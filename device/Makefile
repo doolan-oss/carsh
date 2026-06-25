@@ -11,11 +11,17 @@ CARSHTOP      := $(realpath $(CURDIR)/..)
 
 include $(CIRCLE_STDLIB)/Config.mk
 
-# Device entry + backends, plus the core objects this milestone needs.
+# Device entry + backends, plus the platform-independent core objects. These are
+# the exact sources the host tests cover — only the backends differ.
 OBJS = \
 	main.o \
 	kernel.o \
-	$(CARSHTOP)/src/ui/Font.o
+	CircleDir.o \
+	$(CARSHTOP)/src/ui/Font.o \
+	$(CARSHTOP)/src/library/Database.o \
+	$(CARSHTOP)/src/library/Indexer.o \
+	$(CARSHTOP)/src/decode/DrDecoders.o \
+	$(CARSHTOP)/third_party/dr_libs_impl.o
 
 include $(CIRCLEHOME)/Rules.mk
 
