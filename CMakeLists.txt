@@ -33,11 +33,35 @@ file(GLOB_RECURSE TEST_SRC CONFIGURE_DEPENDS
   ${CMAKE_SOURCE_DIR}/tests/*.cpp
 )
 
+# Vendored single-header libs compiled in their own TU with warnings off — we do
+# not police third-party code style, only our own.
+file(GLOB THIRDPARTY_SRC CONFIGURE_DEPENDS
+  ${CMAKE_SOURCE_DIR}/third_party/*.cpp
+)
+add_library(carsh_thirdparty STATIC ${THIRDPARTY_SRC})
+target_include_directories(carsh_thirdparty PUBLIC ${CMAKE_SOURCE_DIR}/third_party)
+target_compile_options(carsh_thirdparty PRIVATE -w)
+
+# Deterministic test fixtures (sine WAV/FLAC/MP3 + a small library tree),
+# regenerated at build time. Encoders are best-effort (see gen_fixtures.py).
+set(FIXTURES_DIR ${CMAKE_BINARY_DIR}/fixtures)
+add_custom_target(carsh_fixtures ALL
+  COMMAND ${CMAKE_COMMAND} -E make_directory ${FIXTURES_DIR}
+  COMMAND python3 ${CMAKE_SOURCE_DIR}/tools/gen_fixtures.py ${FIXTURES_DIR}
+  BYPRODUCTS ${FIXTURES_DIR}/sine.wav
+  COMMENT "Generating audio/library fixtures"
+  VERBATIM
+)
+
 add_executable(carsh_tests
   ${CMAKE_SOURCE_DIR}/test/Test.cpp
   ${CORE_SRC}
   ${TEST_SRC}
 )
+add_dependencies(carsh_tests carsh_fixtures)
+target_link_libraries(carsh_tests PRIVATE carsh_thirdparty)
+target_compile_definitions(carsh_tests PRIVATE
+  CARSH_FIXTURES_DIR="${FIXTURES_DIR}")
 
 enable_testing()
 add_test(NAME unit COMMAND carsh_tests)
