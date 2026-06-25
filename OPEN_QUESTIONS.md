@@ -44,6 +44,19 @@ surfaced during host build.
   embeds a compiled-in Ed25519 public key (placeholder test key in the host build);
   verify→stage→A/B→try→commit path is identical for network later.
 
+### Q5b — Device OTA crypto: mbedTLS lacks Ed25519 [RESOLVED in code]
+- **Needed:** Ed25519 verify + SHA-256 on-device. PLAN.md §6 assumed "Ed25519 via
+  mbed TLS".
+- **Found:** the mbedTLS bundled by circle-stdlib is **2.28.10**, which does NOT
+  implement Ed25519/EdDSA (only PSA algorithm ids exist; no working impl). mbedTLS
+  3.x has it only via experimental PSA.
+- **Resolution:** the device backend (`device/DeviceCrypto.cpp`) uses **TweetNaCl**
+  (public domain) for Ed25519 verify and a vendored public-domain **SHA-256** — no
+  mbedTLS dependency for OTA verify. Cross-validated against OpenSSL on the host
+  (`tests/ota/DeviceCrypto_test.cpp`): OpenSSL-signed packages verify with the
+  device backend and tampering is rejected. mbedTLS remains available (bundled)
+  for TLS transport if/when network OTA is added.
+
 ### Q6 — Crash-log privacy/consent model (PLAN.md §8.10)
 - **Needed:** Consent model + what is captured.
 - **Unresolved:** Owner decision.

@@ -17,12 +17,16 @@ OBJS = \
 	main.o \
 	kernel.o \
 	CircleDir.o \
+	DeviceCrypto.o \
 	$(CARSHTOP)/src/ui/Font.o \
 	$(CARSHTOP)/src/library/Database.o \
 	$(CARSHTOP)/src/library/Indexer.o \
 	$(CARSHTOP)/src/decode/DrDecoders.o \
 	$(CARSHTOP)/src/player/PlayerController.o \
-	$(CARSHTOP)/third_party/dr_libs_impl.o
+	$(CARSHTOP)/src/ota/OtaManager.o \
+	$(CARSHTOP)/third_party/dr_libs_impl.o \
+	$(CARSHTOP)/third_party/tweetnacl/tweetnacl.o \
+	$(CARSHTOP)/third_party/sha256/sha256.o
 
 include $(CIRCLEHOME)/Rules.mk
 

@@ -3,7 +3,7 @@
 # (that uses Circle's Makefiles + the AArch64 toolchain). This tree exists so
 # the interface-backed logic is provable on the build server.
 cmake_minimum_required(VERSION 3.16)
-project(carsh_host CXX)
+project(carsh_host CXX C)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -20,7 +20,15 @@ include_directories(
   ${CMAKE_SOURCE_DIR}/host
   ${CMAKE_SOURCE_DIR}/third_party
   ${CMAKE_SOURCE_DIR}/test
+  ${CMAKE_SOURCE_DIR}/device
 )
+
+# The device OTA crypto backend (TweetNaCl + SHA-256) is platform-independent
+# C++; compile it into the host build so it can be cross-validated vs OpenSSL.
+set(DEVICE_HOSTABLE_SRC)
+if(EXISTS ${CMAKE_SOURCE_DIR}/device/DeviceCrypto.cpp)
+  list(APPEND DEVICE_HOSTABLE_SRC ${CMAKE_SOURCE_DIR}/device/DeviceCrypto.cpp)
+endif()
 
 # Core + host-backend translation units (header-only modules contribute none).
 file(GLOB_RECURSE CORE_SRC CONFIGURE_DEPENDS
@@ -38,6 +46,14 @@ file(GLOB_RECURSE TEST_SRC CONFIGURE_DEPENDS
 file(GLOB THIRDPARTY_SRC CONFIGURE_DEPENDS
   ${CMAKE_SOURCE_DIR}/third_party/*.cpp
 )
+# Vendored C crypto used by the device OTA backend — compiled into the host build
+# too so it can be cross-validated against OpenSSL (the device path is otherwise
+# unobservable without hardware).
+if(EXISTS ${CMAKE_SOURCE_DIR}/third_party/tweetnacl/tweetnacl.c)
+  list(APPEND THIRDPARTY_SRC
+    ${CMAKE_SOURCE_DIR}/third_party/tweetnacl/tweetnacl.c
+    ${CMAKE_SOURCE_DIR}/third_party/sha256/sha256.c)
+endif()
 add_library(carsh_thirdparty STATIC ${THIRDPARTY_SRC})
 target_include_directories(carsh_thirdparty PUBLIC ${CMAKE_SOURCE_DIR}/third_party)
 target_compile_options(carsh_thirdparty PRIVATE -w)
@@ -56,6 +72,7 @@ add_custom_target(carsh_fixtures ALL
 add_executable(carsh_tests
   ${CMAKE_SOURCE_DIR}/test/Test.cpp
   ${CORE_SRC}
+  ${DEVICE_HOSTABLE_SRC}
   ${TEST_SRC}
 )
 add_dependencies(carsh_tests carsh_fixtures)
