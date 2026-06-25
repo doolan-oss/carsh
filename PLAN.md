@@ -189,15 +189,20 @@ complexity, risks.
   bus identification and pull-ups must be confirmed on hardware.
 
 ### 2.4 Audio Engine (mixer + render callback host)
-- **Responsibilities:** Own the `CI2SSoundBaseDevice`; implement the pull callback; host
-  the fixed-cost DSP chain (per-track/album ReplayGain → parametric EQ biquads → crossfade
-  mixer → master volume); manage sample-rate switching of the I2S clock; underrun
-  detection + recovery; bit-perfect passthrough when source rate == device rate.
+- **Responsibilities:** Own the active sound device **behind an `ISoundDevice` abstraction**
+  (PWM onboard jack for bring-up, I2S DAC for production — swappable by config); implement
+  the pull callback; host the fixed-cost DSP chain (per-track/album ReplayGain → parametric
+  EQ biquads → crossfade mixer → master volume); manage sample-rate switching of the
+  device clock; underrun detection + recovery; bit-perfect passthrough when source rate ==
+  device rate (I2S path only — PWM is not bit-perfect, see §6/§5).
 - **Interfaces:**
+  - `ISoundDevice` wraps either `CPWMSoundBaseDevice` or `CI2SSoundBaseDevice` (same pull
+    callback contract, different `open(rate,bits,channels)` / clocking impl).
   - `AudioEngine::open(rate, bits, channels)`, `setMasterVolume`, `setReplayGain(g)`.
   - Consumes from `PcmRing` (SPSC). `EngineCallback(int16/32* buf, size_t frames)`.
   - `DSP::setEQ(const EqConfig&)` (atomic pointer swap of coefficient banks).
-- **Source:** **From scratch** on top of **Circle**'s `CI2SSoundBaseDevice` + `CDMAChannel`.
+- **Source:** **From scratch** on top of **Circle**'s `CPWMSoundBaseDevice` /
+  `CI2SSoundBaseDevice` + `CDMAChannel`.
 - **Complexity:** High. This is the heart; correctness and timing are unforgiving.
 - **Risks:** Underruns (R8); sample-rate reclock glitches; fixed-point vs float DSP cost on
   A72 (use NEON-friendly float, see 5.x).
@@ -331,8 +336,11 @@ Dependencies are explicit. **P-tags** mark work parallelizable once Phase 0 land
 
 ### Phase 1 — Audio pipeline (depends on P0 FS + scheduler)
 **Goal:** Play a WAV/FLAC/MP3 from USB, bit-perfect, no underruns.
-1. **[P-A]** Bring up `CI2SSoundBaseDevice` to the HiFiBerry DAC+ (see §6 hardware); play a
-   synthesized sine to verify I2S clocking + DAC config (I2C control if needed).
+1. **[P-A]** Bring up audio out via the **onboard 3.5mm PWM jack** (`CPWMSoundBaseDevice`)
+   first — no DAC wiring, fastest path to "sound exists"; play a synthesized sine to verify
+   the engine/ring/callback path end to end. Then implement `ISoundDevice` and add the
+   **I2S/HiFiBerry DAC+** backend (`CI2SSoundBaseDevice` + PCM5122 I2C config); re-run the
+   sine on I2S to verify clocking. From here on, develop against I2S for hi-res/bit-perfect.
 2. **[P-A]** PcmRing (lock-free SPSC) + AudioEngine pull callback (passthrough, no DSP yet).
 3. USB host + mass storage + FAT mount (Circle); stream a file.
 4. Decoder framework + WAV + FLAC (dr_flac) + MP3 (minimp3) first; block-decode + yield.
@@ -569,12 +577,16 @@ indexer back-off rule. If needed, pin decode to its own core via Circle's multic
 
 Legend: **BMF** = bare-metal-friendly (no OS deps, malloc-only, no threads required).
 
-### Hardware: I2S DAC
-- **Recommendation: HiFiBerry DAC+ / DAC2 HD (PCM5122-based).** I2S, supports up to 24/192,
-  hardware volume, well-documented register map over I2C. Alternative: Pimoroni/Adafruit
-  PCM5102A boards (no I2C control needed — simpler, but no HW volume). **Pick the PCM5122
-  (DAC+)**: HW volume + standard rates; we control it over `CI2CMaster`. For DSD (stretch),
-  a different DAC (e.g. ES9038-based) would be needed — defer.
+### Hardware: audio output (two-stage)
+- **Bring-up: onboard 3.5mm PWM jack.** Zero wiring; Circle `CPWMSoundBaseDevice`. Quality
+  is poor (~11-bit effective, PWM noise, no bit-perfect, practically 44.1/48 kHz only) — use
+  it only to validate the pipeline in Phase 1, never as the production path.
+- **Production: HiFiBerry DAC+ (PCM5122-based).** I2S, up to 24/192, hardware volume,
+  documented register map over I2C (`CI2CMaster`). Alternative: Pimoroni/Adafruit PCM5102A
+  boards (no I2C control — simpler, but no HW volume). **Pick the PCM5122 (DAC+).** Both
+  outputs sit behind `ISoundDevice` so the switch is a config flag.
+- **DSD: out of scope.** PCM5122 is PCM-only and DSD adds no value in a car; the hi-res
+  ceiling is **24/192 PCM**, which the PCM5122 does natively.
 
 ### Audio decoders
 | Format | Library | License | Notes |
@@ -582,7 +594,7 @@ Legend: **BMF** = bare-metal-friendly (no OS deps, malloc-only, no threads requi
 | WAV | **dr_wav** (mackron/dr_libs) | Public domain/MIT-0 | BMF, single-header, trivial. |
 | FLAC | **dr_flac** | PD/MIT-0 | BMF, single-header. (libFLAC if max compat needed.) |
 | MP3 | **minimp3** (lieff) | CC0 | BMF, tiny, fast; has gapless/LAME-tag support. |
-| AAC | **faad2** (libfaad) | GPLv2 (commercial license avail.) | Ports; **license caveat** — if GPL is unacceptable, use **Helix AAC** (RealNetworks RPSL) or the **fdk-aac** (custom, patent caveats). Reuse for A2DP-AAC. |
+| AAC | **faad2** (libfaad) | GPLv2 | OK — project is GPL, so GPL deps are fine. Reuse for A2DP-AAC. (Apache-2.0 ALAC + GPLv2-only faad2 is a theoretical combine-and-redistribute clash; harmless for a GPLv3 project's own use, but if it bites, swap to fdk-aac.) |
 | ALAC | **Apple ALAC reference** (alac) | Apache-2.0 | BMF; needs an MP4/M4A demuxer (small) to feed it. |
 | Opus | **libopus** + **libopusfile** | BSD | BMF; opusfile needs an Ogg demuxer (libogg, BSD). Higher CPU but fine. |
 | (stretch) DSD | — | — | Defer; needs DAC + DoP/native path. |
@@ -638,14 +650,14 @@ Legend: **BMF** = bare-metal-friendly (no OS deps, malloc-only, no threads requi
 | R3 | **Bluetooth firmware blob (CYW43455 .hcd)** — onboard controller needs a vendor HCI firmware patch loaded at init; version mismatch → BT dead. | High | Med | Reuse Circle's proven firmware-load path; pin the exact .hcd from a known Pi firmware; verify with an HCI reset/read-local-version probe before BTstack init. |
 | R4 | **BTstack ↔ Circle HCI transport bridge** — gluing BTstack's `hci_transport_t` to Circle's UART/BCM transport + run loop is custom and error-prone. | High | Med | Start from BTstack's posix/embedded transport template; implement the run-loop as a dedicated `CTask`; build an HCI loopback/echo test before profiles. |
 | R5 | **USB host stability across drives/hubs** — flaky enumeration, power, or quirky drives cause read stalls → audio underrun or mount failure. | High | Med | Lean on Circle's tested stack; test a matrix of drives/hubs; powered hub recommendation; treat USB reads as fallible (timeouts, retry, deep ring buffer absorbs stalls); never read USB from the audio callback. |
-| R6 | **exFAT media** — large USB drives ship exFAT; Circle FAT driver is FAT32 only. | Med | High | Document FAT32 requirement for media; provide a "reformat to FAT32" note; if needed, port an exFAT read-only driver (medium effort) — schedule as optional in Phase 2. |
+| R6 | **exFAT media** — large USB drives ship exFAT; Circle FAT driver is FAT32 only. **Accepted/closed**: FAT32 mandated (file sizes never near 4 GiB). | Low | Low | Document FAT32-only requirement; provide a "reformat to FAT32" note. Read-only exFAT port deferred indefinitely unless plug-any-drive UX is needed. |
 | R7 | **SD card wear from logging/DB writes** — naive per-event writes destroy cards. | Med | Med | Batch + journal DB writes; rate-limit + rotate logs; keep logs/DB in RAM and flush on safe points/shutdown; put cache on USB if available; use endurance-rated SD. |
 | R8 | **Audio underruns under load** (crossfade + index + UI + BT simultaneously). | High | Med | Deep PcmRing (≥500 ms); strict yield discipline; indexer/OTA back-off near transitions; budget CPU for 2× decode+EQ during crossfade; consider pinning decode to a second core (`CMultiCoreSupport`) if measured tight. |
 | R9 | **Cooperative-scheduler starvation** — any task running too long glitches everything (no preemption). | High | Med | Enforce ≤2 ms/yield rule in code review; chunk all heavy loops; measure worst-case slice with a watchdog timer that logs offenders. |
 | R10 | **Phone MAC randomization** breaks profile-by-proximity. | Med | Med | Key profiles on the **Classic BR/EDR** address used for A2DP (stable), not BLE RPA; allow manual profile pick + "remember this device" as fallback. |
 | R11 | **OTA bricking** — bad update with no recovery. | High | Low | Chainloader A/B with try/rollback counter; health-confirm handshake; signature verify before write; keep a recovery image; test forced-bad-boot rollback as an exit gate. |
 | R12 | **A2DP clock drift vs I2S master** — phone and DAC clocks differ → buffer slowly over/underflows. | Med | High | Adaptive jitter buffer + slow async SRC on the BT stream to track drift; monitor fill level and nudge resample ratio. |
-| R13 | **AAC/BTstack licensing** for a shipped product (GPL/commercial). | Med | Med | Decide early (§8); choose Helix/fdk-aac and a BTstack commercial license if distributing. |
+| R13 | **AAC/BTstack licensing** — ~~for a shipped product~~ **RESOLVED**: project is GPL/open source, so faad2 (GPL) and BTstack's free open-source license both apply with no friction or cost. | Low | Low | None needed; keep deps GPL-compatible. |
 
 ---
 
@@ -653,15 +665,16 @@ Legend: **BMF** = bare-metal-friendly (no OS deps, malloc-only, no threads requi
 
 These need a call (or research spike) **before or during Phase 0**:
 
-1. **Licensing posture (product vs hobby).** Is this a one-off personal build or a
-   distributed product? Drives AAC decoder choice (faad2 GPL vs Helix/fdk) and **BTstack
-   commercial license** necessity. *Recommend deciding now — it's cheap to choose
-   permissive paths up front, expensive to retrofit.*
-2. **exFAT support required?** If users will plug in big stock-formatted drives, we must
-   port exFAT (read-only). If we can mandate FAT32, we save real effort. (R6)
-3. **DAC final pick + DSD ambition.** Confirm HiFiBerry DAC+ (PCM5122). Is DSD/24-192 a
-   real requirement or droppable? DSD changes the DAC choice. *Recommend: PCM5122, drop
-   DSD for v1, keep 24/192 PCM.*
+1. **Licensing posture — RESOLVED: GPL / open source.** faad2 (GPL) is fine; BTstack's free
+   open-source license applies (no commercial license, no cost). Keep all deps GPL-
+   compatible (the permissive ones — dr_libs, minimp3, stb, opus, mbed TLS — all are).
+2. **exFAT support — RESOLVED: skip it, mandate FAT32.** Audio files never approach the 4 GiB
+   limit and firmware/update bins are tens of MB at most, so file size is a non-issue;
+   exFAT would only buy plug-any-large-drive convenience. Document the FAT32 requirement for
+   media; revisit only if "plug any stock-formatted drive" UX becomes a goal. (R6 downgraded)
+3. **DAC + DSD — RESOLVED.** Start on the onboard 3.5mm PWM jack for bring-up, move to the
+   HiFiBerry DAC+ (PCM5122) for production, both behind `ISoundDevice`. **DSD dropped**;
+   hi-res ceiling is 24/192 PCM (native on the PCM5122).
 4. **Cover art over Bluetooth.** AVRCP cover art uses BIP over OBEX — not all phones/
    versions support it. Is BT cover art must-have, or is "metadata text only + generic art"
    acceptable for BT sources? *Recommend: text metadata must-have, BT cover art best-effort.*
