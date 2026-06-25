@@ -71,9 +71,14 @@ with `aarch64-none-elf` + circle-stdlib (`STDLIB_SUPPORT=4`). See device/README.
 |---|---|---|
 | Toolchain + circle-stdlib | done | ARM aarch64-none-elf 14.2; circle-stdlib Step pinned; newlib+libstdc++ build. |
 | `CKernel` (boot/serial/timer) | builds + QEMU-runs | Serial log @115200; boots cleanly under QEMU raspi3b (no fault). |
-| `CircleRenderTarget` (`IRenderTarget`) | builds | Over `CBcmFrameBuffer`, double-buffered, pitch-aware. Pixels need panel/HDMI to view (H1). |
-| Renders `ui/` + 7 screens on target | builds | `kernel8-rpi4.img` produced; visual check = bench (H1). |
-| `Vfs`/`ISoundDevice`/`ITouch`/`IFlashTarget` Circle backends | todo | Next device milestones. |
+| `CircleRenderTarget` (`IRenderTarget`) | builds | Over `CBcmFrameBuffer`, double-buffered, pitch-aware. Pixels need panel/HDMI (H1). |
+| `CircleVfs`/`CircleSource` (`Vfs`) | builds | FatFs (f_open/read/lseek + dir); SD mounted; real Indexer scans it. |
+| `CircleSoundDevice` (`ISoundDevice`) | builds | CI2SSoundBaseDevice pull→float→DAC range. Opened only on HW (H3/H4). |
+| `CircleTouch` (`ITouch`) | builds | CRPiTouchScreen events→queue; active if digitizer present (H2). |
+| `CircleFlashTarget` (`IFlashTarget`) | builds | FatFs write of kernel8-A/B.img; rollback = bench (H7). |
+| Full app integrated in `CKernel` | builds | SD→library→player→EQ→profiles→UI+7 screens+touch link bare-metal (1.0 MB img). |
+| Real-time decode/scheduler task | todo | `CScheduler` + decode `CTask` feeding the ring; tune yields (H4). |
+| OTA device crypto (mbedTLS `ICrypto`) | todo | mbedTLS bundled in circle-stdlib; wire `ICrypto` backend. |
 | BTstack↔Circle transport | todo | Phase 3 device. |
 
 > QEMU note: the image **builds and runs** under `qemu raspi3b` without faulting,

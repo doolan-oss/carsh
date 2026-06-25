@@ -24,8 +24,7 @@ public:
     TShutdownMode Run(void) override;
 
 private:
-    void scanLibrary(void);   // index the SD into the Database (demo of the core)
-    void renderHome(void);    // draw the UI to the framebuffer
+    void scanLibrary(void);   // index the SD into the Database
 
     CSerialDevice mSerial;
     CTimer mTimer;

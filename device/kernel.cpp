@@ -1,23 +1,42 @@
-// carsh device kernel implementation. Brings up serial + SD/FAT + framebuffer,
-// indexes the SD into the library with the same core the host tests cover, and
-// renders the carsh UI to the panel.
+// carsh device kernel. Brings up serial + SD/FAT + framebuffer + touch, builds
+// the full app (library, player, EQ, profiles) from the same core the host tests
+// cover, and runs the UI/input loop. Audio output and touch touch real hardware,
+// so they are only activated on a board (not in the QEMU boot demo); everything
+// is constructed here so the whole stack is built + linked bare-metal.
 #include "kernel.h"
 
 #include <circle/bcmframebuffer.h>
 
 #include "CircleRenderTarget.h"
+#include "CircleSoundDevice.h"
+#include "CircleTouch.h"
 #include "CircleVfs.h"
+#include "audio/AudioEngine.h"
+#include "audio/PcmRing.h"
+#include "dsp/Eq.h"
 #include "library/Database.h"
 #include "library/Indexer.h"
+#include "player/PlayerController.h"
+#include "profile/ProfileManager.h"
 #include "ui/Canvas.h"
 #include "ui/Screen.h"
 #include "ui/Screens.h"
 
 #define FROM "carsh"
 
-// Long-lived app state. Kept at file scope so the framebuffer render and the
-// (future) input/audio loop can share it without a huge stack frame.
-static carsh::library::Database s_db;
+namespace {
+// Long-lived app state at file scope: the PcmRing's buffer is large (~1 s of
+// audio) and must not sit on the stack, and these persist across the run loop.
+constexpr unsigned kRate = 48000;
+constexpr uint8_t kChannels = 2;
+
+carsh::library::Database g_db;
+carsh::audio::PcmRing<float> g_ring(kRate * kChannels);  // ~1 s stereo
+carsh::audio::AudioEngine g_engine(&g_ring, kChannels);
+carsh::dsp::EqProcessor g_eq(kRate);
+carsh::device::CircleSource g_sdSource(0, carsh::hal::SourceType::Sd, "SD:");
+carsh::profile::ProfileManager g_profiles;
+}  // namespace
 
 CKernel::CKernel(void)
     : CStdlibApp("carsh"),
@@ -32,7 +51,6 @@ bool CKernel::Initialize(void) {
     if (!mLogger.Initialize(&mSerial)) return false;
     if (!mTimer.Initialize()) return false;
 
-    // SD card + FAT. Non-fatal: the UI still runs without media.
     if (mEMMC.Initialize() && f_mount(&mFileSystem, "SD:", 1) == FR_OK) {
         mSdMounted = true;
         mLogger.Write(FROM, LogNotice, "SD mounted (FAT)");
@@ -44,26 +62,33 @@ bool CKernel::Initialize(void) {
 
 void CKernel::scanLibrary(void) {
     if (!mSdMounted) return;
-    carsh::device::CircleSource src(0, carsh::hal::SourceType::Sd, "SD:");
-    carsh::library::Indexer idx(s_db);
-    idx.beginScan(src);
+    carsh::library::Indexer idx(g_db);
+    idx.beginScan(g_sdSource);
     mLogger.Write(FROM, LogNotice, "indexing %u files...",
                   unsigned(idx.progress().filesTotal));
-    // Chunked scan (the cooperative slice the scheduler task will drive later).
-    while (idx.step(8)) { /* Yield() once the scheduler is wired */ }
+    while (idx.step(8)) { /* CScheduler::Yield() once the decode task is wired */ }
     mLogger.Write(FROM, LogNotice, "library: %u tracks, %u albums",
-                  unsigned(s_db.trackCount()), unsigned(s_db.albums().size()));
+                  unsigned(g_db.trackCount()), unsigned(g_db.albums().size()));
 }
 
-void CKernel::renderHome(void) {
+CStdlibApp::TShutdownMode CKernel::Run(void) {
+    mLogger.Write(FROM, LogNotice, "carsh boot — bare-metal automotive head unit");
+
+    // Wire the audio DSP chain (EQ inserted into the engine). Playback is started
+    // on demand via the player on hardware; the I2S device is not opened here.
+    g_engine.setSampleProcessor(&g_eq);
+    g_engine.setMasterVolume(0.8f);
+    carsh::player::PlayerController player(g_sdSource.vfs(), g_ring, g_engine,
+                                           kChannels);
+
+    scanLibrary();
+
+    // Framebuffer + UI.
     CBcmFrameBuffer fb(800, 480, 32);
     if (!fb.Initialize()) {
         mLogger.Write(FROM, LogError, "framebuffer init failed");
-        return;
+        return ShutdownHalt;
     }
-    mLogger.Write(FROM, LogNotice, "framebuffer %ux%u pitch=%u", fb.GetWidth(),
-                  fb.GetHeight(), fb.GetPitch());
-
     carsh::device::CircleRenderTarget rt(&fb);
     carsh::ui::Canvas canvas(rt);
     carsh::ui::ScreenManager mgr(rt.width(), rt.height());
@@ -83,39 +108,71 @@ void CKernel::renderHome(void) {
     mgr.addScreen(&sources, "Src");
     mgr.addScreen(&settings, "Set");
 
-    // Populate the library browse list from the scan.
+    // Library list -> tap queues + plays that track.
+    std::vector<uint64_t> ids = g_db.allTracks();
     std::vector<std::string> rows;
-    for (uint64_t id : s_db.allTracks()) {
-        const carsh::library::Track* t = s_db.get(id);
-        if (t) rows.push_back(s_db.artist(*t) + " - " + s_db.title(*t));
+    std::vector<std::string> paths;
+    for (uint64_t id : ids) {
+        const carsh::library::Track* t = g_db.get(id);
+        if (!t) continue;
+        rows.push_back(g_db.artist(*t) + " - " + g_db.title(*t));
+        paths.push_back(g_db.path(*t));
     }
-    if (rows.empty()) rows.push_back("(insert a FAT32 USB/SD with music)");
+    if (rows.empty()) rows.push_back("(insert FAT32 media with music)");
     library.setItems(rows);
+    library.setOnSelect([&](int i) {
+        if (i >= 0 && i < int(paths.size())) {
+            player.setQueue(paths);
+            player.play(i);  // starts decode; audio device opened on hardware
+        }
+    });
 
-    carsh::ui::NowPlayingScreen::State st;
-    st.title = "carsh online";
-    st.artist = "bare-metal head unit";
-    st.album = mSdMounted ? "SD mounted" : "no media";
-    st.durationMs = 222000;
-    st.playing = false;
-    now.setState(st);
+    // EQ screen edits feed the live engine EQ.
+    eq.onBandChange = [&](int, double) { g_eq.setConfig(eq.config()); };
+    now.onPlayPause = [&] {
+        if (player.state().transport == carsh::player::Transport::Playing)
+            player.pause();
+        else
+            player.resume();
+    };
+    now.onNext = [&] { player.next(); };
+    now.onPrev = [&] { player.prev(); };
 
-    mgr.render(canvas);
-    rt.present();
-    mLogger.Write(FROM, LogNotice, "rendered carsh UI (%dx%d)", rt.width(),
-                  rt.height());
-}
+    // Touch (real hardware only; QEMU has no digitizer).
+    carsh::device::CircleTouch touch;
+    bool haveTouch = touch.initialize();
+    mLogger.Write(FROM, LogNotice, "touch: %s", haveTouch ? "ready" : "absent");
 
-CStdlibApp::TShutdownMode CKernel::Run(void) {
-    mLogger.Write(FROM, LogNotice, "carsh boot — bare-metal automotive head unit");
-    scanLibrary();
-    renderHome();
+    mLogger.Write(FROM, LogNotice, "entering UI loop");
+    unsigned frame = 0;
+    for (;;) {
+        if (haveTouch) {
+            carsh::hal::TouchEvent ev;
+            while (touch.poll(ev)) mgr.onTouch(ev);  // driver self-updates
+        }
+        // Refresh now-playing from the player each frame.
+        carsh::player::PlayerState ps = player.state();
+        carsh::ui::NowPlayingScreen::State st;
+        if (ps.queueIndex >= 0 && ps.queueIndex < int(ids.size())) {
+            const carsh::library::Track* t = g_db.get(ids[std::size_t(ps.queueIndex)]);
+            if (t) { st.title = g_db.title(*t); st.artist = g_db.artist(*t);
+                     st.album = g_db.album(*t); }
+        } else {
+            st.title = "carsh"; st.artist = "select a track"; st.album = "";
+        }
+        st.positionMs = ps.positionMs;
+        st.durationMs = ps.durationMs;
+        st.playing = ps.transport == carsh::player::Transport::Playing;
+        now.setState(st);
 
-    for (;;) {  // heartbeat; the cooperative task loop lands here next milestone
+        mgr.render(canvas);
+        rt.present();
+
         mActLED.On();
-        mTimer.MsDelay(250);
+        mTimer.MsDelay(15);
         mActLED.Off();
-        mTimer.MsDelay(750);
+        mTimer.MsDelay(15);   // ~30 fps; the decode task will share this loop
+        ++frame;
     }
     return ShutdownHalt;
 }
