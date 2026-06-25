@@ -61,7 +61,25 @@ HARDWARE_TODO.md for what the bench session must confirm.
 | OTA: flash write + reboot | stubbed — needs hardware | IFlashTarget host stub; real SD write = H7. |
 | Bluetooth seam (IBluetooth) | host-done (stub) | Interfaces + FakeBluetooth; connect→profile, AVRCP→now-playing, A2DP→ring tested. |
 | Bluetooth real A2DP/AVRCP | stubbed — needs hardware | BTstack+controller; H6. |
-| Boot/CKernel, Circle backends | stubbed — needs hardware | HW bring-up; not host-testable. |
+
+## Device build (Circle / bare metal) — Step 2 in progress
+
+Foundation proven: the STL-heavy core compiles+links into a real bare-metal image
+with `aarch64-none-elf` + circle-stdlib (`STDLIB_SUPPORT=4`). See device/README.md.
+
+| Module | Status | Notes |
+|---|---|---|
+| Toolchain + circle-stdlib | done | ARM aarch64-none-elf 14.2; circle-stdlib Step pinned; newlib+libstdc++ build. |
+| `CKernel` (boot/serial/timer) | builds + QEMU-runs | Serial log @115200; boots cleanly under QEMU raspi3b (no fault). |
+| `CircleRenderTarget` (`IRenderTarget`) | builds | Over `CBcmFrameBuffer`, double-buffered, pitch-aware. Pixels need panel/HDMI to view (H1). |
+| Renders `ui/` + 7 screens on target | builds | `kernel8-rpi4.img` produced; visual check = bench (H1). |
+| `Vfs`/`ISoundDevice`/`ITouch`/`IFlashTarget` Circle backends | todo | Next device milestones. |
+| BTstack↔Circle transport | todo | Phase 3 device. |
+
+> QEMU note: the image **builds and runs** under `qemu raspi3b` without faulting,
+> but this QEMU's bcm2835 mailbox/UART I/O doesn't surface serial *text* headless
+> (Circle's own samples behave identically — it routes to the framebuffer window).
+> Authoritative runtime/visual validation is the real Pi 4 over UART + HDMI/DSI.
 
 ## Deferred host-buildable work (not hardware-gated, not yet done)
 
