@@ -26,7 +26,13 @@ HARDWARE_TODO.md for what the bench session must confirm.
 | Host backend: HostVfs/HostSource | host-done | Real-dir Vfs; tested indirectly via decoders/indexer. |
 | Host backend: SyntheticTouch | host-done | Scripted tap/swipe event injector. |
 | Host backend: MemStream | host-done | In-RAM IStream for fixtures/OTA blobs. |
-| Host backend: PngRenderTarget | todo | UI phase. |
+| Host backend: PngRenderTarget | host-done | ARGB surface -> PNG on present(). |
+| UI: Canvas + 8x8 font | host-done | Primitives, glyph blit, text, alpha blend. |
+| UI: Theme | host-done | Dark/Light/Amber; accent #d97757. |
+| UI: GestureRecognizer | host-done | Tap vs vertical swipe from touch stream. |
+| UI: Widgets | host-done | Button, Label, ListView (select+scroll), TabBar. |
+| UI: ScreenManager + tabs | host-done | Tab routing, gesture dispatch, render. |
+| UI: 7 screens | host-done | Now/Lib/Find/Queue/EQ/Src/Set; PNG + touch tested. |
 | Decoders (WAV/FLAC/MP3) | host-done | dr_libs; WAV bit-exact, FLAC lossless, MP3 tone. |
 | Decoder: Opus | host-done | libopusfile; real .opus fixture, tone-correlated. |
 | Decoder: AAC (ADTS) | host-done | faad2; real .aac fixture, tone-correlated. |
