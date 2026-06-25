@@ -11,3 +11,12 @@
 #include "dr_libs/dr_wav.h"
 #include "dr_libs/dr_flac.h"
 #include "dr_libs/dr_mp3.h"
+
+// Image codecs for cover-art decode + the host PNG render target.
+#define STB_IMAGE_IMPLEMENTATION
+#define STBI_ONLY_JPEG
+#define STBI_ONLY_PNG
+#define STBI_ONLY_BMP
+#include "stb/stb_image.h"
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include "stb/stb_image_write.h"

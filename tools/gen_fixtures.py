@@ -84,6 +84,31 @@ def main():
     else:
         print("faac not found — skipping AAC fixture")
 
+    # Tagged single-track fixtures for the tag parsers. Known values so tests
+    # can assert exact title/artist/album/year/track across MP3/FLAC/Opus.
+    T = dict(title="Night Drive", artist="Carsh Test", album="Demos",
+             year="2023", track="3")
+    if shutil.which("lame"):
+        m = os.path.join(out, "tagged.mp3")
+        try_run(["lame", "--quiet", "--tt", T["title"], "--ta", T["artist"],
+                 "--tl", T["album"], "--ty", T["year"], "--tn", T["track"],
+                 wav, m])
+        print(f"wrote {m}")
+    if shutil.which("flac"):
+        f = os.path.join(out, "tagged.flac")
+        try_run(["flac", "--totally-silent", "-f", "-o", f,
+                 f"--tag=TITLE={T['title']}", f"--tag=ARTIST={T['artist']}",
+                 f"--tag=ALBUM={T['album']}", f"--tag=DATE={T['year']}",
+                 f"--tag=TRACKNUMBER={T['track']}", wav])
+        print(f"wrote {f}")
+    if shutil.which("opusenc"):
+        o = os.path.join(out, "tagged.opus")
+        try_run(["opusenc", "--quiet", "--title", T["title"],
+                 "--artist", T["artist"], "--album", T["album"],
+                 "--comment", f"DATE={T['year']}",
+                 "--comment", f"TRACKNUMBER={T['track']}", wav, o])
+        print(f"wrote {o}")
+
     # Small library tree: a couple of "albums" of WAVs for the indexer. Tags are
     # added later by the tag-writer fixtures; for now filenames carry structure.
     lib = os.path.join(out, "library")
