@@ -8,10 +8,14 @@
 #include <circle/bcmframebuffer.h>
 
 #include "CircleDecodeTask.h"
+#include "CircleFlashTarget.h"
 #include "CircleRenderTarget.h"
 #include "CircleSoundDevice.h"
 #include "CircleTouch.h"
 #include "CircleVfs.h"
+#include "DeviceCrypto.h"
+#include "ota/OtaManager.h"
+#include "ota/Package.h"
 #include "audio/AudioEngine.h"
 #include "audio/PcmRing.h"
 #include "dsp/Eq.h"
@@ -72,6 +76,34 @@ void CKernel::scanLibrary(void) {
                   unsigned(g_db.trackCount()), unsigned(g_db.albums().size()));
 }
 
+void CKernel::checkOta(void) {
+    if (!mSdMounted) return;
+    carsh::device::CircleVfs vfs("SD:");
+    auto s = vfs.open("/carsh/ota/update.carup");
+    if (!s) { mLogger.Write(FROM, LogNotice, "OTA: no staged package"); return; }
+
+    std::vector<uint8_t> blob(std::size_t(s->size()));
+    s->read(blob.data(), blob.size());
+
+    carsh::device::DeviceCrypto crypto;
+    carsh::device::CircleFlashTarget flash("SD:");
+    // PLACEHOLDER signing key — provision the real Ed25519 public key at build
+    // time (compiled into the image + recovery image). See OPEN_QUESTIONS Q5.
+    static const carsh::ota::Ed25519PublicKey kOtaPubKey{};
+    carsh::ota::OtaManager ota(crypto, kOtaPubKey, flash);
+
+    carsh::ota::Package pkg;
+    if (!carsh::ota::parsePackage(blob, pkg)) {
+        mLogger.Write(FROM, LogWarning, "OTA: malformed package");
+        return;
+    }
+    auto vr = carsh::ota::verifyPackage(pkg, crypto, kOtaPubKey);
+    mLogger.Write(FROM, LogNotice,
+                  "OTA: staged %s, verify=%d (confirm in Settings to apply)",
+                  pkg.manifest.version.c_str(), int(vr));
+    (void)ota;  // apply()/commit() are user-confirmed (PLAN §8.5); not automatic
+}
+
 CStdlibApp::TShutdownMode CKernel::Run(void) {
     mLogger.Write(FROM, LogNotice, "carsh boot — bare-metal automotive head unit");
 
@@ -83,6 +115,7 @@ CStdlibApp::TShutdownMode CKernel::Run(void) {
                                            kChannels);
 
     scanLibrary();
+    checkOta();
 
     // Framebuffer + UI.
     CBcmFrameBuffer fb(800, 480, 32);

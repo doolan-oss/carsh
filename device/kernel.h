@@ -26,6 +26,7 @@ public:
 
 private:
     void scanLibrary(void);   // index the SD into the Database
+    void checkOta(void);      // verify a staged USB OTA package (no auto-flash)
 
     CSerialDevice mSerial;
     CTimer mTimer;
