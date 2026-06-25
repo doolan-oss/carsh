@@ -18,20 +18,11 @@
 #include <cstddef>
 #include <vector>
 
+#include "audio/ISampleProcessor.h"
 #include "audio/PcmRing.h"
 #include "hal/ISoundDevice.h"
 
 namespace carsh::audio {
-
-// Optional in-place processor inserted between ReplayGain and master volume.
-// The parametric EQ (Phase 4) implements this. Must be real-time safe.
-class ISampleProcessor {
-public:
-    virtual ~ISampleProcessor() = default;
-    // Process `frames` interleaved frames in place; `channels` samples/frame.
-    virtual void process(float* interleaved, std::size_t frames,
-                         uint8_t channels) = 0;
-};
 
 class AudioEngine : public carsh::hal::IAudioSink {
 public:
