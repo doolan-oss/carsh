@@ -132,7 +132,7 @@ context (the I2S DMA callback) and everything else is best-effort cooperative.
 | Decode task | CTask | Fill ring to high-water, then `Yield()`. Block size ≤ 10 ms of audio. | Highest cooperative |
 | BTstack run loop | CTask | Pump HCI/L2CAP; A2DP media bytes go to a decode ring. Yield each pass. | High |
 | UI/render task | CTask | ~30 fps tick; dirty-region redraw; yields after each frame. | Medium |
-| Touch input task | CTask | Poll FT5406 over I2C ~60 Hz; enqueue events. Cheap. | Medium |
+| Touch input task | CTask | Poll firmware touchbuffer >60 Hz; enqueue events. Cheap. | Medium |
 | Library indexer task | CTask | Chunked work (one file per slice), `Yield()` between files. Pausable. | Low |
 | OTA/Net task | CTask | Only active opportunistically; never during playback-critical windows. | Lowest |
 
@@ -175,18 +175,21 @@ complexity, risks.
 - **Risks:** Tearing without proper double-buffer flip; redraw cost if not dirty-tracked;
   font atlas memory.
 
-### 2.3 Touch Input (FT5406)
-- **Responsibilities:** Poll the official panel's FT5406 capacitive controller over I2C
-  (addr 0x38), debounce, map raw coords → 800×480, produce down/move/up + simple gestures
-  (tap, vertical swipe for lists). Enforce 44×44 px minimum target via UI, not driver.
+### 2.3 Touch Input (FT5406 via firmware touchbuffer)
+- **Responsibilities:** Read the firmware-maintained touch buffer, debounce, map raw coords
+  → 800×480, produce down/move/up + simple gestures (tap, vertical swipe for lists). Enforce
+  44×44 px minimum target via UI, not driver.
 - **Interfaces:** `Touch::poll() -> vector<TouchPoint>`; emits `TouchEvent` to UI queue.
-- **Source:** **From scratch**, thin. Circle provides `CI2CMaster`. The FT5406 register
-  map is small and well-documented (touch count + per-point X/Y high/low registers).
-  Note: on a stock Pi the firmware exposes touch via a polled memory region; bare-metal we
-  talk to the controller directly over I2C on the DSI's I2C bus (see R1/R2).
-- **Complexity:** Low–Medium (I2C bus routing for the DSI panel is the only subtlety).
-- **Risks:** R2 — the touch controller sits on the DSI connector's I2C, not the GPIO I2C;
-  bus identification and pull-ups must be confirmed on hardware.
+- **Source:** **Circle (`CRPiTouchScreen`).** We do **not** drive the FT5406 over I2C
+  directly — the VideoCore firmware polls the controller and publishes touch state into a
+  memory region established once via the `GET_TOUCHBUF` mailbox tag (`0x0004000f`). (Direct
+  ARM I2C to the controller is actually unsafe: the GPU owns that i2c-0 bus for its GPIO
+  expander + PSU.) Circle's `CRPiTouchScreen` already implements the touchbuffer read; we
+  wrap it with our gesture/event layer.
+- **Complexity:** Low. Mostly gesture/debounce on top of a working Circle driver.
+- **Risks:** Minor — the buffer is a FIFO updated at ~60 Hz with a "count == 99 means
+  updating" sentinel, so we must poll faster than 60 Hz and skip the sentinel state to
+  avoid corrupt/lost points. No bus identification or scope work needed.
 
 ### 2.4 Audio Engine (mixer + render callback host)
 - **Responsibilities:** Own the active sound device **behind an `ISoundDevice` abstraction**
@@ -646,7 +649,7 @@ Legend: **BMF** = bare-metal-friendly (no OS deps, malloc-only, no threads requi
 | # | Risk | Sev | Lik | Mitigation |
 |---|---|---|---|---|
 | R1 | **DSI panel init / framebuffer quirks** — bare-metal relies on VideoCore firmware to bring up the official 7" DSI panel; config.txt/`ignore_lcd`, firmware version, and dual-cam/disp quirks can leave no framebuffer. | High | Med | Validate Phase 0 on real hardware first; pin a known-good firmware + `config.txt` (`display_default_lcd`, `dtoverlay=vc4-...` as needed); keep HDMI fallback path for bring-up; document exact firmware blob versions. |
-| R2 | **Touch controller on DSI I2C bus** — FT5406 hangs off the DSI connector's I2C (i2c-10/`i2c_vc`), not GPIO I2C-1; wrong bus = no touch. | High | High | Identify correct I2C peripheral early; confirm pull-ups/address 0x38 on scope; abstract the bus behind `Touch` so it's a one-line change. |
+| R2 | **Touch access mechanism** — ~~which I2C bus~~ **RESOLVED by research**: don't use I2C at all; the firmware publishes touch via the `GET_TOUCHBUF` mailbox buffer and Circle's `CRPiTouchScreen` already reads it. | Low | Low | Use `CRPiTouchScreen`; poll >60 Hz; honor the `count==99` "updating" sentinel to avoid FIFO corruption. Hardware check is just "does Circle's touch sample report points," not bus bring-up. |
 | R3 | **Bluetooth firmware blob (CYW43455 .hcd)** — onboard controller needs a vendor HCI firmware patch loaded at init; version mismatch → BT dead. | High | Med | Reuse Circle's proven firmware-load path; pin the exact .hcd from a known Pi firmware; verify with an HCI reset/read-local-version probe before BTstack init. |
 | R4 | **BTstack ↔ Circle HCI transport bridge** — gluing BTstack's `hci_transport_t` to Circle's UART/BCM transport + run loop is custom and error-prone. | High | Med | Start from BTstack's posix/embedded transport template; implement the run-loop as a dedicated `CTask`; build an HCI loopback/echo test before profiles. |
 | R5 | **USB host stability across drives/hubs** — flaky enumeration, power, or quirky drives cause read stalls → audio underrun or mount failure. | High | Med | Lean on Circle's tested stack; test a matrix of drives/hubs; powered hub recommendation; treat USB reads as fallible (timeouts, retry, deep ring buffer absorbs stalls); never read USB from the audio callback. |
@@ -678,9 +681,24 @@ These need a call (or research spike) **before or during Phase 0**:
 4. **Cover art over Bluetooth.** AVRCP cover art uses BIP over OBEX — not all phones/
    versions support it. Is BT cover art must-have, or is "metadata text only + generic art"
    acceptable for BT sources? *Recommend: text metadata must-have, BT cover art best-effort.*
-5. **OTA transport + key management.** Where do update manifests live (HTTPS endpoint vs
-   USB-stick fallback)? Who holds the Ed25519 signing key, and how is the public key
-   provisioned/rotated on devices? Need a concrete signing/release process.
+5. **OTA transport + key management — RECOMMENDED SCHEME (no blocker; one choice for you).**
+   Default design, adopt unless you object:
+   - **Package:** a single `.carup` archive = `{manifest.json, kernel8-<slot>.img,
+     optional assets}`, where `manifest.json` carries `{version, buildId, slotImageSHA256,
+     minPrevVersion, ed25519_sig}`. The signature covers the manifest, and the manifest
+     pins the image's SHA-256 — so verifying the manifest signature + hashing the image is
+     sufficient (no separate image signature needed).
+   - **Crypto:** Ed25519 sign/verify + SHA-256 via mbed TLS. **One offline root signing
+     key**; its **public key is compiled into the image** (and into the recovery image).
+     Support a second "next" public key slot in the image so you can rotate by shipping an
+     update signed by the current key that adds the new key, then start signing with it.
+   - **Transport:** HTTPS GET of `manifest.json` from a fixed URL on known-SSID, then the
+     package; **USB-stick fallback** (drop `.carup` at `/carsh/ota/` and confirm in
+     Settings) for no-network garages. Both feed the same verify→stage→A/B→try→commit path.
+   - **The one decision that's genuinely yours:** who custodies the offline private key and
+     where the HTTPS endpoint lives. Recommendation: you hold the key offline (e.g. on a
+     hardware token / air-gapped), endpoint is a static signed-object host (S3/Pages). Until
+     you have an endpoint, ship with USB-only OTA — it needs no infrastructure.
 6. **WiFi credentials provisioning.** How are home/garage SSIDs + secrets configured —
    pre-baked config file, or a setup screen? (Affects Settings UI + persistence.)
 7. **Multicore usage.** Do we commit to `CMultiCoreSupport` (pin decode to a core) from the
@@ -717,7 +735,8 @@ These need a call (or research spike) **before or during Phase 0**:
 1. Clone Circle, build the AArch64 toolchain, flash the `hello` sample to confirm the
    build/flash loop on the actual Pi 4 + serial console.
 2. Get the **framebuffer + a single glyph** on the **real 7" DSI panel** (resolve R1 now).
-3. Get **FT5406 touch** reading over the correct I2C bus (resolve R2 now).
+3. Run Circle's touchscreen sample to confirm `CRPiTouchScreen` reports points on the panel
+   (no I2C bring-up needed — R2 resolved; this is just a sanity check).
 4. Get a **sine wave out the HiFiBerry DAC** via `CI2SSoundBaseDevice` (resolve I2S/clock).
 5. Only then build the UI toolkit and PcmRing. R1, R2, R3 are the bring-up gates — burn them
    down before writing application logic.
