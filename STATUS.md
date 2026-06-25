@@ -34,7 +34,10 @@ HARDWARE_TODO.md for what the bench session must confirm.
 | AudioEngine + DSP chain host | host-done | RG→EQ hook→vol→limiter; underrun/rendered counts; pause. |
 | DecodePump (decode task) | host-done | Block decode + gapless handoff + track boundaries. |
 | PlayerController | host-done | Transport FSM, queue, gapless, seek, pause, position. |
-| DSP/EQ (biquads, RG) | todo | |
+| DSP: Biquad (RBJ) | host-done | Peak/shelf/LP/HP; verified vs analytic |H|. |
+| DSP: EqProcessor | host-done | Cascade + preamp; RT-safe double-buffer swap; ISampleProcessor. |
+| DSP: ReplayGain apply | host-done | dB<->lin, R128 ref gain, peak-clamped resolve. |
+| DSP: loudness measure (BS.1770) | todo | In indexer (RG scan on import). |
 | Library DB + indexer + search | todo | |
 | Tag parsers | todo | |
 | Cover-art + ASCII generator | todo | |
