@@ -15,6 +15,7 @@
 #include <circle/logger.h>
 #include <SDCard/emmc.h>
 #include <fatfs/ff.h>
+#include <circle/sched/scheduler.h>
 
 class CKernel : public CStdlibApp {
 public:
@@ -30,6 +31,7 @@ private:
     CTimer mTimer;
     CLogger mLogger;
     CEMMCDevice mEMMC;
+    CScheduler mScheduler;   // cooperative scheduler for the decode/UI tasks
     FATFS mFileSystem;
     bool mSdMounted = false;
 };
