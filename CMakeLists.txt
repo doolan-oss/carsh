@@ -90,5 +90,19 @@ else()
   message(STATUS "carsh: faad2 not found — AAC decoder skipped (stub)")
 endif()
 
+# OpenSSL (libcrypto) for the host OTA crypto backend (real Ed25519 + SHA-256).
+# The device build uses an mbed TLS ICrypto implementation instead.
+if(PkgConfig_FOUND)
+  pkg_check_modules(LIBCRYPTO QUIET libcrypto)
+endif()
+if(LIBCRYPTO_FOUND)
+  message(STATUS "carsh: libcrypto found — host OTA crypto enabled")
+  target_compile_definitions(carsh_tests PRIVATE CARSH_HAVE_OPENSSL=1)
+  target_include_directories(carsh_tests PRIVATE ${LIBCRYPTO_INCLUDE_DIRS})
+  target_link_libraries(carsh_tests PRIVATE ${LIBCRYPTO_LIBRARIES})
+else()
+  message(STATUS "carsh: libcrypto not found — OTA crypto tests skipped")
+endif()
+
 enable_testing()
 add_test(NAME unit COMMAND carsh_tests)
