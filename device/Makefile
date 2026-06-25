@@ -21,6 +21,7 @@ OBJS = \
 	$(CARSHTOP)/src/library/Database.o \
 	$(CARSHTOP)/src/library/Indexer.o \
 	$(CARSHTOP)/src/decode/DrDecoders.o \
+	$(CARSHTOP)/src/player/PlayerController.o \
 	$(CARSHTOP)/third_party/dr_libs_impl.o
 
 include $(CIRCLEHOME)/Rules.mk
