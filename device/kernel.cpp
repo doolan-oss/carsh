@@ -7,6 +7,7 @@
 
 #include <circle/bcmframebuffer.h>
 
+#include "CircleDecodeTask.h"
 #include "CircleRenderTarget.h"
 #include "CircleSoundDevice.h"
 #include "CircleTouch.h"
@@ -143,6 +144,10 @@ CStdlibApp::TShutdownMode CKernel::Run(void) {
     bool haveTouch = touch.initialize();
     mLogger.Write(FROM, LogNotice, "touch: %s", haveTouch ? "ready" : "absent");
 
+    // Spawn the cooperative decode task (sole ring producer). The scheduler owns
+    // it; it runs whenever this (UI) task yields via MsSleep below.
+    new carsh::device::CircleDecodeTask(&player);
+
     mLogger.Write(FROM, LogNotice, "entering UI loop");
     unsigned frame = 0;
     for (;;) {
@@ -168,10 +173,9 @@ CStdlibApp::TShutdownMode CKernel::Run(void) {
         mgr.render(canvas);
         rt.present();
 
-        mActLED.On();
-        mTimer.MsDelay(15);
-        mActLED.Off();
-        mTimer.MsDelay(15);   // ~30 fps; the decode task will share this loop
+        // Scheduler-aware sleep: yields to the decode task (and BT/net later)
+        // between frames, ~30 fps. The decode task keeps the ring fed meanwhile.
+        mScheduler.MsSleep(30);
         ++frame;
     }
     return ShutdownHalt;
