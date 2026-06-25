@@ -196,32 +196,25 @@ std::vector<uint64_t> Database::bySource(uint8_t sourceId) const {
 }
 
 std::vector<Database::AlbumEntry> Database::albums() const {
+    // Dedup by albumKey (not by adjacency: with sparse tags two tracks of one
+    // album need not be contiguous in browse order). First-seen order preserved.
     std::vector<AlbumEntry> out;
-    uint64_t lastKey = 0;
-    bool first = true;
+    std::unordered_map<uint64_t, bool> seen;
     for (uint32_t i : sortOrder_) {
         const Track& t = tracks_[i];
-        if (first || t.albumKey != lastKey) {
+        if (seen.emplace(t.albumKey, true).second)
             out.push_back({t.albumKey, strings_.get(t.albumRef),
                            strings_.get(t.albumArtistRef)});
-            lastKey = t.albumKey;
-            first = false;
-        }
     }
     return out;
 }
 
 std::vector<std::string> Database::artists() const {
     std::vector<std::string> out;
-    std::string last;
-    bool first = true;
+    std::unordered_map<std::string, bool> seen;
     for (uint32_t i : sortOrder_) {
         std::string a = strings_.get(tracks_[i].albumArtistRef);
-        if (first || normalize(a) != normalize(last)) {
-            out.push_back(a);
-            last = a;
-            first = false;
-        }
+        if (seen.emplace(normalize(a), true).second) out.push_back(a);
     }
     return out;
 }

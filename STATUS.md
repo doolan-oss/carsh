@@ -37,10 +37,14 @@ HARDWARE_TODO.md for what the bench session must confirm.
 | DSP: Biquad (RBJ) | host-done | Peak/shelf/LP/HP; verified vs analytic |H|. |
 | DSP: EqProcessor | host-done | Cascade + preamp; RT-safe double-buffer swap; ISampleProcessor. |
 | DSP: ReplayGain apply | host-done | dB<->lin, R128 ref gain, peak-clamped resolve. |
-| DSP: loudness measure (BS.1770) | todo | In indexer (RG scan on import). |
-| Library DB + indexer + search | todo | |
-| Tag parsers | todo | |
-| Cover-art + ASCII generator | todo | |
+| DSP: loudness measure (BS.1770) | host-done | K-weighting + gating; rate-correct coeffs; verified. |
+| Library: TextNorm | host-done | UTF-8 casefold + accent strip + tokenize. |
+| Library: Database | host-done | Upsert, token search (AND+prefix), browse, persist. |
+| Library: SmartPlaylist | host-done | Rule engine; All/Any, sort, limit. |
+| Tag parsers (ID3v2/Vorbis/FLAC/Opus) | host-done | Real-encoder fixtures; lame UTF-16 quirk handled. |
+| Tag parsers (MP4/M4A) | deferred | Needs MP4 demux (with AAC-MP4/ALAC). |
+| Library: Indexer | host-done | Interruptible scan, tags+props, RG track+album scan. |
+| Cover-art + ASCII generator | host-done | stb_image decode, downscale, ramp, tint, cache blob. |
 | UI toolkit + 7 screens | todo | |
 | ProfileManager | todo | |
 | EQ presets | todo | |
