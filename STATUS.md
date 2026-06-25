@@ -46,9 +46,13 @@ HARDWARE_TODO.md for what the bench session must confirm.
 | Library: Indexer | host-done | Interruptible scan, tags+props, RG track+album scan. |
 | Cover-art + ASCII generator | host-done | stb_image decode, downscale, ramp, tint, cache blob. |
 | UI toolkit + 7 screens | todo | |
-| ProfileManager | todo | |
-| EQ presets | todo | |
-| OTA package/crypto/A-B logic | todo | |
+| ProfileManager | host-done | MAC→profile, guest clone+remember, persist. |
+| Profile / EQ preset format | host-done | Binary serialize round-trips. |
+| OTA: Crypto (ICrypto) | host-done | OpenSSL host backend (real Ed25519+SHA-256). |
+| OTA: Manifest/Package | host-done | Flat-JSON manifest, .carup verify (sig+image hash). |
+| OTA: BootSlots A/B SM | host-done | decide/stage/confirm/rollback + record persist. |
+| OTA: OtaManager apply | host-done | verify→version-gate→write inactive→arm trial. |
+| OTA: flash write + reboot | stubbed — needs hardware | IFlashTarget host stub; real SD write = H7. |
 | Bluetooth (A2DP/AVRCP) | stubbed (planned) | Logic stubs only; needs controller. |
 | Boot/CKernel, Circle backends | stubbed (planned) | HW bring-up; not host-testable. |
 
