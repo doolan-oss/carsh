@@ -51,6 +51,12 @@ public:
         std::size_t got = dec_->decode(scratch_.data(), want);
         if (got == 0) {
             // Current decoder drained — hand off to next, or finish.
+            ++tracksCompleted_;
+            // Record cumulative output frames at this boundary. Because nothing
+            // written to the ring is ever dropped, this equals the output-frame
+            // index at which the heard stream crosses into the next track — the
+            // controller maps it onto rendered frames for the now-playing index.
+            boundaries_.push_back(framesProduced_);
             if (next_) {
                 dec_ = next_;
                 next_ = nullptr;
@@ -92,6 +98,18 @@ public:
 
     bool eof() const { return eof_; }
     std::size_t framesProduced() const { return framesProduced_; }
+    // Number of decoders that have fully drained (track boundaries crossed).
+    std::size_t tracksCompleted() const { return tracksCompleted_; }
+    // Cumulative output-frame index at each completed track boundary.
+    const std::vector<std::size_t>& trackBoundaries() const { return boundaries_; }
+    // True once the queued `next` has been promoted to current.
+    bool hasNext() const { return next_ != nullptr; }
+    // Replace the current decoder (used by the controller on seek/skip).
+    void setCurrent(carsh::decode::IDecoder* dec) {
+        dec_ = dec;
+        eof_ = false;
+        skip_ = 0;
+    }
 
 private:
     carsh::decode::IDecoder* dec_;
@@ -103,6 +121,8 @@ private:
     std::size_t skip_ = 0;
     std::size_t nextSkip_ = 0;
     std::size_t framesProduced_ = 0;
+    std::size_t tracksCompleted_ = 0;
+    std::vector<std::size_t> boundaries_;
     bool eof_ = false;
 };
 

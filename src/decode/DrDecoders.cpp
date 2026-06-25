@@ -12,6 +12,7 @@
 #include <cctype>
 #include <cstring>
 
+#include "decode/OptionalDecoders.h"
 #include "dr_libs/dr_flac.h"
 #include "dr_libs/dr_mp3.h"
 #include "dr_libs/dr_wav.h"
@@ -167,16 +168,30 @@ private:
 
 Codec sniff(IStream* s) {
     if (!s) return Codec::Unknown;
-    uint8_t hdr[12] = {0};
+    uint8_t hdr[64] = {0};
     s->seek(0);
     size_t n = s->read(hdr, sizeof(hdr));
     s->seek(0);
     if (n >= 12 && !std::memcmp(hdr, "RIFF", 4) && !std::memcmp(hdr + 8, "WAVE", 4))
         return Codec::Wav;
     if (n >= 4 && !std::memcmp(hdr, "fLaC", 4)) return Codec::Flac;
-    // MP3: ID3v2 tag ("ID3") or an MPEG audio sync word 0xFFEx.
+    // Ogg container: distinguish Opus from Vorbis by the codec id in page 0.
+    if (n >= 4 && !std::memcmp(hdr, "OggS", 4)) {
+        for (size_t i = 0; i + 8 <= n; ++i)
+            if (!std::memcmp(hdr + i, "OpusHead", 8)) return Codec::Opus;
+        return Codec::Unknown;  // Ogg Vorbis not supported
+    }
+    // MP4/M4A: 'ftyp' box at offset 4 (AAC or ALAC inside; MP4 demux is backlog).
+    if (n >= 12 && !std::memcmp(hdr + 4, "ftyp", 4)) return Codec::Aac;
+    // ADTS AAC and MP3 share the 0xFF sync byte; the layer field disambiguates.
+    // ADTS: sync 0xFFF, layer bits == 00  -> (b1 & 0xF6) == 0xF0.
+    // MP3 (Layer III): layer bits == 01   -> (b1 & 0xE0) == 0xE0 (and not ADTS).
+    if (n >= 2 && hdr[0] == 0xFF) {
+        if ((hdr[1] & 0xF6) == 0xF0) return Codec::Aac;
+        if ((hdr[1] & 0xE0) == 0xE0) return Codec::Mp3;
+    }
+    // MP3 with a leading ID3v2 tag.
     if (n >= 3 && !std::memcmp(hdr, "ID3", 3)) return Codec::Mp3;
-    if (n >= 2 && hdr[0] == 0xFF && (hdr[1] & 0xE0) == 0xE0) return Codec::Mp3;
     return Codec::Unknown;
 }
 
@@ -185,6 +200,14 @@ std::unique_ptr<IDecoder> createDecoder(Codec c) {
         case Codec::Wav: return std::make_unique<WavDecoder>();
         case Codec::Flac: return std::make_unique<FlacDecoder>();
         case Codec::Mp3: return std::make_unique<Mp3Decoder>();
+#ifdef CARSH_HAVE_OPUS
+        case Codec::Opus: return makeOpusDecoder();
+#endif
+#ifdef CARSH_HAVE_AAC
+        case Codec::Aac: return makeAacDecoder();  // ADTS; MP4 demux is backlog
+#endif
+        // ALAC needs Apple ALAC + an MP4/CAF demuxer; sniffed/catalogued but no
+        // decoder yet (also no host encoder for fixtures). See OPEN_QUESTIONS.
         default: return nullptr;
     }
 }

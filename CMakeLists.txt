@@ -63,5 +63,32 @@ target_link_libraries(carsh_tests PRIVATE carsh_thirdparty)
 target_compile_definitions(carsh_tests PRIVATE
   CARSH_FIXTURES_DIR="${FIXTURES_DIR}")
 
+# Optional: real Opus decode via system libopusfile if present on the build
+# server. The bare-metal port is separate; this proves the wrapper + factory.
+find_package(PkgConfig QUIET)
+if(PkgConfig_FOUND)
+  pkg_check_modules(OPUSFILE QUIET opusfile)
+endif()
+if(OPUSFILE_FOUND)
+  message(STATUS "carsh: libopusfile found — Opus decoder enabled")
+  target_compile_definitions(carsh_tests PRIVATE CARSH_HAVE_OPUS=1)
+  target_include_directories(carsh_tests PRIVATE ${OPUSFILE_INCLUDE_DIRS})
+  target_link_libraries(carsh_tests PRIVATE ${OPUSFILE_LIBRARIES})
+else()
+  message(STATUS "carsh: libopusfile not found — Opus decoder skipped (stub)")
+endif()
+
+# Optional: real AAC (ADTS) decode via system faad2.
+find_library(FAAD_LIB NAMES faad)
+find_path(FAAD_INC NAMES neaacdec.h)
+if(FAAD_LIB AND FAAD_INC)
+  message(STATUS "carsh: faad2 found — AAC (ADTS) decoder enabled")
+  target_compile_definitions(carsh_tests PRIVATE CARSH_HAVE_AAC=1)
+  target_include_directories(carsh_tests PRIVATE ${FAAD_INC})
+  target_link_libraries(carsh_tests PRIVATE ${FAAD_LIB})
+else()
+  message(STATUS "carsh: faad2 not found — AAC decoder skipped (stub)")
+endif()
+
 enable_testing()
 add_test(NAME unit COMMAND carsh_tests)

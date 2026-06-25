@@ -70,6 +70,20 @@ def main():
     else:
         print("lame not found — skipping MP3 fixture")
 
+    if shutil.which("opusenc"):
+        opus = os.path.join(out, "sine.opus")
+        if try_run(["opusenc", "--quiet", wav, opus]):
+            print(f"wrote {opus}")
+    else:
+        print("opusenc not found — skipping Opus fixture")
+
+    if shutil.which("faac"):
+        aac = os.path.join(out, "sine.aac")  # raw ADTS transport (no -w/MP4 wrap)
+        if try_run(["faac", "-o", aac, wav]):
+            print(f"wrote {aac}")
+    else:
+        print("faac not found — skipping AAC fixture")
+
     # Small library tree: a couple of "albums" of WAVs for the indexer. Tags are
     # added later by the tag-writer fixtures; for now filenames carry structure.
     lib = os.path.join(out, "library")
