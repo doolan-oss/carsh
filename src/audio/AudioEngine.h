@@ -65,17 +65,34 @@ public:
     // Enable a simple post-chain soft limiter (tanh) to tame EQ-boost clipping.
     void setSoftLimiter(bool on) { limiter_.store(on, std::memory_order_relaxed); }
 
+    // Pause gates the callback: it outputs silence and does NOT drain the ring,
+    // so the buffered audio (and thus playback position) is preserved on resume.
+    void setPaused(bool p) { paused_.store(p, std::memory_order_relaxed); }
+    bool paused() const { return paused_.load(std::memory_order_relaxed); }
+
     std::size_t underrunFrames() const {
         return underrun_.load(std::memory_order_relaxed);
     }
     void resetUnderrunCount() { underrun_.store(0, std::memory_order_relaxed); }
 
+    // Total real (non-underrun) frames delivered to the device — the basis for
+    // the playback position the UI shows.
+    std::uint64_t framesRendered() const {
+        return rendered_.load(std::memory_order_relaxed);
+    }
+    void resetRenderedCount() { rendered_.store(0, std::memory_order_relaxed); }
+
     // --- IAudioSink (the pull callback) ------------------------------------
 
     std::size_t render(float* out, std::size_t frames) override {
+        if (paused_.load(std::memory_order_relaxed)) {
+            for (std::size_t i = 0; i < frames * channels_; ++i) out[i] = 0.0f;
+            return frames;  // silence, but ring untouched and not an underrun
+        }
         const std::size_t want = frames * channels_;
         const std::size_t got = ring_->read(out, want);
         const std::size_t framesGot = got / channels_;
+        rendered_.fetch_add(framesGot, std::memory_order_relaxed);
         if (framesGot < frames)
             underrun_.fetch_add(frames - framesGot, std::memory_order_relaxed);
 
@@ -121,7 +138,9 @@ private:
     std::atomic<float> replayGain_{1.0f};
     std::atomic<ISampleProcessor*> processor_{nullptr};
     std::atomic<bool> limiter_{false};
+    std::atomic<bool> paused_{false};
     std::atomic<std::size_t> underrun_{0};
+    std::atomic<std::uint64_t> rendered_{0};
 };
 
 }  // namespace carsh::audio
