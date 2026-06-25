@@ -59,8 +59,9 @@ HARDWARE_TODO.md for what the bench session must confirm.
 | OTA: BootSlots A/B SM | host-done | decide/stage/confirm/rollback + record persist. |
 | OTA: OtaManager apply | host-done | verify→version-gate→write inactive→arm trial. |
 | OTA: flash write + reboot | stubbed — needs hardware | IFlashTarget host stub; real SD write = H7. |
-| Bluetooth (A2DP/AVRCP) | stubbed (planned) | Logic stubs only; needs controller. |
-| Boot/CKernel, Circle backends | stubbed (planned) | HW bring-up; not host-testable. |
+| Bluetooth seam (IBluetooth) | host-done (stub) | Interfaces + FakeBluetooth; connect→profile, AVRCP→now-playing, A2DP→ring tested. |
+| Bluetooth real A2DP/AVRCP | stubbed — needs hardware | BTstack+controller; H6. |
+| Boot/CKernel, Circle backends | stubbed — needs hardware | HW bring-up; not host-testable. |
 
 ## Deferred host-buildable work (not hardware-gated, not yet done)
 

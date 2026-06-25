@@ -8,15 +8,21 @@ this is the prioritized list for the first hardware session. Format:
 
 ---
 
-### H0 — Build environment: cross-toolchain + QEMU absent
-- **Module:** build infra.
-- **Validate:** Install the AArch64 bare-metal toolchain (`aarch64-none-elf-gcc`)
-  and `qemu-system-aarch64` on the build server, then build Circle + a `carsh`
-  image and boot it under `qemu raspi3b`/`raspi4b` for boot/scheduler/FB/SD-FAT
-  smoke. The brief says these exist; they are not present in this environment.
-- **Stub now:** All code is host-compiled with g++ 15 against the HAL interfaces.
-  No Circle image is produced. Priority: do this first — it unblocks QEMU-level
-  checks for everything below short of the analog peripherals.
+### H0 — Circle image build + QEMU/board boot
+- **Module:** build infra, `CKernel`.
+- **Status update:** the AArch64 toolchain (`aarch64-linux-gnu-gcc`) and
+  `qemu-system-aarch64` were **not** preinstalled but have since been installed
+  here (via apt). What remains absent is the **Circle source tree + its Makefile
+  build** — so no `kernel8.img` is produced yet, and the HAL interfaces have no
+  Circle backends wired.
+- **Validate:** Clone rsta2/circle, build it with the toolchain, implement the
+  Circle backends behind the HAL interfaces (CBcmFrameBuffer→IRenderTarget,
+  CI2SSoundBaseDevice→ISoundDevice, CFATFileSystem→Vfs, CRPiTouchScreen→ITouch),
+  link the carsh core, and boot under `qemu raspi4b` (then real Pi 4) for
+  boot/scheduler/FB/SD-FAT smoke.
+- **Stub now:** All carsh logic is host-compiled with g++ 15 against the HAL
+  interfaces and host backends. Do this first at the bench — it unblocks QEMU-
+  level checks for everything below short of the analog peripherals.
 
 ### H1 — DSI panel / framebuffer bring-up (Risk R1)
 - **Module:** `CKernel`, IRenderTarget Circle backend.
