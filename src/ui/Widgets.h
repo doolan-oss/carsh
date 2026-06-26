@@ -62,26 +62,30 @@ public:
     const std::string& label() const { return label_; }
 
     void draw(Canvas& c, const Theme& th) override {
-        uint32_t fill = pressedHighlight_ ? th.accentBg : th.panel;
+        uint32_t fill = pressFlash_ > 0 ? th.accentBg : th.panel;
         c.fillRect(bounds.x, bounds.y, bounds.w, bounds.h, fill);
         c.rectOutline(bounds.x, bounds.y, bounds.w, bounds.h, th.accent);
         int tw = int(label_.size()) * kCellW;
         int tx = bounds.x + (bounds.w - tw) / 2;
         int ty = bounds.y + (bounds.h - kCellH) / 2;
         c.drawText(tx, ty, label_, th.bright);
+        // Momentary press feedback: taps are discrete (no release event), so the
+        // highlight decays over a few rendered frames instead of latching on.
+        if (pressFlash_ > 0) --pressFlash_;
     }
     bool onTap(int px, int py) override {
         if (!bounds.contains(px, py)) return false;
-        pressedHighlight_ = true;
+        pressFlash_ = kPressFlashFrames;
         if (onPress_) onPress_();
         return true;
     }
-    void setHighlight(bool h) { pressedHighlight_ = h; }
+    void setHighlight(bool h) { pressFlash_ = h ? kPressFlashFrames : 0; }
 
 private:
+    static constexpr int kPressFlashFrames = 8;  // ~0.25 s at the ~30 fps UI loop
     std::string label_;
     std::function<void()> onPress_;
-    bool pressedHighlight_ = false;
+    int pressFlash_ = 0;
 };
 
 class ListView : public Widget {
