@@ -50,6 +50,35 @@ qemu-system-aarch64 -M raspi3b -kernel kernel8-rpi3.img -serial stdio -display n
 # then reconfigure back to -r 4 and rebuild for the product image
 ```
 
+## Bluetooth (A2DP sink + AVRCP) — scaffold
+
+The app binds to `bt::IBluetooth`; `device/CircleBluetooth` implements it. All
+BTstack-specific code is in `device/BtStackGlue.cpp`, **gated behind
+`CARSH_HAVE_BTSTACK`** — the default build links a stub (no BT), so the rest of
+the image is unaffected. The kernel already wires the seam: connect → driver
+profile switch, AVRCP metadata → BT now-playing, decoded A2DP PCM → `g_btRing`,
+and a `CircleBtRunLoopTask` that pumps the BTstack run loop.
+
+To make it live (at the bench, with a controller):
+
+```sh
+../scripts/fetch_btstack.sh           # pin BTstack under third_party/btstack
+```
+
+Then, modelled on **BTstack `port/raspi`** + `example/a2dp_sink_demo.c` / `avrcp_*`:
+1. Implement the HCI UART transport (`btstack_uart_block_t`) over a Circle
+   `CSerialDevice` on the **controller's** PL011 (not the debug console UART).
+2. `hci_set_chipset(btstack_chipset_bcm_instance())` and pin the BCM/CYW `.hcd`
+   firmware on the SD boot partition (Risk R3).
+3. Init `a2dp_sink` + `avrcp` and complete the packet handlers in
+   `BtStackGlue.cpp` to call `owner->deliverConnected/Metadata/A2dpPcm(...)`.
+4. Add BTstack's `src/` + `classic/{a2dp_sink,avrcp}.c` to the device build and
+   compile with `-DCARSH_HAVE_BTSTACK`.
+
+Two-stage path (mirrors the audio bring-up): get A2DP working first over a **USB
+BT dongle** via Circle's `CUSBBluetoothDevice` → BTstack `hci_transport`
+(simpler, no onboard firmware), then port to the onboard CYW43455.
+
 ## Current milestone (Step 2)
 
 `CKernel` brings up serial logging + the framebuffer and renders the real carsh
