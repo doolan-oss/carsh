@@ -24,6 +24,17 @@ void btGlueProcess();
 // AVRCP controller command (matches bt::AvrcpCommand order: 0=Play..3=Prev).
 void btGlueSendAvrcp(int command);
 
+// Classic device discovery (GAP inquiry). Found devices are delivered back via
+// CircleBluetooth::deliverDeviceDiscovered, and completion via deliverScanComplete.
+// No-op stubs without BTstack.
+void btGlueStartScan();
+void btGlueStopScan();
+
+// Connect/disconnect the A2DP source (the phone). addr6 is a 6-byte Classic
+// address, MSB-first. Failure is delivered via deliverConnectFailed. No-op stubs.
+void btGlueConnect(const unsigned char* addr6);
+void btGlueDisconnect();
+
 }  // namespace carsh::device
 
 #endif
