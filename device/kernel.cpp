@@ -6,6 +6,10 @@
 #include "kernel.h"
 
 #include <circle/bcmframebuffer.h>
+#include <circle/devicenameservice.h>
+
+#include <cstdarg>
+#include <cstdio>
 
 #include "CircleBluetooth.h"
 #include "CircleBtRunLoopTask.h"
@@ -43,6 +47,7 @@ carsh::audio::PcmRing<float> g_btRing(kRate * kChannels);  // A2DP jitter+decode
 carsh::audio::AudioEngine g_engine(&g_ring, kChannels);
 carsh::dsp::EqProcessor g_eq(kRate);
 carsh::device::CircleSource g_sdSource(0, carsh::hal::SourceType::Sd, "SD:");
+carsh::device::CircleSource g_usbSource(1, carsh::hal::SourceType::Usb, "USB:");
 carsh::profile::ProfileManager g_profiles;
 carsh::bt::AvrcpMetadata g_btMeta;  // latest AVRCP now-playing (BT source)
 }  // namespace
@@ -52,7 +57,19 @@ CKernel::CKernel(void)
       mSerial(&mInterrupt),
       mTimer(&mInterrupt),
       mLogger(mOptions.GetLogLevel(), &mTimer),
-      mEMMC(&mInterrupt, &mTimer, &mActLED) {}
+      mEMMC(&mInterrupt, &mTimer, &mActLED),
+      mUSBHCI(&mInterrupt, &mTimer, TRUE) {}
+
+void CKernel::diag(const char* fmt, ...) {
+    char buf[96];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof buf, fmt, ap);
+    va_end(ap);
+    mLogger.Write(FROM, LogNotice, "%s", buf);
+    mDiag.emplace_back(buf);
+    if (mDiag.size() > 16) mDiag.pop_front();
+}
 
 bool CKernel::Initialize(void) {
     if (!CStdlibApp::Initialize()) return false;
@@ -60,24 +77,48 @@ bool CKernel::Initialize(void) {
     if (!mLogger.Initialize(&mSerial)) return false;
     if (!mTimer.Initialize()) return false;
 
-    if (mEMMC.Initialize() && f_mount(&mFileSystem, "SD:", 1) == FR_OK) {
-        mSdMounted = true;
-        mLogger.Write(FROM, LogNotice, "SD mounted (FAT)");
-    } else {
-        mLogger.Write(FROM, LogWarning, "no SD/FAT — running without media");
-    }
+    if (!mUSBHCI.Initialize()) diag("USB: host controller init FAILED");
+
+    mountStorage();
     return true;
 }
 
-void CKernel::scanLibrary(void) {
-    if (!mSdMounted) return;
+void CKernel::mountStorage(void) {
+    // SD (EMMC) — the boot card; may also hold media.
+    if (mEMMC.Initialize() && f_mount(&mFileSystem, "SD:", 1) == FR_OK) {
+        mSdMounted = true;
+        diag("SD: mounted (FAT)");
+    } else {
+        diag("SD: not mounted");
+    }
+
+    // USB mass storage. With plug-and-play, a stick connected at power-on is
+    // enumerated during mUSBHCI.Initialize(); give it a few PnP cycles in case
+    // it is slow to settle, then mount the first device (umsd1) as USB:.
+    for (int attempt = 0; attempt < 20 && !mUsbMounted; ++attempt) {
+        if (CDeviceNameService::Get()->GetDevice("umsd1", TRUE)) {
+            FRESULT r = f_mount(&mUsbFs, "USB:", 1);
+            if (r == FR_OK) {
+                mUsbMounted = true;
+                diag("USB: mounted (FAT) on umsd1");
+            } else {
+                diag("USB: umsd1 found, mount failed (%d) — FAT32?", int(r));
+            }
+            return;
+        }
+        mUSBHCI.UpdatePlugAndPlay();
+        mTimer.MsDelay(50);
+    }
+    diag("USB: no mass-storage device detected");
+}
+
+void CKernel::scanLibrary(carsh::hal::Source& src) {
     carsh::library::Indexer idx(g_db);
-    idx.beginScan(g_sdSource);
-    mLogger.Write(FROM, LogNotice, "indexing %u files...",
-                  unsigned(idx.progress().filesTotal));
+    idx.beginScan(src);
+    diag("indexing %u files...", unsigned(idx.progress().filesTotal));
     while (idx.step(8)) { /* CScheduler::Yield() once the decode task is wired */ }
-    mLogger.Write(FROM, LogNotice, "library: %u tracks, %u albums",
-                  unsigned(g_db.trackCount()), unsigned(g_db.albums().size()));
+    diag("library: %u tracks, %u albums", unsigned(g_db.trackCount()),
+         unsigned(g_db.albums().size()));
 }
 
 void CKernel::checkOta(void) {
@@ -115,10 +156,19 @@ CStdlibApp::TShutdownMode CKernel::Run(void) {
     // on demand via the player on hardware; the I2S device is not opened here.
     g_engine.setSampleProcessor(&g_eq);
     g_engine.setMasterVolume(0.8f);
-    carsh::player::PlayerController player(g_sdSource.vfs(), g_ring, g_engine,
+
+    // Prefer a USB stick for media; fall back to the SD card. The player must
+    // read through the SAME source we index, so logical track paths ("/Music/..")
+    // resolve against the right FatFs drive.
+    carsh::hal::Source& media =
+        mUsbMounted ? static_cast<carsh::hal::Source&>(g_usbSource)
+                    : static_cast<carsh::hal::Source&>(g_sdSource);
+    diag("media source: %s", mUsbMounted ? "USB:" : "SD:");
+
+    carsh::player::PlayerController player(media.vfs(), g_ring, g_engine,
                                            kChannels);
 
-    scanLibrary();
+    scanLibrary(media);
     checkOta();
 
     // Framebuffer + UI.
@@ -214,7 +264,17 @@ CStdlibApp::TShutdownMode CKernel::Run(void) {
     for (;;) {
         if (haveTouch) {
             carsh::hal::TouchEvent ev;
-            while (touch.poll(ev)) mgr.onTouch(ev);  // driver self-updates
+            while (touch.poll(ev)) {
+                // Diagnostics panel toggle: a touch-down in the top-right corner
+                // (clear of the panel at top-left and the tab bar at the bottom).
+                // Consume it so it does not reach the UI.
+                if (ev.phase == carsh::hal::TouchPhase::Down &&
+                    ev.x >= rt.width() - 60 && ev.y < 60) {
+                    mDiagVisible = !mDiagVisible;
+                    continue;
+                }
+                mgr.onTouch(ev);
+            }
         }
         // Refresh now-playing from the player each frame.
         carsh::player::PlayerState ps = player.state();
@@ -232,6 +292,24 @@ CStdlibApp::TShutdownMode CKernel::Run(void) {
         now.setState(st);
 
         mgr.render(canvas);
+
+        // Storage/USB diagnostics panel (toggle: tap the top-right corner).
+        // Mirrors the boot/scan log (SD/USB mount, indexed file/track counts)
+        // onto the display so storage issues are visible without a serial cable.
+        if (mDiagVisible) {
+            int n = int(mDiag.size());
+            canvas.fillRect(0, 0, 380, n * 10 + 4, 0xC8000000u);
+            int y = 2;
+            for (const std::string& l : mDiag) {
+                canvas.drawText(2, y, l, 0xFF33FF66u, 0, 1);
+                y += 10;
+            }
+        }
+        // Toggle affordance: a small marker in the top-right corner (green when
+        // the panel is shown, dim when hidden).
+        canvas.fillRect(rt.width() - 14, 2, 12, 12,
+                        mDiagVisible ? 0xFF33FF66u : 0x80FFFFFFu);
+
         rt.present();
 
         // Scheduler-aware sleep: yields to the decode task (and BT/net later)
