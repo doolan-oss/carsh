@@ -18,7 +18,25 @@ export PATH=/opt/arm-toolchain/bin:$PATH
 cd ../third_party/circle-stdlib
 ./configure -r 4 --prefix aarch64-none-elf-
 make -j$(nproc)
+
+# 3. USB-C serial-log gadget: set a non-zero USB Vendor ID (the default 0x0000 is
+#    rejected by Circle's gadget driver). carsh uses the pid.codes open-source VID
+#    0x1209 for development — replace before shipping a product. Edit
+#    libs/circle/include/circle/sysconfig.h:
+#        #define USB_GADGET_VENDOR_ID  0x1209
+#    then rebuild just the gadget lib:
+cd libs/circle/lib/usb/gadget && make
 ```
+
+### USB-C serial console (no extra cable)
+
+The image presents a USB CDC-ACM **serial gadget** on the Pi 4's USB-C port (the
+dwc2 OTG controller, independent of the xHCI host that drives the USB-A ports).
+With the Pi bus-powered from a host PC over USB-C, the firmware log streams to
+that PC as `/dev/ttyACM0` — the logger retargets to it on connect, and falls back
+to the PL011 UART (GPIO14/15) otherwise. Read it with e.g.
+`picocom -b 115200 /dev/ttyACM0` (the CDC baud is nominal). This coexists with the
+USB-A media stick and the onboard Bluetooth.
 
 > Why circle-stdlib and not plain Circle? carsh's core uses the C++ STL
 > (`std::vector`/`string`/`map`/`function`, `<cmath>`, `<atomic>`, `<complex>`).
