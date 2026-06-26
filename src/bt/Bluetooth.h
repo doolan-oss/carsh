@@ -31,6 +31,16 @@ struct AvrcpMetadata {
 
 enum class AvrcpCommand : uint8_t { Play, Pause, Next, Prev };
 
+// A device found during an inquiry/scan. address is the Classic address used for
+// connect() and ProfileManager keying; name/rssi/class are for display + sorting.
+struct DiscoveredDevice {
+    BdAddr address{};
+    std::string name;
+    int8_t rssi = 0;
+    uint32_t classOfDevice = 0;  // CoD (plain int for trivial copy into the cache)
+    bool connectable = true;
+};
+
 // Callbacks the app registers. Invoked from the BTstack run-loop task on device.
 struct BluetoothCallbacks {
     std::function<void(const BdAddr&)> onConnected;
@@ -39,6 +49,12 @@ struct BluetoothCallbacks {
     // Decoded A2DP PCM (SBC/AAC) destined for the engine's BT decode ring.
     std::function<void(const float* interleaved, std::size_t frames,
                        uint8_t channels)> onA2dpPcm;
+    // Discovery + connection-control events (scan/connect UI). Additive; connect
+    // SUCCESS still arrives via onConnected (so ProfileManager is unchanged) —
+    // only the failure path is new here.
+    std::function<void(const DiscoveredDevice&)> onDeviceDiscovered;
+    std::function<void()> onScanComplete;
+    std::function<void(const BdAddr&, int reason)> onConnectFailed;
 };
 
 class IBluetooth {
@@ -50,6 +66,16 @@ public:
     // True once a phone is connected; exposes its Classic address for profiles.
     virtual bool connected() const = 0;
     virtual BdAddr connectedAddress() const = 0;
+
+    // Discovery + connection control (scan/connect UI). Results are PUSHED via
+    // onDeviceDiscovered (the app caches them) rather than polled, mirroring the
+    // metadata/PCM callbacks. An implementation must stop scanning before paging
+    // (inquiry and connection cannot run together on one Classic controller).
+    virtual void startScan() = 0;
+    virtual void stopScan() = 0;
+    virtual bool isScanning() const = 0;
+    virtual void connect(const BdAddr& addr) = 0;
+    virtual void disconnect() = 0;
 };
 
 }  // namespace carsh::bt

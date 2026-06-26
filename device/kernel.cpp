@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "CircleBluetooth.h"
+#include "bt/DeviceRow.h"
 #include "CircleBtRunLoopTask.h"
 #include "CircleDecodeTask.h"
 #include "CircleFlashTarget.h"
@@ -55,6 +56,7 @@ carsh::device::CircleSource g_sdSource(0, carsh::hal::SourceType::Sd, "SD:");
 carsh::device::CircleSource g_usbSource(1, carsh::hal::SourceType::Usb, "USB:");
 carsh::profile::ProfileManager g_profiles;
 carsh::bt::AvrcpMetadata g_btMeta;  // latest AVRCP now-playing (BT source)
+std::vector<carsh::bt::DiscoveredDevice> g_btDevices;  // scan results for the BT tab
 }  // namespace
 
 CKernel::CKernel(void)
@@ -193,6 +195,7 @@ CStdlibApp::TShutdownMode CKernel::Run(void) {
     carsh::ui::EqScreen eq(mgr.contentRect());
     carsh::ui::ListScreen sources(mgr.contentRect(), "Src");
     carsh::ui::SettingsScreen settings(mgr.contentRect());
+    carsh::ui::DevicesScreen devices(mgr.contentRect());
     mgr.addScreen(&now, "Now");
     mgr.addScreen(&library, "Lib");
     mgr.addScreen(&search, "Find");
@@ -200,6 +203,7 @@ CStdlibApp::TShutdownMode CKernel::Run(void) {
     mgr.addScreen(&eq, "EQ");
     mgr.addScreen(&sources, "Src");
     mgr.addScreen(&settings, "Set");
+    mgr.addScreen(&devices, "BT");
 
     // Left volume rail -> engine master volume. Boots muted (setMasterVolume(0)
     // above); dragging the rail raises it.
@@ -255,6 +259,15 @@ CStdlibApp::TShutdownMode CKernel::Run(void) {
     btcb.onA2dpPcm = [](const float* p, std::size_t f, uint8_t ch) {
         g_btRing.write(p, f * ch);
     };
+    // Scan results feed the BT tab's device cache (upsert by address).
+    btcb.onDeviceDiscovered = [](const carsh::bt::DiscoveredDevice& d) {
+        for (auto& e : g_btDevices)
+            if (e.address == d.address) { e = d; return; }
+        g_btDevices.push_back(d);
+    };
+    btcb.onConnectFailed = [this](const carsh::bt::BdAddr&, int reason) {
+        mLogger.Write(FROM, LogWarning, "BT connect failed: 0x%x", reason);
+    };
     bt.setCallbacks(btcb);
     if (bt.init()) {
         new carsh::device::CircleBtRunLoopTask();
@@ -263,6 +276,19 @@ CStdlibApp::TShutdownMode CKernel::Run(void) {
         mLogger.Write(FROM, LogNotice,
                       "Bluetooth: not built (define CARSH_HAVE_BTSTACK + add BTstack)");
     }
+
+    // BT tab intents -> the radio. `bt` (static) and g_btDevices (file scope) have
+    // static storage, so the lambdas reference them without capture (no dangling
+    // capture of `devices`). connect() itself stops any in-progress inquiry.
+    devices.onScan = [] {
+        if (bt.isScanning()) bt.stopScan();
+        else { g_btDevices.clear(); bt.startScan(); }
+    };
+    devices.onConnect = [](int i) {
+        if (i < 0 || i >= int(g_btDevices.size())) return;
+        bt.connect(g_btDevices[std::size_t(i)].address);
+    };
+    devices.onDisconnect = [] { bt.disconnect(); };
 
     // Spawn the cooperative decode task (sole ring producer). The scheduler owns
     // it; it runs whenever this (UI) task yields via MsSleep below.
@@ -354,6 +380,29 @@ CStdlibApp::TShutdownMode CKernel::Run(void) {
         st.durationMs = ps.durationMs;
         st.playing = ps.transport == carsh::player::Transport::Playing;
         now.setState(st);
+
+        // BT tab: reflect scan state + the discovered/connected device list. The
+        // connected device is upserted into the cache so it always shows, even on
+        // a passive auto-reconnect (its address may not be a scan result).
+        devices.setScanning(bt.isScanning());
+        {
+            int connIdx = -1;
+            if (bt.connected()) {
+                carsh::bt::BdAddr ca = bt.connectedAddress();
+                for (std::size_t i = 0; i < g_btDevices.size(); ++i)
+                    if (g_btDevices[i].address == ca) { connIdx = int(i); break; }
+                if (connIdx < 0) {
+                    carsh::bt::DiscoveredDevice d; d.address = ca; d.name = "(connected)";
+                    connIdx = int(g_btDevices.size());
+                    g_btDevices.push_back(d);
+                }
+            }
+            std::vector<std::string> rows;
+            rows.reserve(g_btDevices.size());
+            for (std::size_t i = 0; i < g_btDevices.size(); ++i)
+                rows.push_back(carsh::bt::deviceRow(g_btDevices[i], int(i) == connIdx));
+            devices.setDevices(rows, connIdx);
+        }
 
         mgr.render(canvas);
 

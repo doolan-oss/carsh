@@ -18,6 +18,10 @@ namespace carsh::device {
 bool btGlueInit(CircleBluetooth*) { return false; }
 void btGlueProcess() {}
 void btGlueSendAvrcp(int) {}
+void btGlueStartScan() {}
+void btGlueStopScan() {}
+void btGlueConnect(const unsigned char*) {}
+void btGlueDisconnect() {}
 }  // namespace carsh::device
 
 #else
@@ -120,6 +124,30 @@ void btGlueSendAvrcp(int command) {
     //   case 3: avrcp_controller_backward(g_cid); break;
     // }
     (void)command;
+}
+
+// Classic GAP inquiry -> discovered devices for the scan/connect UI. TODO: in a
+// gap event handler, on GAP_EVENT_INQUIRY_RESULT build a carsh::bt::DiscoveredDevice
+// (gap_event_inquiry_result_get_bd_addr / _name / _rssi / _class_of_device) and
+// call g_owner->deliverDeviceDiscovered(d); on GAP_EVENT_INQUIRY_COMPLETE call
+// g_owner->deliverScanComplete().
+void btGlueStartScan() {
+    // gap_inquiry_start(GAP_INQUIRY_DURATION);  // ~5.12 s scan window
+}
+void btGlueStopScan() {
+    // gap_inquiry_stop();
+}
+
+void btGlueConnect(const unsigned char* addr6) {
+    // Inquiry and paging cannot run together: stop the scan, then page + open the
+    // A2DP stream. On failure call g_owner->deliverConnectFailed(addr, status).
+    // gap_inquiry_stop();
+    // bd_addr_t addr; for (int i = 0; i < 6; ++i) addr[i] = addr6[i];
+    // a2dp_sink_establish_stream(addr, &g_a2dpCid);
+    (void)addr6;
+}
+void btGlueDisconnect() {
+    // a2dp_sink_disconnect(g_a2dpCid); / gap_disconnect(g_conHandle);
 }
 
 }  // namespace carsh::device
