@@ -2,7 +2,15 @@
 // (PLAN.md §2.3). The firmware publishes touch via the GET_TOUCHBUF mailbox
 // (R2 resolved); CRPiTouchScreen reads it. Its event handler is a plain function
 // pointer with no user param, so we route through a static self-pointer into a
-// queue that poll() drains. Call update() >60 Hz from the UI/input loop.
+// queue that poll() drains.
+//
+// Driving the driver: Circle does NOT self-pump this. CTouchScreenDevice::Update()
+// is what reads the firmware touch buffer and fires events, and its header says
+// "Call this about 60 times per second!" — nothing in CRPiTouchScreen registers a
+// timer to do that. So poll() pumps Update() itself. Also, CTouchScreenDevice
+// requires Setup(CDisplay*) before any event can be reported (ReportHandler
+// dereferences the display for coordinate mapping), so initialize() takes the
+// framebuffer and wires it in.
 #ifndef _carsh_circle_touch_h
 #define _carsh_circle_touch_h
 
@@ -18,20 +26,26 @@ namespace carsh::device {
 
 class CircleTouch : public carsh::hal::ITouch {
 public:
-    bool initialize() {
+    // display: the framebuffer the UI renders to (CBcmFrameBuffer is a CDisplay).
+    // CTouchScreenDevice::Setup() needs it for coordinate mapping; without it,
+    // the first reported event null-derefs the display in ReportHandler.
+    bool initialize(CDisplay* display) {
         if (!mTouch.Initialize()) return false;
         mDevice = static_cast<CTouchScreenDevice*>(
             CDeviceNameService::Get()->GetDevice("touch1", FALSE));
         if (!mDevice) return false;
+        mDevice->Setup(display);  // REQUIRED before Update()/event reporting
         s_self = this;
         mDevice->RegisterEventHandler(&CircleTouch::handler);
         return true;
     }
 
-    // CRPiTouchScreen self-updates via a periodic timer registered in
-    // Initialize() (it polls the firmware touchbuffer ~60 Hz and fires the event
-    // handler), so there is nothing to pump here — just drain the queue.
+    // Pump the driver, then drain. CTouchScreenDevice::Update() polls the firmware
+    // touch buffer and synchronously fires our handler (which enqueues), so one
+    // Update() when the queue is empty refills it for this frame. The UI loop
+    // calls poll() until it returns false, so Update() runs ~once per frame.
     bool poll(carsh::hal::TouchEvent& out) override {
+        if (queue_.empty()) mDevice->Update();
         if (queue_.empty()) return false;
         out = queue_.front();
         queue_.pop_front();
