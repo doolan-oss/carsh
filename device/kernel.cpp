@@ -19,6 +19,7 @@
 #include "bt/DeviceRow.h"
 #include "CircleBtRunLoopTask.h"
 #include "CircleDecodeTask.h"
+#include "CircleUsbLog.h"
 #include "CircleFlashTarget.h"
 #include "CirclePwmSoundDevice.h"
 #include "CircleRenderTarget.h"
@@ -65,7 +66,8 @@ CKernel::CKernel(void)
       mTimer(&mInterrupt),
       mLogger(mOptions.GetLogLevel(), &mTimer),
       mEMMC(&mInterrupt, &mTimer, &mActLED),
-      mUSBHCI(&mInterrupt, &mTimer, TRUE) {}
+      mUSBHCI(&mInterrupt, &mTimer, TRUE),
+      mSerialCDC(&mInterrupt) {}
 
 void CKernel::diag(const char* fmt, ...) {
     char buf[96];
@@ -85,6 +87,10 @@ bool CKernel::Initialize(void) {
     if (!mTimer.Initialize()) return false;
 
     if (!mUSBHCI.Initialize()) diag("USB: host controller init FAILED");
+
+    // USB-C serial-log gadget (dwc2 OTG) — independent of the xHCI host above.
+    mUsbGadgetOk = mSerialCDC.Initialize();
+    diag("USB-C: serial-log gadget %s", mUsbGadgetOk ? "ready" : "FAILED");
 
     mountStorage();
     return true;
@@ -293,6 +299,11 @@ CStdlibApp::TShutdownMode CKernel::Run(void) {
     // Spawn the cooperative decode task (sole ring producer). The scheduler owns
     // it; it runs whenever this (UI) task yields via MsSleep below.
     new carsh::device::CircleDecodeTask(&player);
+
+    // Pump the USB-C serial-log gadget; on host connect it retargets the logger to
+    // the USB serial (fallback: the PL011 UART). Frequent servicing for USB PnP.
+    if (mUsbGadgetOk)
+        new carsh::device::CircleUsbLog(&mSerialCDC, &mLogger, &mSerial);
 
     // Audio output: drive the Pi's onboard 3.5mm jack via PWM (no extra hardware).
     // Opened LAZILY at the first track's sample rate in the loop below (the core

@@ -34,10 +34,12 @@ include $(CIRCLEHOME)/Rules.mk
 
 INCLUDE += -I$(CARSHTOP)/src -I$(CARSHTOP)/third_party
 INCLUDE := $(CIRCLE_STDLIB_INCLUDES) $(INCLUDE)
-# Circle's sound library (PWM/I2S/USB sound base devices) is not part of the
-# default circle-stdlib lib set; add it ahead of the rest (it depends on
-# libcircle, which comes later) so the audio-output backends link.
-LIBS := $(CIRCLEHOME)/lib/sound/libsound.a $(CIRCLE_STDLIB_LIBS)
+# Circle's sound + USB-gadget libraries are not part of the default circle-stdlib
+# lib set; add them ahead of the rest (they depend on libusb/libcircle, which come
+# later) so the audio-output backends and the USB-C serial-log gadget link.
+LIBS := $(CIRCLEHOME)/lib/sound/libsound.a \
+        $(CIRCLEHOME)/lib/usb/gadget/libusbgadget.a \
+        $(CIRCLE_STDLIB_LIBS)
 CPPFLAGS += -std=c++17
 
 -include $(DEPS)
