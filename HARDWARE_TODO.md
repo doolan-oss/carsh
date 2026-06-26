@@ -55,11 +55,27 @@ this is the prioritized list for the first hardware session. Format:
 - **Validate:** Mount + stream from a matrix of USB drives/hubs; hot-unplug mid-read.
 - **Stub now:** HostVfs over a real directory; FAT32-only mandate documented.
 
-### H6 — Bluetooth: firmware blob + transport bridge (Risks R3/R4/R12)
+### H6 — Bluetooth: USB ACL path + firmware blob + bring-up (Risks R3/R4/R12)
 - **Module:** BTstack↔Circle HCI transport, A2DP sink, AVRCP CT/TG.
-- **Validate:** Load CYW43455 .hcd; HCI reset/read-local-version probe; pair a phone;
-  A2DP SBC/AAC → ring; AVRCP metadata + control both ways; clock-drift adaptive SRC.
-- **Stub now:** BtSource and AVRCP are interface stubs only (Phase 3 = logic stubs).
+- **Compiles now:** `make CARSH_HAVE_BTSTACK=1` builds + links BTstack into the
+  image (Classic A2DP-sink + AVRCP + SBC, embedded run loop, Circle USB transport,
+  Realtek chipset). The default `make` still links a stub. The single biggest
+  unknown — does BTstack co-compile with Circle on the target ABI — is retired.
+  AVRCP now-playing assembly is host-tested (`tests/bt/BtParse_test`).
+- **Bench validate (stage 1, USB dongle — Realtek RTL8761B, e.g. TP-Link UB500):**
+  1. **Close the USB ACL gap (blocker for audio).** Extend Circle's
+     `CUSBBluetoothDevice` with bulk ACL in/out and wire it into
+     `CircleHciTransport.cpp` (currently HCI command/event only; ACL is dropped).
+     `third_party/circle-stdlib/` is git-ignored → ship the extension as a tracked
+     patch under `scripts/`.
+  2. Place the Realtek `rtlbt_fw`/`rtlbt_config` for the dongle's USB PID under
+     `SD:/firmware/rtlbt` (R3); confirm HCI reset / read-local-version.
+  3. Trampoline HCI events from USB-completion (IRQ) context onto the run loop.
+  4. Pair a phone; A2DP SBC → `g_btRing`; AVRCP metadata + play/pause/next both
+     ways; clock-drift adaptive SRC on the PCM (R12).
+- **Stage 2:** port the transport to the onboard CYW43455 (UART + `.hcd` firmware).
+- **Stub now (default build):** BtSource and AVRCP are interface stubs;
+  `btGlueInit` returns false so no `CircleBtRunLoopTask` is spawned.
 
 ### H7 — WiFi STA + OTA flash/rollback (Risk R11)
 - **Module:** NetSvc (CYW43455 STA), OTA flash writer, chainloader A/B.
