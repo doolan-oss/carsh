@@ -33,9 +33,18 @@ export PATH=/opt/arm-toolchain/bin:$PATH
 make                # -> kernel8-rpi4.img
 ```
 
-Copy `kernel8-rpi4.img` (renamed `kernel8.img`) + the Pi firmware + `config.txt`
-to a FAT32 SD card. With `enable_uart=1`, the boot log appears on the PL011 UART
-(GPIO14/15) at 115200 — or route it to the HDMI console.
+Copy `kernel8-rpi4.img` (keep this name — `config.txt`'s `[pi4]` section loads
+`kernel=kernel8-rpi4.img`) + the Pi firmware + `config.txt` to a **FAT32** SD card
+(the Pi 4 bootloader cannot read other filesystems). With `enable_uart=1`, the
+boot log appears on the PL011 UART (GPIO14/15) at 115200 — or route it to the
+HDMI console.
+
+The `scripts/make_sdcard.fish` helper assembles a correct boot partition (FAT32 +
+the firmware, kernel, and a Pi 4 `config.txt`) from this tree in one step:
+
+```sh
+scripts/make_sdcard.fish /dev/sdX   # ERASES the target device
+```
 
 ## QEMU smoke (runtime proof, no board)
 

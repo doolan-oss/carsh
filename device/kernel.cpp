@@ -178,7 +178,7 @@ CStdlibApp::TShutdownMode CKernel::Run(void) {
 
     // Touch (real hardware only; QEMU has no digitizer).
     carsh::device::CircleTouch touch;
-    bool haveTouch = touch.initialize();
+    bool haveTouch = touch.initialize(&fb);  // fb supplies touch coord mapping
     mLogger.Write(FROM, LogNotice, "touch: %s", haveTouch ? "ready" : "absent");
 
     // Bluetooth (A2DP sink + AVRCP). Connect switches the driver profile (keyed

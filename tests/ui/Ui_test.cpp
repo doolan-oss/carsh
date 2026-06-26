@@ -37,14 +37,16 @@ TEST(Ui, CanvasDrawsTextPixels) {
 TEST(Ui, GestureTapVsSwipe) {
     GestureRecognizer g;
     Gesture out;
-    // Tap: down+up near same point.
+    // Tap: down then up at the same spot. Up carries no coords (0,0), as the Pi
+    // driver reports it; the release point is derived from the last Down/Move.
     CHECK(!g.feed({hal::TouchPhase::Down, 0, 100, 100, 0}, out));
-    REQUIRE(g.feed({hal::TouchPhase::Up, 0, 103, 102, 30}, out));
+    REQUIRE(g.feed({hal::TouchPhase::Up, 0, 0, 0, 30}, out));
     CHECK(out.type == GestureType::Tap);
-    // Swipe up: large negative dy.
+    // Swipe up: large negative dy. The endpoint arrives via Move; Up is (0,0).
     g.feed({hal::TouchPhase::Down, 0, 200, 300, 0}, out);
     g.feed({hal::TouchPhase::Move, 0, 200, 250, 10}, out);
-    REQUIRE(g.feed({hal::TouchPhase::Up, 0, 200, 150, 20}, out));
+    g.feed({hal::TouchPhase::Move, 0, 200, 150, 20}, out);
+    REQUIRE(g.feed({hal::TouchPhase::Up, 0, 0, 0, 30}, out));
     CHECK(out.type == GestureType::Swipe);
     CHECK(out.dy < -100);
 }

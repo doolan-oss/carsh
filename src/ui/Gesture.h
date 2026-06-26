@@ -35,11 +35,14 @@ public:
             lastX_ = e.x; lastY_ = e.y;
             return false;
         }
-        // Up
+        // Up. The release point comes from the last Down/Move, NOT the Up event:
+        // the Pi touch driver (CRPiTouchScreen) reports FingerUp at (0,0), so
+        // trusting e.x/e.y here misclassifies every tap as a long swipe and routes
+        // it to (0,0). lastX_/lastY_ track the true finger position.
         if (!down_) return false;
         down_ = false;
-        int dx = e.x - sx_, dy = e.y - sy_;
-        out.dx = dx; out.dy = dy; out.x = e.x; out.y = e.y;
+        int dx = lastX_ - sx_, dy = lastY_ - sy_;
+        out.dx = dx; out.dy = dy; out.x = lastX_; out.y = lastY_;
         if (std::abs(dx) <= tapRadius_ && std::abs(dy) <= tapRadius_)
             out.type = GestureType::Tap;
         else
