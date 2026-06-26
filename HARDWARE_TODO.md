@@ -8,21 +8,22 @@ this is the prioritized list for the first hardware session. Format:
 
 ---
 
-### H0 — Circle image build + QEMU/board boot
+### H0 — Circle image build + board boot  [MOSTLY DONE]
 - **Module:** build infra, `CKernel`.
-- **Status update:** the AArch64 toolchain (`aarch64-linux-gnu-gcc`) and
-  `qemu-system-aarch64` were **not** preinstalled but have since been installed
-  here (via apt). What remains absent is the **Circle source tree + its Makefile
-  build** — so no `kernel8.img` is produced yet, and the HAL interfaces have no
-  Circle backends wired.
-- **Validate:** Clone rsta2/circle, build it with the toolchain, implement the
-  Circle backends behind the HAL interfaces (CBcmFrameBuffer→IRenderTarget,
-  CI2SSoundBaseDevice→ISoundDevice, CFATFileSystem→Vfs, CRPiTouchScreen→ITouch),
-  link the carsh core, and boot under `qemu raspi4b` (then real Pi 4) for
-  boot/scheduler/FB/SD-FAT smoke.
-- **Stub now:** All carsh logic is host-compiled with g++ 15 against the HAL
-  interfaces and host backends. Do this first at the bench — it unblocks QEMU-
-  level checks for everything below short of the analog peripherals.
+- **Done:** ARM `aarch64-none-elf` 14.2 toolchain + `qemu-system-aarch64`
+  installed; **circle-stdlib** pinned (`scripts/fetch_circle.sh`) and built
+  (`STDLIB_SUPPORT=4`: newlib + libstdc++ — required because the core uses the
+  C++ STL). `device/` has `CKernel` + the `CircleRenderTarget` framebuffer
+  backend; **`kernel8-rpi4.img` builds** and **boots under QEMU raspi3b without
+  faulting**. This retired the biggest risk: the STL core runs on the target ABI.
+- **Bench validate:** Flash `kernel8-rpi4.img` (as `kernel8.img`) + Pi firmware +
+  `config.txt` (`enable_uart=1`) to a FAT32 SD; confirm the boot log on the PL011
+  UART (115200) and the carsh UI on the panel. (QEMU here can't surface serial
+  *text* headless — see device/README; the board is authoritative.)
+- **Remaining (next device milestones, not blocked):** wire the rest of the
+  Circle backends — `CFATFileSystem`→`Vfs`, `CI2SSoundBaseDevice`→`ISoundDevice`,
+  `CRPiTouchScreen`→`ITouch`, SD boot-slot→`IFlashTarget` — plus the decode +
+  scheduler tasks and the BTstack transport bridge.
 
 ### H1 — DSI panel / framebuffer bring-up (Risk R1)
 - **Module:** `CKernel`, IRenderTarget Circle backend.

@@ -61,7 +61,32 @@ HARDWARE_TODO.md for what the bench session must confirm.
 | OTA: flash write + reboot | stubbed — needs hardware | IFlashTarget host stub; real SD write = H7. |
 | Bluetooth seam (IBluetooth) | host-done (stub) | Interfaces + FakeBluetooth; connect→profile, AVRCP→now-playing, A2DP→ring tested. |
 | Bluetooth real A2DP/AVRCP | stubbed — needs hardware | BTstack+controller; H6. |
-| Boot/CKernel, Circle backends | stubbed — needs hardware | HW bring-up; not host-testable. |
+
+## Device build (Circle / bare metal) — Step 2 in progress
+
+Foundation proven: the STL-heavy core compiles+links into a real bare-metal image
+with `aarch64-none-elf` + circle-stdlib (`STDLIB_SUPPORT=4`). See device/README.md.
+
+| Module | Status | Notes |
+|---|---|---|
+| Toolchain + circle-stdlib | done | ARM aarch64-none-elf 14.2; circle-stdlib Step pinned; newlib+libstdc++ build. |
+| `CKernel` (boot/serial/timer) | builds + QEMU-runs | Serial log @115200; boots cleanly under QEMU raspi3b (no fault). |
+| `CircleRenderTarget` (`IRenderTarget`) | builds | Over `CBcmFrameBuffer`, double-buffered, pitch-aware. Pixels need panel/HDMI (H1). |
+| `CircleVfs`/`CircleSource` (`Vfs`) | builds | FatFs (f_open/read/lseek + dir); SD mounted; real Indexer scans it. |
+| `CircleSoundDevice` (`ISoundDevice`) | builds | CI2SSoundBaseDevice pull→float→DAC range. Opened only on HW (H3/H4). |
+| `CircleTouch` (`ITouch`) | builds | CRPiTouchScreen events→queue; active if digitizer present (H2). |
+| `CircleFlashTarget` (`IFlashTarget`) | builds | FatFs write of kernel8-A/B.img; rollback = bench (H7). |
+| Full app integrated in `CKernel` | builds | SD→library→player→EQ→profiles→UI+7 screens+touch link bare-metal (1.0 MB img). |
+| Real-time decode/scheduler task | builds | `CircleDecodeTask` under `CScheduler`; UI MsSleep yields. Tune yields at bench (H4). |
+| OTA device crypto (`DeviceCrypto`) | builds + host-validated | TweetNaCl Ed25519 + SHA-256 (mbedTLS 2.28 has no Ed25519). Cross-checked vs OpenSSL. |
+| OTA verify on device | builds | Kernel reads/verifies staged `/carsh/ota/*.carup` (no auto-flash; user-confirmed). |
+| Bluetooth scaffold (`CircleBluetooth`) | builds (stub) | `bt::IBluetooth` impl + run-loop `CTask` + A2DP→ring/AVRCP→profile wiring; BTstack glue gated by `CARSH_HAVE_BTSTACK`. |
+| BTstack A2DP/AVRCP glue | todo (drop-in) | Complete `BtStackGlue.cpp` vs port/raspi at the bench (H6); `scripts/fetch_btstack.sh` pins it. |
+
+> QEMU note: the image **builds and runs** under `qemu raspi3b` without faulting,
+> but this QEMU's bcm2835 mailbox/UART I/O doesn't surface serial *text* headless
+> (Circle's own samples behave identically — it routes to the framebuffer window).
+> Authoritative runtime/visual validation is the real Pi 4 over UART + HDMI/DSI.
 
 ## Deferred host-buildable work (not hardware-gated, not yet done)
 
