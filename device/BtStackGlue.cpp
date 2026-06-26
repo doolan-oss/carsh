@@ -33,6 +33,7 @@ void btGlueDisconnect() {}
 // CUSBBluetoothDevice does not yet expose (TODO(hw), see CircleHciTransport.h),
 // so audio cannot actually flow until that gap is closed at the bench.
 #include "CircleHciTransport.h"
+#include "bt/NowPlaying.h"  // platform-independent AVRCP metadata assembly
 
 // BTstack is C; include its headers with C linkage. Specific headers only (NOT
 // the umbrella btstack.h, which drags in BLE/mesh we don't build).
@@ -65,6 +66,10 @@ btstack_packet_callback_registration_t g_hciEventCb;
 uint16_t g_a2dpCid = 0;
 uint16_t g_avrcpCid = 0;
 uint8_t  g_localSeid = 0;
+
+// Accumulates the per-attribute AVRCP now-playing subevents into one metadata
+// (host-tested in tests/bt/BtParse_test).
+carsh::bt::NowPlayingAssembler g_nowPlaying;
 
 // SBC -> PCM decoder for the A2DP media payload (bluedroid).
 const btstack_sbc_decoder_t* g_sbcDecoder = nullptr;
@@ -128,22 +133,53 @@ void a2dpPacketHandler(uint8_t type, uint16_t, uint8_t* packet, uint16_t) {
 void avrcpPacketHandler(uint8_t type, uint16_t, uint8_t* packet, uint16_t) {
     if (type != HCI_EVENT_PACKET) return;
     if (hci_event_packet_get_type(packet) != HCI_EVENT_AVRCP_META) return;
+    using carsh::bt::AvrcpAttr;
     switch (hci_event_avrcp_meta_get_subevent_code(packet)) {
         case AVRCP_SUBEVENT_CONNECTION_ESTABLISHED:
             g_avrcpCid = avrcp_subevent_connection_established_get_avrcp_cid(packet);
             // TODO(hw): enable track-changed / playback-status notifications and
-            // request the initial now-playing info here.
+            // request the initial now-playing info (avrcp_controller_get_now_playing_info)
+            // here so the subevents below start arriving.
             break;
         case AVRCP_SUBEVENT_CONNECTION_RELEASED:
             g_avrcpCid = 0;
+            g_nowPlaying.reset();
             break;
+        // Now-playing attributes arrive one subevent at a time; accumulate them
+        // (the value bytes are length-delimited, not NUL-terminated). The
+        // assembly + duration/status mapping is host-tested in BtParse_test.
         case AVRCP_SUBEVENT_NOW_PLAYING_TITLE_INFO:
+            g_nowPlaying.setAttribute(
+                uint8_t(AvrcpAttr::Title),
+                (const char*)avrcp_subevent_now_playing_title_info_get_value(packet),
+                avrcp_subevent_now_playing_title_info_get_value_len(packet));
+            break;
         case AVRCP_SUBEVENT_NOW_PLAYING_ARTIST_INFO:
+            g_nowPlaying.setAttribute(
+                uint8_t(AvrcpAttr::Artist),
+                (const char*)avrcp_subevent_now_playing_artist_info_get_value(packet),
+                avrcp_subevent_now_playing_artist_info_get_value_len(packet));
+            break;
         case AVRCP_SUBEVENT_NOW_PLAYING_ALBUM_INFO:
-            // TODO(hw): accumulate the now-playing fields across these subevents
-            // into one carsh::bt::AvrcpMetadata and call g_owner->deliverMetadata.
-            // The field bytes are non-NUL-terminated (value_len + value pointer);
-            // assembling them is host-tested separately (tests/bt/BtParse_test).
+            g_nowPlaying.setAttribute(
+                uint8_t(AvrcpAttr::Album),
+                (const char*)avrcp_subevent_now_playing_album_info_get_value(packet),
+                avrcp_subevent_now_playing_album_info_get_value_len(packet));
+            break;
+        case AVRCP_SUBEVENT_NOW_PLAYING_SONG_LENGTH_MS_INFO:
+            g_nowPlaying.setDurationMs(
+                avrcp_subevent_now_playing_song_length_ms_info_get_song_length(packet));
+            break;
+        case AVRCP_SUBEVENT_NOTIFICATION_PLAYBACK_STATUS_CHANGED:
+            g_nowPlaying.setPlaybackStatus(
+                avrcp_subevent_notification_playback_status_changed_get_play_status(packet));
+            if (g_owner) g_owner->deliverMetadata(g_nowPlaying.metadata());
+            break;
+        case AVRCP_SUBEVENT_NOW_PLAYING_INFO_DONE:
+            // All attributes for this track delivered — publish the assembled set.
+            if (g_owner && g_nowPlaying.hasText()) {
+                g_owner->deliverMetadata(g_nowPlaying.metadata());
+            }
             break;
         default:
             break;
