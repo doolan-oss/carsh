@@ -24,13 +24,16 @@ public:
     bool empty() const { return queue_.empty(); }
     void clear() { queue_.clear(); }
 
-    // A single tap at (x,y): down then up at the same point.
+    // A single tap at (x,y): down then up. Real CRPiTouchScreen reports FingerUp
+    // with no coordinates (0,0), so we mirror that — the gesture layer must derive
+    // the release point from the last Down/Move, not the Up event.
     void scriptTap(int x, int y, std::uint32_t tMs = 0) {
         push({carsh::hal::TouchPhase::Down, 0, x, y, tMs});
-        push({carsh::hal::TouchPhase::Up, 0, x, y, tMs + 30});
+        push({carsh::hal::TouchPhase::Up, 0, 0, 0, tMs + 30});
     }
 
-    // A vertical swipe from (x,y0) to (x,y1) over `steps` move events.
+    // A vertical swipe from (x,y0) to (x,y1) over `steps` move events. The final
+    // Move lands on (x,y1); the Up carries no coordinates (0,0), as on hardware.
     void scriptSwipe(int x, int y0, int y1, int steps = 8,
                      std::uint32_t tMs = 0, std::uint32_t stepMs = 10) {
         push({carsh::hal::TouchPhase::Down, 0, x, y0, tMs});
@@ -39,7 +42,7 @@ public:
             push({carsh::hal::TouchPhase::Move, 0, x, y,
                   tMs + std::uint32_t(i) * stepMs});
         }
-        push({carsh::hal::TouchPhase::Up, 0, x, y1,
+        push({carsh::hal::TouchPhase::Up, 0, 0, 0,
               tMs + std::uint32_t(steps + 1) * stepMs});
     }
 
