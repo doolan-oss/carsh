@@ -77,7 +77,7 @@ qemu-system-aarch64 -M raspi3b -kernel kernel8-rpi3.img -serial stdio -display n
 # then reconfigure back to -r 4 and rebuild for the product image
 ```
 
-## Bluetooth (A2DP sink + AVRCP) — scaffold
+## Bluetooth (A2DP sink + AVRCP)
 
 The app binds to `bt::IBluetooth`; `device/CircleBluetooth` implements it. All
 BTstack-specific code is in `device/BtStackGlue.cpp`, **gated behind
@@ -86,25 +86,58 @@ the image is unaffected. The kernel already wires the seam: connect → driver
 profile switch, AVRCP metadata → BT now-playing, decoded A2DP PCM → `g_btRing`,
 and a `CircleBtRunLoopTask` that pumps the BTstack run loop.
 
-To make it live (at the bench, with a controller):
+### Building it
 
 ```sh
-../scripts/fetch_btstack.sh           # pin BTstack under third_party/btstack
+../scripts/fetch_btstack.sh        # pin BTstack under third_party/btstack (once)
+make CARSH_HAVE_BTSTACK=1           # compiles + links BTstack into the image
 ```
 
-Then, modelled on **BTstack `port/raspi`** + `example/a2dp_sink_demo.c` / `avrcp_*`:
-1. Implement the HCI UART transport (`btstack_uart_block_t`) over a Circle
-   `CSerialDevice` on the **controller's** PL011 (not the debug console UART).
-2. `hci_set_chipset(btstack_chipset_bcm_instance())` and pin the BCM/CYW `.hcd`
-   firmware on the SD boot partition (Risk R3).
-3. Init `a2dp_sink` + `avrcp` and complete the packet handlers in
-   `BtStackGlue.cpp` to call `owner->deliverConnected/Metadata/A2dpPcm(...)`.
-4. Add BTstack's `src/` + `classic/{a2dp_sink,avrcp}.c` to the device build and
-   compile with `-DCARSH_HAVE_BTSTACK`.
+This **compiles and links today** (image grows ~1.12 MB → ~1.37 MB). The build
+pulls a curated, Classic-only source closure — core BTstack + the A2DP-sink /
+AVRCP / SDP profiles + the bluedroid SBC codec + the embedded run loop — plus
+three carsh files:
 
-Two-stage path (mirrors the audio bring-up): get A2DP working first over a **USB
-BT dongle** via Circle's `CUSBBluetoothDevice` → BTstack `hci_transport`
-(simpler, no onboard firmware), then port to the onboard CYW43455.
+- `btstack_config.h` — Classic-only A2DP-sink + AVRCP, embedded run loop, no
+  BLE/mesh (small footprint).
+- `HalCircle.cpp` — the embedded HAL (`hal_time_ms` via `CTimer`, `hal_cpu_*`
+  via Circle critical sections).
+- `CircleHciTransport.cpp` — a `hci_transport_t` backed by Circle's
+  `CUSBBluetoothDevice` (the stage-1 USB-dongle path).
+- `BtStackClassicShims.c` — the `hci_le_rand` command descriptor (BLE-gated
+  upstream) so `btstack_crypto` links in a Classic-only config.
+
+`BtStackGlue.cpp` holds the real A2DP-sink + AVRCP + GAP glue (modelled on
+`example/a2dp_sink_demo.c`), and `src/bt/NowPlaying.h` assembles the per-attribute
+AVRCP now-playing subevents into one `bt::AvrcpMetadata` (host-tested in
+`tests/bt/BtParse_test`).
+
+### Two-stage hardware path
+
+Mirrors the audio bring-up: get A2DP working first over a **USB BT dongle**
+(Realtek RTL8761B, e.g. TP-Link UB500) via `CUSBBluetoothDevice` → BTstack
+`hci_transport` (simpler, no onboard firmware), then port to the onboard
+CYW43455. The build above targets stage 1.
+
+### What still needs the bench (TODO(hw), see HARDWARE_TODO H6)
+
+The build links, but it is **not** validated against a radio:
+
+1. **USB ACL data path — the one real transport gap.** Circle's
+   `CUSBBluetoothDevice` configures the bulk IN/OUT endpoints but exposes no ACL
+   transfer API (only the control EP for commands + the interrupt EP for events).
+   `CircleHciTransport.cpp` therefore wires HCI **command/event** (so HCI
+   bring-up, inquiry and connection can work) but **drops ACL** — no A2DP audio
+   flows until `CUSBBluetoothDevice` is extended with bulk ACL in/out. Note
+   `third_party/circle-stdlib/` is git-ignored, so that extension must ship as a
+   tracked patch under `scripts/`, not an in-place edit.
+2. **Realtek firmware blobs.** `BtStackGlue` points the chipset at
+   `SD:/firmware/rtlbt`; the matching `rtlbt_fw` / `rtlbt_config` for the dongle's
+   USB product id must be placed there (R3).
+3. **IRQ-context delivery.** Circle delivers HCI events from USB-completion
+   context; for correctness they should be trampolined onto the BTstack run loop
+   rather than handed to the stack synchronously.
+4. **SSP / pairing** and the **clock-drift adaptive SRC** (R12) on the A2DP PCM.
 
 ## Current milestone (Step 2)
 

@@ -60,7 +60,8 @@ HARDWARE_TODO.md for what the bench session must confirm.
 | OTA: OtaManager apply | host-done | verify→version-gate→write inactive→arm trial. |
 | OTA: flash write + reboot | stubbed — needs hardware | IFlashTarget host stub; real SD write = H7. |
 | Bluetooth seam (IBluetooth) | host-done (stub) | Interfaces + FakeBluetooth; connect→profile, AVRCP→now-playing, A2DP→ring tested. |
-| Bluetooth real A2DP/AVRCP | stubbed — needs hardware | BTstack+controller; H6. |
+| Bluetooth real A2DP/AVRCP | compiles+links, unverified on HW | `CARSH_HAVE_BTSTACK=1` links BTstack (A2DP-sink+AVRCP+SBC); USB ACL path + radio bring-up = H6. |
+| AVRCP now-playing assembly | host-done | `bt::NowPlayingAssembler` accumulates per-attribute subevents; 7 tests (BtParse). |
 
 ## Device build (Circle / bare metal) — Step 2 in progress
 
@@ -81,7 +82,7 @@ with `aarch64-none-elf` + circle-stdlib (`STDLIB_SUPPORT=4`). See device/README.
 | OTA device crypto (`DeviceCrypto`) | builds + host-validated | TweetNaCl Ed25519 + SHA-256 (mbedTLS 2.28 has no Ed25519). Cross-checked vs OpenSSL. |
 | OTA verify on device | builds | Kernel reads/verifies staged `/carsh/ota/*.carup` (no auto-flash; user-confirmed). |
 | Bluetooth scaffold (`CircleBluetooth`) | builds (stub) | `bt::IBluetooth` impl + run-loop `CTask` + A2DP→ring/AVRCP→profile wiring; BTstack glue gated by `CARSH_HAVE_BTSTACK`. |
-| BTstack A2DP/AVRCP glue | todo (drop-in) | Complete `BtStackGlue.cpp` vs port/raspi at the bench (H6); `scripts/fetch_btstack.sh` pins it. |
+| BTstack A2DP/AVRCP glue | compiles+links | `make CARSH_HAVE_BTSTACK=1` links the full A2DP-sink/AVRCP/SBC closure + Circle USB transport + embedded HAL (img 1.12→1.37 MB). Radio bring-up + USB ACL gap = H6. |
 
 > QEMU note: the image **builds and runs** under `qemu raspi3b` without faulting,
 > but this QEMU's bcm2835 mailbox/UART I/O doesn't surface serial *text* headless
