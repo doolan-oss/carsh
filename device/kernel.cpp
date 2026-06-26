@@ -11,10 +11,15 @@
 #include <cstdarg>
 #include <cstdio>
 
+#include <algorithm>
+#include <cmath>
+#include <vector>
+
 #include "CircleBluetooth.h"
 #include "CircleBtRunLoopTask.h"
 #include "CircleDecodeTask.h"
 #include "CircleFlashTarget.h"
+#include "CirclePwmSoundDevice.h"
 #include "CircleRenderTarget.h"
 #include "CircleSoundDevice.h"
 #include "CircleTouch.h"
@@ -259,8 +264,24 @@ CStdlibApp::TShutdownMode CKernel::Run(void) {
     // it; it runs whenever this (UI) task yields via MsSleep below.
     new carsh::device::CircleDecodeTask(&player);
 
+    // Audio output: drive the Pi's onboard 3.5mm jack via PWM (no extra hardware).
+    // Opened LAZILY at the first track's sample rate in the loop below (the core
+    // has no resampler, so the device must clock at the track's native rate, and
+    // opening from a closed state avoids tearing down a running DMA). Once open,
+    // its DMA/IRQ callback is the sole ring consumer, so playback advances and
+    // sound comes out the jack. A USB/I2S DAC would slot in here in future.
+    carsh::device::CirclePwmSoundDevice sound(&mInterrupt);
+    unsigned curRate = 0;  // 0 = not opened yet
+
     mLogger.Write(FROM, LogNotice, "entering UI loop");
     unsigned frame = 0;
+    // Diagnostic software audio sink: no I2S DAC is wired yet, so nothing pulls
+    // the engine — playback position would never advance. Each UI tick we consume
+    // ~30 ms of audio here (decode -> ring -> engine DSP), which advances the
+    // position and yields the output peak for the on-screen level meter. When a
+    // DAC is connected, CircleSoundDevice becomes the sole ring consumer instead.
+    std::vector<float> sinkBuf(std::size_t(kRate) / 20 * kChannels);  // 50 ms max
+    float audioPeak = 0.0f;  // 0..1, peak-hold with per-frame decay
     for (;;) {
         if (haveTouch) {
             carsh::hal::TouchEvent ev;
@@ -278,6 +299,45 @@ CStdlibApp::TShutdownMode CKernel::Run(void) {
         }
         // Refresh now-playing from the player each frame.
         carsh::player::PlayerState ps = player.state();
+
+        // Open / adapt the PWM output to the current track's sample rate, lazily.
+        // The core has no resampler, so the device must clock at the track's native
+        // rate (a fixed rate would shift pitch). Opening from closed is clean, and
+        // close() drains the DMA so a rate-change reopen is safe; a single-rate
+        // library opens once and never reopens.
+        if (ps.queueIndex >= 0 && ps.queueIndex < int(ids.size())) {
+            const carsh::library::Track* t =
+                g_db.get(ids[std::size_t(ps.queueIndex)]);
+            unsigned trackRate = (t && t->sampleRate) ? t->sampleRate : kRate;
+            if (trackRate != curRate) {
+                curRate = trackRate;
+                if (sound.open({curRate, 16, kChannels}, &g_engine))
+                    diag("audio: PWM jack @ %u Hz", unsigned(curRate));
+                else
+                    diag("audio: PWM open FAILED");
+            }
+        }
+
+        // Output level for the meter. With a real device open, its DMA/IRQ
+        // callback is the ring consumer, so we just read its peak (do NOT render
+        // here — a second consumer would violate the ring's SPSC contract).
+        // Without a device, fall back to the diagnostic software sink that pulls
+        // ~one UI tick of audio so the pipeline still runs and position advances.
+        if (sound.isOpen()) {
+            audioPeak = std::max(sound.peak(), audioPeak * 0.80f);
+        } else if (ps.transport == carsh::player::Transport::Playing) {
+            std::size_t framesTick = std::size_t(kRate) * 30 / 1000;  // ~30 ms
+            if (framesTick * kChannels > sinkBuf.size())
+                framesTick = sinkBuf.size() / kChannels;
+            std::size_t framesOut = g_engine.render(sinkBuf.data(), framesTick);
+            float peak = 0.0f;
+            for (std::size_t i = 0; i < framesOut * kChannels; ++i)
+                peak = std::max(peak, std::fabs(sinkBuf[i]));
+            audioPeak = std::max(peak, audioPeak * 0.80f);  // fast attack, slow decay
+        } else {
+            audioPeak *= 0.80f;
+        }
+
         carsh::ui::NowPlayingScreen::State st;
         if (ps.queueIndex >= 0 && ps.queueIndex < int(ids.size())) {
             const carsh::library::Track* t = g_db.get(ids[std::size_t(ps.queueIndex)]);
@@ -309,6 +369,24 @@ CStdlibApp::TShutdownMode CKernel::Run(void) {
         // the panel is shown, dim when hidden).
         canvas.fillRect(rt.width() - 14, 2, 12, 12,
                         mDiagVisible ? 0xFF33FF66u : 0x80FFFFFFu);
+
+        // Output level meter (diagnostic): peak of the engine output this tick,
+        // in the gap just above the tab bar. Green / amber / red near clip. The
+        // underrun counter (u=) climbing means the decoder isn't feeding the ring
+        // fast enough; 0 with a moving bar means the audio pipeline is healthy.
+        {
+            int my = mgr.contentRect().h - 16, mx = 8, mw = 300, mh = 12;
+            canvas.drawText(mx, my + 2, "OUT", 0xFFFFFFFFu, 0, 1);
+            int bx = mx + 28;
+            canvas.rectOutline(bx, my, mw, mh, 0xFF666666u);
+            int fill = int(std::min(audioPeak, 1.0f) * float(mw - 2));
+            uint32_t col = audioPeak > 0.9f ? 0xFFFF3030u
+                         : audioPeak > 0.7f ? 0xFFFFD030u : 0xFF30FF30u;
+            if (fill > 0) canvas.fillRect(bx + 1, my + 1, fill, mh - 2, col);
+            char info[40];
+            snprintf(info, sizeof info, "u=%lu", (unsigned long)ps.underrunFrames);
+            canvas.drawText(bx + mw + 6, my + 2, info, 0xFFAAAAAAu, 0, 1);
+        }
 
         rt.present();
 
