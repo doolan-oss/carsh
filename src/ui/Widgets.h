@@ -5,6 +5,7 @@
 #pragma once
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <functional>
 #include <string>
@@ -86,6 +87,51 @@ private:
     std::string label_;
     std::function<void()> onPress_;
     int pressFlash_ = 0;
+};
+
+// VolumeSlider — vertical level control. Top of the track = maximum, bottom = 0
+// (mute). Driven by a raw drag (setFromY) for continuous feedback, since a slider
+// needs to track the finger live, not wait for a completed-gesture tap.
+class VolumeSlider : public Widget {
+public:
+    explicit VolumeSlider(Rect b) : Widget(b) {}
+
+    // Raw rail position [0,1] — drives the visual fill and the % display.
+    float value() const { return value_; }
+    void setValue(float v) { value_ = v < 0.f ? 0.f : (v > 1.f ? 1.f : v); }
+
+    // Perceptual (logarithmic) gain for the current position — this is what drives
+    // the engine, NOT the raw position. Perceived loudness is ~log of amplitude, so
+    // a linear position->gain map crams the usable range into the bottom of the
+    // travel. A dB taper makes equal slider travel ≈ equal loudness change. The top
+    // is capped (full rail = kMaxGain linear, not 1.0); 0 = mute.
+    float gain() const {
+        if (value_ <= 0.f) return 0.f;
+        float g = kMaxGain * std::pow(10.f, (value_ - 1.f) * (kRangeDb / 20.f));
+        return g > kMaxGain ? kMaxGain : g;  // hard ceiling (guard fp rounding)
+    }
+
+    // Map a touch y within the track to a position (top = 1, bottom = 0), clamped.
+    void setFromY(int y) {
+        if (bounds.h <= 0) return;
+        setValue(float(bounds.y + bounds.h - y) / float(bounds.h));
+    }
+
+    void draw(Canvas& c, const Theme& th) override {
+        c.fillRect(bounds.x, bounds.y, bounds.w, bounds.h, th.panel);
+        int fh = int(value_ * float(bounds.h));
+        int fy = bounds.y + bounds.h - fh;
+        if (fh > 0) c.fillRect(bounds.x, fy, bounds.w, fh, th.accentBg);
+        c.fillRect(bounds.x, fy - 1, bounds.w, 2, th.accent);  // level indicator
+        c.drawText(bounds.x + 4, bounds.y + 4, "VOL", th.dim, 0, 1);
+        c.drawText(bounds.x + 4, bounds.y + bounds.h - 12,
+                   std::to_string(int(value_ * 100.f + 0.5f)), th.bright, 0, 1);
+    }
+
+private:
+    static constexpr float kMaxGain = 0.5f;  // cap: full rail = 0.5 linear gain
+    static constexpr float kRangeDb = 40.f;  // taper span, top to near-bottom (dB)
+    float value_ = 0.0f;                      // boots muted
 };
 
 class ListView : public Widget {

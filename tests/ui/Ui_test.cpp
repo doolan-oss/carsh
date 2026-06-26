@@ -144,6 +144,49 @@ TEST(Ui, TabTapSwitchesActiveScreen) {
     CHECK_EQ(std::string(app.mgr.activeScreen()->name()), std::string("EQ"));
 }
 
+TEST(Ui, VolumeSliderMapsAndClamps) {
+    VolumeSlider v({0, 0, 50, 100});  // track y in [0,100], top = max
+    CHECK(v.value() == 0.0f);          // boots muted
+    v.setFromY(0);   CHECK(v.value() > 0.99f);             // top -> 1
+    v.setFromY(100); CHECK(v.value() < 0.01f);             // bottom -> 0
+    v.setFromY(50);  CHECK(v.value() > 0.45f); CHECK(v.value() < 0.55f);
+    v.setFromY(-20); CHECK(v.value() == 1.0f);             // above -> clamp
+    v.setFromY(999); CHECK(v.value() == 0.0f);             // below -> clamp
+}
+
+TEST(Ui, VolumeLogTaperAndCap) {
+    VolumeSlider v({0, 0, 50, 100});
+    v.setValue(1.0f); CHECK(v.gain() > 0.49f); CHECK(v.gain() <= 0.5f);  // capped
+    v.setValue(0.0f); CHECK(v.gain() == 0.0f);                            // mute
+    // Logarithmic: the slider midpoint sits well below half the cap.
+    v.setValue(0.5f); CHECK(v.gain() < 0.1f);
+    // Monotonic; value()/the % display stays the raw position.
+    v.setValue(0.25f); float g25 = v.gain();
+    v.setValue(0.75f); float g75 = v.gain();
+    CHECK(g75 > g25);
+    CHECK(v.value() == 0.75f);
+}
+
+TEST(Ui, VolumeRailDragSetsVolume) {
+    App app;  // 800x480; rail is the left strip above the tab bar
+    float vol = -1.0f;
+    app.mgr.setOnVolumeChange([&](float v) { vol = v; });
+    // Down at the very top of the rail -> the cap (0.5 linear), live on Down.
+    app.mgr.onTouch({hal::TouchPhase::Down, 0, 10, 0, 0});
+    CHECK(vol > 0.49f); CHECK(vol <= 0.5f);
+    // Drag toward the bottom -> very low (log taper). Up reports (0,0) but must
+    // not zero it.
+    app.mgr.onTouch({hal::TouchPhase::Move, 0, 10, 420, 10});
+    CHECK(vol < 0.05f);
+    float low = vol;
+    app.mgr.onTouch({hal::TouchPhase::Up, 0, 0, 0, 20});
+    CHECK_EQ(vol, low);  // Up's (0,0) ignored
+    // A tap in the content area (right of the rail) does NOT move volume.
+    app.mgr.onTouch({hal::TouchPhase::Down, 0, 400, 200, 30});
+    app.mgr.onTouch({hal::TouchPhase::Up, 0, 0, 0, 40});
+    CHECK_EQ(vol, low);
+}
+
 TEST(Ui, NowPlayingTransportButtons) {
     App app;
     int prev = 0, pp = 0, next = 0;
@@ -168,7 +211,8 @@ TEST(Ui, LibraryListSelection) {
     app.library.setOnSelect([&](int i) { picked = i; });
     app.library.setItems({"Album A", "Album B", "Album C"});
     SyntheticTouch t;
-    app.tap(t, 20, 20);  // first row (rows 44px tall from content y+8)
+    Rect cr = app.mgr.contentRect();
+    app.tap(t, cr.x + 20, cr.y + 20);  // first row (content is inset by the rail)
     CHECK_EQ(picked, 0);
 }
 
@@ -200,7 +244,8 @@ TEST(Ui, SettingsToggle) {
     int activated = -1;
     app.settings.onActivate = [&](int i) { activated = i; };
     SyntheticTouch t;
-    app.tap(t, 20, 20);  // first settings row
+    Rect cr = app.mgr.contentRect();
+    app.tap(t, cr.x + 20, cr.y + 20);  // first settings row (content inset by rail)
     CHECK_EQ(activated, 0);
     app.settings.setValue(0, "Album");  // controller would flip + persist
     app.mgr.render(app.canvas);

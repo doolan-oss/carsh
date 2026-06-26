@@ -160,7 +160,7 @@ CStdlibApp::TShutdownMode CKernel::Run(void) {
     // Wire the audio DSP chain (EQ inserted into the engine). Playback is started
     // on demand via the player on hardware; the I2S device is not opened here.
     g_engine.setSampleProcessor(&g_eq);
-    g_engine.setMasterVolume(0.8f);
+    g_engine.setMasterVolume(0.0f);  // boot muted; the left volume rail raises it
 
     // Prefer a USB stick for media; fall back to the SD card. The player must
     // read through the SAME source we index, so logical track paths ("/Music/..")
@@ -200,6 +200,10 @@ CStdlibApp::TShutdownMode CKernel::Run(void) {
     mgr.addScreen(&eq, "EQ");
     mgr.addScreen(&sources, "Src");
     mgr.addScreen(&settings, "Set");
+
+    // Left volume rail -> engine master volume. Boots muted (setMasterVolume(0)
+    // above); dragging the rail raises it.
+    mgr.setOnVolumeChange([&](float v) { g_engine.setMasterVolume(v); });
 
     // Library list -> tap queues + plays that track.
     std::vector<uint64_t> ids = g_db.allTracks();
@@ -357,11 +361,12 @@ CStdlibApp::TShutdownMode CKernel::Run(void) {
         // Mirrors the boot/scan log (SD/USB mount, indexed file/track counts)
         // onto the display so storage issues are visible without a serial cable.
         if (mDiagVisible) {
+            int dx = mgr.contentRect().x;  // clear of the left volume rail
             int n = int(mDiag.size());
-            canvas.fillRect(0, 0, 380, n * 10 + 4, 0xC8000000u);
+            canvas.fillRect(dx, 0, 380, n * 10 + 4, 0xC8000000u);
             int y = 2;
             for (const std::string& l : mDiag) {
-                canvas.drawText(2, y, l, 0xFF33FF66u, 0, 1);
+                canvas.drawText(dx + 2, y, l, 0xFF33FF66u, 0, 1);
                 y += 10;
             }
         }
@@ -375,7 +380,8 @@ CStdlibApp::TShutdownMode CKernel::Run(void) {
         // underrun counter (u=) climbing means the decoder isn't feeding the ring
         // fast enough; 0 with a moving bar means the audio pipeline is healthy.
         {
-            int my = mgr.contentRect().h - 16, mx = 8, mw = 300, mh = 12;
+            int my = mgr.contentRect().h - 16, mx = mgr.contentRect().x + 4,
+                mw = 280, mh = 12;
             canvas.drawText(mx, my + 2, "OUT", 0xFFFFFFFFu, 0, 1);
             int bx = mx + 28;
             canvas.rectOutline(bx, my, mw, mh, 0xFF666666u);
