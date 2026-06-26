@@ -2,10 +2,14 @@
 // interruptible step model and the ReplayGain (BS.1770) scan pass.
 #include "library/Indexer.h"
 
+#include <map>
+#include <memory>
 #include <string>
+#include <vector>
 
 #include "Test.h"
 #include "fs/HostVfs.h"
+#include "hal/Vfs.h"
 #include "library/Database.h"
 
 using namespace carsh;
@@ -13,6 +17,41 @@ using namespace carsh::library;
 
 static std::string libRoot() {
     return std::string(CARSH_FIXTURES_DIR) + "/library";
+}
+
+namespace {
+// Minimal in-memory Source: the walk (beginScan) only needs readdir, so this
+// asserts hidden-folder skipping without real decodable files on disk.
+struct FakeVfs : hal::Vfs {
+    std::map<std::string, std::vector<hal::DirEntry>> tree;
+    std::unique_ptr<hal::IStream> open(const std::string&) override { return nullptr; }
+    bool stat(const std::string&, hal::DirEntry&) override { return false; }
+    bool readdir(const std::string& path, std::vector<hal::DirEntry>& out) override {
+        auto it = tree.find(path);
+        if (it == tree.end()) return false;
+        out = it->second;
+        return true;
+    }
+};
+struct FakeSource : hal::Source {
+    FakeVfs v;
+    std::uint8_t id() const override { return 1; }
+    hal::SourceType type() const override { return hal::SourceType::Usb; }
+    hal::Vfs& vfs() override { return v; }
+    std::string root() const override { return "/"; }
+};
+}  // namespace
+
+TEST(Indexer, SkipsHiddenDotFolders) {
+    FakeSource src;
+    src.v.tree["/"] = {{"Album", true, 0, 0}, {".Trash-1000", true, 0, 0}};
+    src.v.tree["/Album"] = {{"song.flac", false, 100, 0}};
+    src.v.tree["/.Trash-1000"] = {{"deleted.flac", false, 100, 0}};
+    Database db;
+    Indexer idx(db);
+    idx.beginScan(src);
+    // Only Album/song.flac is queued; the hidden .Trash-1000 tree is skipped.
+    CHECK_EQ(idx.progress().filesTotal, std::size_t(1));
 }
 
 TEST(Indexer, ScansTreeIntoDatabase) {
