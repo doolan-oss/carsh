@@ -3,3 +3,13 @@ build/
 *.wav
 *.png
 /tmp/
+
+# device build artifacts
+device/*.img
+device/*.elf
+device/*.lst
+device/*.map
+*.d
+third_party/circle-stdlib/
+third_party/circle-stdlib/
+third_party/btstack/
