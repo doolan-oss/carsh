@@ -17,6 +17,8 @@ OBJS = \
 	main.o \
 	kernel.o \
 	CircleDir.o \
+	CircleBluetooth.o \
+	BtStackGlue.o \
 	DeviceCrypto.o \
 	$(CARSHTOP)/src/ui/Font.o \
 	$(CARSHTOP)/src/library/Database.o \

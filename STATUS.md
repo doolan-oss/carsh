@@ -80,7 +80,8 @@ with `aarch64-none-elf` + circle-stdlib (`STDLIB_SUPPORT=4`). See device/README.
 | Real-time decode/scheduler task | builds | `CircleDecodeTask` under `CScheduler`; UI MsSleep yields. Tune yields at bench (H4). |
 | OTA device crypto (`DeviceCrypto`) | builds + host-validated | TweetNaCl Ed25519 + SHA-256 (mbedTLS 2.28 has no Ed25519). Cross-checked vs OpenSSL. |
 | OTA verify on device | builds | Kernel reads/verifies staged `/carsh/ota/*.carup` (no auto-flash; user-confirmed). |
-| BTstack↔Circle transport | todo | Phase 3 device — large + needs the controller (H6); BTstack not bundled. |
+| Bluetooth scaffold (`CircleBluetooth`) | builds (stub) | `bt::IBluetooth` impl + run-loop `CTask` + A2DP→ring/AVRCP→profile wiring; BTstack glue gated by `CARSH_HAVE_BTSTACK`. |
+| BTstack A2DP/AVRCP glue | todo (drop-in) | Complete `BtStackGlue.cpp` vs port/raspi at the bench (H6); `scripts/fetch_btstack.sh` pins it. |
 
 > QEMU note: the image **builds and runs** under `qemu raspi3b` without faulting,
 > but this QEMU's bcm2835 mailbox/UART I/O doesn't surface serial *text* headless

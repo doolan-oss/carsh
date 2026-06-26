@@ -7,6 +7,8 @@
 
 #include <circle/bcmframebuffer.h>
 
+#include "CircleBluetooth.h"
+#include "CircleBtRunLoopTask.h"
 #include "CircleDecodeTask.h"
 #include "CircleFlashTarget.h"
 #include "CircleRenderTarget.h"
@@ -36,11 +38,13 @@ constexpr unsigned kRate = 48000;
 constexpr uint8_t kChannels = 2;
 
 carsh::library::Database g_db;
-carsh::audio::PcmRing<float> g_ring(kRate * kChannels);  // ~1 s stereo
+carsh::audio::PcmRing<float> g_ring(kRate * kChannels);  // ~1 s stereo (local)
+carsh::audio::PcmRing<float> g_btRing(kRate * kChannels);  // A2DP jitter+decode
 carsh::audio::AudioEngine g_engine(&g_ring, kChannels);
 carsh::dsp::EqProcessor g_eq(kRate);
 carsh::device::CircleSource g_sdSource(0, carsh::hal::SourceType::Sd, "SD:");
 carsh::profile::ProfileManager g_profiles;
+carsh::bt::AvrcpMetadata g_btMeta;  // latest AVRCP now-playing (BT source)
 }  // namespace
 
 CKernel::CKernel(void)
@@ -176,6 +180,30 @@ CStdlibApp::TShutdownMode CKernel::Run(void) {
     carsh::device::CircleTouch touch;
     bool haveTouch = touch.initialize();
     mLogger.Write(FROM, LogNotice, "touch: %s", haveTouch ? "ready" : "absent");
+
+    // Bluetooth (A2DP sink + AVRCP). Connect switches the driver profile (keyed
+    // on the stable Classic address); AVRCP metadata feeds the BT now-playing;
+    // decoded A2DP PCM flows into the BT ring. Live only when BTstack is compiled
+    // in (CARSH_HAVE_BTSTACK) and the controller comes up.
+    static carsh::device::CircleBluetooth bt;  // outlives Run for the glue callbacks
+    carsh::bt::BluetoothCallbacks btcb;
+    btcb.onConnected = [](const carsh::bt::BdAddr& a) {
+        carsh::profile::BdAddr pa; pa.b = a;
+        g_profiles.onBtConnected(pa);
+    };
+    btcb.onDisconnected = [](const carsh::bt::BdAddr&) { g_profiles.onBtDisconnected(); };
+    btcb.onMetadata = [](const carsh::bt::AvrcpMetadata& m) { g_btMeta = m; };
+    btcb.onA2dpPcm = [](const float* p, std::size_t f, uint8_t ch) {
+        g_btRing.write(p, f * ch);
+    };
+    bt.setCallbacks(btcb);
+    if (bt.init()) {
+        new carsh::device::CircleBtRunLoopTask();
+        mLogger.Write(FROM, LogNotice, "Bluetooth: ready (A2DP/AVRCP)");
+    } else {
+        mLogger.Write(FROM, LogNotice,
+                      "Bluetooth: not built (define CARSH_HAVE_BTSTACK + add BTstack)");
+    }
 
     // Spawn the cooperative decode task (sole ring producer). The scheduler owns
     // it; it runs whenever this (UI) task yields via MsSleep below.

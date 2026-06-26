@@ -12,3 +12,4 @@ device/*.map
 *.d
 third_party/circle-stdlib/
 third_party/circle-stdlib/
+third_party/btstack/
