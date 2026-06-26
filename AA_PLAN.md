@@ -129,9 +129,27 @@ host tests pass, never "validated on the Pi").
 
 ## Status
 
-- [x] Phase 0 — branch created; this plan.
-- [ ] Phase 1 — protocol core port + capture‑replay host tests.
-- [ ] Phase 2 — H.264 NAL framing + decode correctness.
-- [ ] Phase 3 — `CircleAoaTransport` USB‑AOA spike (dongle).
-- [ ] Phase 4 — integration / first projection.
-- [ ] Phase 5 — polish.
+- [x] **Phase 0** — branch + plan; `src/aa/` scaffold; `IAaTransport` seam;
+  `host/aa/FakeAaTransport`; `tests/aa/` harness + capture fixtures.
+- [x] **Phase 1** — protocol core, host-tested:
+  - [x] `AaMessenger` framing/reassembly — byte-exact vs the real DHU capture.
+  - [x] `Pb` protobuf wire codec.
+  - [x] `IAaCrypto` TLS seam + `FakeAaCrypto`.
+  - [x] `AaConnection` bring-up state machine (version → SSL handshake → auth →
+        service discovery → channel opens → dispatch), driven end-to-end by a
+        scripted phone in host tests.
+  - [ ] *Remaining (breadth):* per-channel handlers (av/sensor/input/media/nav
+        decode — currently routed to a generic callback); the real mbedTLS-backed
+        `IAaCrypto` for the device (live handshake is `[hw]`).
+- [x] **Phase 2** — H.264 NAL extraction/classification (`H264Nal`) +
+  `IH264Decoder` seam, host-tested.
+  - [ ] *Remaining `[hw]`:* the SW decoder impl + on-target FPS.
+- [ ] **Phase 3** — `CircleAoaTransport` USB-AOA spike (needs the dongle).
+- [ ] **Phase 4** — integration / first projection.
+- [ ] **Phase 5** — polish.
+
+The whole protocol spine — framing, protobuf, the full connection handshake, and
+video NAL parsing — now builds and is regression-tested on the build server with
+no radio, against Google's real DHU capture bytes where possible (143 host tests).
+What's left is breadth (more per-channel decoders) or genuinely hardware-gated
+(live TLS against the dongle, the USB-AOA transport, on-target decode FPS).
