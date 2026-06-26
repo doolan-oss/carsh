@@ -29,6 +29,9 @@ void Indexer::beginScan(carsh::hal::Source& src) {
         std::vector<carsh::hal::DirEntry> entries;
         if (!src.vfs().readdir(dir, entries)) continue;
         for (auto& e : entries) {
+            // Skip hidden entries (dot-prefixed): OS trash like ".Trash-1000",
+            // ".Spotlight-V100", AppleDouble "._" sidecars, and "."/"..".
+            if (!e.name.empty() && e.name.front() == '.') continue;
             std::string child = dir;
             if (child.empty() || child.back() != '/') child += '/';
             child += e.name;
