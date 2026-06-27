@@ -17,6 +17,12 @@ public:
     virtual ~Screen() = default;
     virtual const char* name() const = 0;
 
+    // Called when this screen's tab becomes / stops being the active one. Most
+    // screens ignore these; the Android Auto screen uses them to drive the AA
+    // VIDEO_FOCUS_INDICATION so the phone only streams frames we're showing.
+    virtual void onActivate() {}
+    virtual void onDeactivate() {}
+
     virtual void draw(Canvas& c, const Theme& th) {
         for (Widget* w : widgets_)
             if (w->visible) w->draw(c, th);
@@ -70,10 +76,11 @@ public:
 
     int activeIndex() const { return active_; }
     void setActive(int i) {
-        if (i >= 0 && i < int(screens_.size())) {
-            active_ = i;
-            tabs_.setActive(i);
-        }
+        if (i < 0 || i >= int(screens_.size()) || i == active_) return;
+        if (screens_[active_]) screens_[active_]->onDeactivate();
+        active_ = i;
+        tabs_.setActive(i);
+        if (screens_[active_]) screens_[active_]->onActivate();
     }
     Screen* activeScreen() {
         return screens_.empty() ? nullptr : screens_[active_];
@@ -113,7 +120,7 @@ public:
         if (!recognizer_.feed(e, g)) return;
         if (g.type == GestureType::Tap && tabs_.bounds.contains(g.x, g.y)) {
             if (tabs_.onTap(g.x, g.y)) {
-                active_ = tabs_.activeIndex();
+                setActive(tabs_.activeIndex());  // fires onDeactivate/onActivate
                 return;
             }
         }
