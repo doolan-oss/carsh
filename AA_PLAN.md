@@ -114,8 +114,10 @@ the content area:
   construction, and tab-switching is unchanged.
 
 Approach when Phase 4 lands:
-1. **New `AndroidAuto` screen** (8th tab). Its draw blits the latest decoded AA
-   frame into `contentRect()`; everything else stays standard chrome.
+1. **New `AndroidAuto` screen** (the 9th tab — 8 already exist incl. BT
+   scan/connect). Its draw blits the latest decoded AA frame into `contentRect()`;
+   everything else stays standard chrome. The volume rail + tab bar that frame it
+   are already **hw-validated** on the Pi 4, so this confines cleanly by design.
 2. **Resolution + scale.** AA video sizes are fixed standards (480p = 800×480,
    720p, 1080p) — you can't request 696×432. Keep the already-advertised **480p**
    (service-discovery video config), decode 800×480, and **scale-blit** into the
@@ -133,6 +135,12 @@ no change to the protocol core already written.
 
 ## Hardware notes
 
+- **The platform under AA is already hardware-validated** (main, June 2026): the
+  base image boots on a real Pi 4 as a working media player — DSI framebuffer
+  (`IRenderTarget`), touch (`ITouch`), PWM-jack audio (`ISoundDevice`), USB-host
+  FAT media (xHCI), and the USB-C serial console are all confirmed on the board.
+  So every backend AA Phase 4 plugs into is proven, not assumed; bring-up debug
+  has a live serial channel. (See STATUS.md / HARDWARE_TODO H0–H5.)
 - Dongle in a Pi 4 **USB‑A** port (xHCI host). Coexists with the separate BT
   A2DP adapter and the USB media stick (all on xHCI); the USB‑C port stays the
   CDC serial‑log gadget.
@@ -144,8 +152,11 @@ no change to the protocol core already written.
 
 1. **SW H.264 decode FPS** on the A72 (Phase 2/4) — the standout. Mitigation:
    dedicate a core; 800×480 is modest; the far‑weaker P4 managed SW decode.
-2. **USB bulk throughput on Circle/xHCI** (Phase 3) — the ESP32's nemesis;
-   prove it early and in isolation.
+2. **USB bulk throughput on Circle/xHCI** (Phase 3) — the ESP32's nemesis.
+   *Partly de-risked:* the xHCI host + bulk transfer are now hw-validated on the
+   board (a FAT media stick mounts + streams), so the controller works; AA adds
+   AOA control + a custom bulk device on that proven host. Still prove sustained
+   bulk-IN throughput early and in isolation.
 3. **Dongle quirks vs a non‑certified head unit** — only the bench tells;
    reuse `head_unit`'s solved AOA strings and compare against its captures.
 4. **mbedTLS cipher coverage** — the AA handshake in the DHU capture is
