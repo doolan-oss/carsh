@@ -37,6 +37,7 @@ void btGlueDisconnect() {}
 
 #include <circle/logger.h>  // bench bring-up diagnostics over the serial log
 #include <cstdio>           // fopen self-test: does newlib reach the SD card?
+#include <cstdarg>          // route BTstack log_info/log_error to the serial log
 
 // BTstack is C; include its headers with C linkage. Specific headers only (NOT
 // the umbrella btstack.h, which drags in BLE/mesh we don't build).
@@ -57,12 +58,28 @@ extern "C" {
 #include "classic/btstack_sbc.h"
 #include "classic/btstack_sbc_bluedroid.h"
 #include "btstack_chipset_realtek.h"
+#include "hci_dump.h"
 }
 
 namespace carsh::device {
 namespace {
 
 const char FromBt[] = "btglue";  // serial-log tag for BT bring-up
+
+// Route BTstack's log_info/log_error (incl. the Realtek chipset's firmware
+// decisions) to the serial log, so bring-up is observable. INFO+ only.
+void btDumpLogMessage(int level, const char* format, va_list ap) {
+    if (level < HCI_DUMP_LOG_LEVEL_INFO) return;
+    char buf[200];
+    vsnprintf(buf, sizeof(buf), format, ap);
+    CLogger::Get()->Write(FromBt, level >= HCI_DUMP_LOG_LEVEL_ERROR ? LogError : LogNotice,
+                          "bt: %s", buf);
+}
+// hci_dump.c calls log_packet for every packet WITHOUT a null check, so it must be
+// non-null even though we only want messages — a no-op (packet logging is also
+// disabled below).
+void btDumpLogPacket(uint8_t, uint8_t, uint8_t*, uint16_t) {}
+const hci_dump_t g_btDump = {nullptr, &btDumpLogPacket, &btDumpLogMessage};
 
 CircleBluetooth* g_owner = nullptr;
 btstack_packet_callback_registration_t g_hciEventCb;
@@ -267,6 +284,8 @@ void hciPacketHandler(uint8_t type, uint16_t, uint8_t* packet, uint16_t) {
 bool btGlueInit(CircleBluetooth* owner) {
     g_owner = owner;
     CLogger::Get()->Write(FromBt, LogNotice, "BT bring-up start (Realtek USB dongle)");
+    hci_dump_init(&g_btDump);          // BTstack log_info/error -> serial
+    hci_dump_enable_packet_log(false); // messages only, no per-packet dumps
 
     // 1. Memory pools + embedded run loop (pumped by CircleBtRunLoopTask).
     btstack_memory_init();
@@ -289,6 +308,11 @@ bool btGlueInit(CircleBluetooth* owner) {
     // TODO(hw): read the real idProduct from the enumerated dongle for other models.
     btstack_chipset_realtek_set_product_id(0x8771);
     hci_set_chipset(btstack_chipset_realtek_instance());
+    // REQUIRED for the Realtek 2-phase init: phase 1 (read LMP subversion) runs at
+    // CUSTOM_PRE_INIT, then phase 2 (read ROM version + DOWNLOAD FIRMWARE) at
+    // CUSTOM_INIT. Without this the pre-init phase is skipped, phase 1 runs late and
+    // returns DONE, and the firmware never downloads — controller stays in ROM mode.
+    hci_enable_custom_pre_init();
 
     // Probe the firmware path up front: this is the one unproven link — whether
     // newlib's fopen() actually reaches the mounted FatFs "SD:" volume. If this
