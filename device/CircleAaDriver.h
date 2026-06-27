@@ -1,15 +1,18 @@
 // CircleAaDriver — drives an AaConnection over the live AOA transport ("uaa1") from
-// the UI loop. AA_PLAN rung 4a: the plaintext VERSION_REQUEST/RESPONSE exchange,
-// which proves the bulk path is bidirectional and stabilises the dongle (it stops
-// resetting once the head unit responds). TLS is stubbed with a logging crypto, so
-// the connection advances to SslHandshake (= version exchange OK) and stops there;
-// the real mbedTLS IAaCrypto is the next rung.
+// the UI loop. Bring-up advances version exchange (rung 4a, plaintext) into the
+// real mbedTLS TLS handshake (rung 4b): the crypto is AaCryptoMbedTls, seeded from
+// the Pi's hardware RNG. With the placeholder head-unit cert (AaHuCert.h) the phone
+// rejects the handshake — swapping in the Google-registered aasdk cert is the [hw]
+// step that lets it complete on the bench; the driver logs the handshake state and
+// any mbedTLS error so that pass is observable on the serial console.
 //
 // Driven from the UI task (tick() each frame), NOT a separate task — so it never
 // races with USB plug-and-play (also UI-task driven), which is what deletes the
 // transport when the dongle re-cycles. It binds/rebinds "uaa1" across those cycles.
 #ifndef _carsh_circle_aa_driver_h
 #define _carsh_circle_aa_driver_h
+
+#include <circle/bcmrandom.h>
 
 #include "aa/AaConnection.h"
 #include "aa/AaMessenger.h"
@@ -24,6 +27,12 @@ public:
 
 private:
     void teardown();
+
+    // mbedTLS entropy callback — fills buf from the Pi's hardware RNG. ctx is the
+    // CBcmRandomNumberGenerator below.
+    static int rngEntropy(void* ctx, unsigned char* buf, size_t len);
+
+    CBcmRandomNumberGenerator rng_;  // HW entropy source for the TLS DRBG seed
     void* boundDev_ = nullptr;  // CAndroidAutoDevice* — compared only, never deref'd stale
     carsh::aa::IAaCrypto* crypto_ = nullptr;
     carsh::aa::AaMessenger* msger_ = nullptr;

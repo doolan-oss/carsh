@@ -122,5 +122,26 @@ else()
   message(STATUS "carsh: libcrypto not found — OTA crypto tests skipped")
 endif()
 
+# Optional: host-test the device's mbedTLS AA crypto (device/AaCryptoMbedTls.cpp)
+# against the system mbedTLS. circle-stdlib bundles mbedTLS 2.28 and Ubuntu's
+# libmbedtls-dev is the same 2.28 line, so the in-memory TLS 1.2 handshake +
+# record round-trip the device path performs is genuinely exercised on the build
+# server. The LIVE handshake against a real phone (and the Google-registered cert)
+# stays [hw]. Without mbedTLS the test compiles to nothing (see the #ifdef guard).
+find_library(MBEDTLS_LIB NAMES mbedtls)
+find_library(MBEDX509_LIB NAMES mbedx509)
+find_library(MBEDCRYPTO_LIB NAMES mbedcrypto)
+find_path(MBEDTLS_INC NAMES mbedtls/ssl.h)
+if(MBEDTLS_LIB AND MBEDX509_LIB AND MBEDCRYPTO_LIB AND MBEDTLS_INC)
+  message(STATUS "carsh: mbedTLS found — AA TLS crypto host test enabled")
+  target_sources(carsh_tests PRIVATE ${CMAKE_SOURCE_DIR}/device/AaCryptoMbedTls.cpp)
+  target_compile_definitions(carsh_tests PRIVATE CARSH_HAVE_MBEDTLS=1)
+  target_include_directories(carsh_tests PRIVATE ${MBEDTLS_INC})
+  # Link order matters: mbedtls -> mbedx509 -> mbedcrypto.
+  target_link_libraries(carsh_tests PRIVATE ${MBEDTLS_LIB} ${MBEDX509_LIB} ${MBEDCRYPTO_LIB})
+else()
+  message(STATUS "carsh: mbedTLS not found — AA TLS crypto host test skipped (stub)")
+endif()
+
 enable_testing()
 add_test(NAME unit COMMAND carsh_tests)
