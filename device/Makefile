@@ -19,8 +19,11 @@ OBJS = \
 	CircleDir.o \
 	CircleBluetooth.o \
 	CircleAoaTransport.o \
+	CircleAaDriver.o \
 	BtStackGlue.o \
 	DeviceCrypto.o \
+	$(CARSHTOP)/src/aa/AaMessenger.o \
+	$(CARSHTOP)/src/aa/AaConnection.o \
 	$(CARSHTOP)/src/ui/Font.o \
 	$(CARSHTOP)/src/library/Database.o \
 	$(CARSHTOP)/src/library/Indexer.o \
