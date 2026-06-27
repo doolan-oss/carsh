@@ -7,6 +7,8 @@
 #ifndef _carsh_btstack_glue_h
 #define _carsh_btstack_glue_h
 
+#include <cstdint>
+
 namespace carsh::device {
 
 class CircleBluetooth;  // forward decl; glue calls back into it to deliver events
@@ -23,6 +25,21 @@ void btGlueProcess();
 
 // AVRCP controller command (matches bt::AvrcpCommand order: 0=Play..3=Prev).
 void btGlueSendAvrcp(int command);
+
+// Classic device discovery (GAP inquiry). Found devices are delivered back via
+// CircleBluetooth::deliverDeviceDiscovered, and completion via deliverScanComplete.
+// No-op stubs without BTstack.
+void btGlueStartScan();
+void btGlueStopScan();
+
+// Connect/disconnect the A2DP source (the phone). addr6 is a 6-byte Classic
+// address, MSB-first. Failure is delivered via deliverConnectFailed. No-op stubs.
+void btGlueConnect(const unsigned char* addr6);
+void btGlueDisconnect();
+
+// Current A2DP SBC sample rate in Hz (so the output device clocks at the stream's
+// rate). 0 when BTstack is not built in.
+uint32_t btGlueA2dpSampleRate();
 
 }  // namespace carsh::device
 

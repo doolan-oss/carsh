@@ -11,10 +11,17 @@
 #include <cstdarg>
 #include <cstdio>
 
+#include <algorithm>
+#include <cmath>
+#include <vector>
+
 #include "CircleBluetooth.h"
+#include "bt/DeviceRow.h"
 #include "CircleBtRunLoopTask.h"
 #include "CircleDecodeTask.h"
+#include "CircleUsbLog.h"
 #include "CircleFlashTarget.h"
+#include "CirclePwmSoundDevice.h"
 #include "CircleRenderTarget.h"
 #include "CircleSoundDevice.h"
 #include "CircleTouch.h"
@@ -46,10 +53,29 @@ carsh::audio::PcmRing<float> g_ring(kRate * kChannels);  // ~1 s stereo (local)
 carsh::audio::PcmRing<float> g_btRing(kRate * kChannels);  // A2DP jitter+decode
 carsh::audio::AudioEngine g_engine(&g_ring, kChannels);
 carsh::dsp::EqProcessor g_eq(kRate);
+
+// PWM output sink: plays decoded A2DP PCM when the BT ring has data, otherwise the
+// local player engine. The DMA/IRQ callback calls render(); the BT ring is the
+// SPSC consumer here (producer is the A2DP decode callback). BT bypasses the
+// engine's volume/EQ for now (the phone controls volume).
+class BtMixSink : public carsh::hal::IAudioSink {
+public:
+    std::size_t render(float* out, std::size_t frames) override {
+        const std::size_t want = frames * kChannels;
+        if (g_btRing.readable() >= want) {
+            std::size_t got = g_btRing.read(out, want);
+            for (std::size_t i = got; i < want; ++i) out[i] = 0.0f;
+            return frames;
+        }
+        return g_engine.render(out, frames);
+    }
+};
+BtMixSink g_outSink;
 carsh::device::CircleSource g_sdSource(0, carsh::hal::SourceType::Sd, "SD:");
 carsh::device::CircleSource g_usbSource(1, carsh::hal::SourceType::Usb, "USB:");
 carsh::profile::ProfileManager g_profiles;
 carsh::bt::AvrcpMetadata g_btMeta;  // latest AVRCP now-playing (BT source)
+std::vector<carsh::bt::DiscoveredDevice> g_btDevices;  // scan results for the BT tab
 }  // namespace
 
 CKernel::CKernel(void)
@@ -58,7 +84,8 @@ CKernel::CKernel(void)
       mTimer(&mInterrupt),
       mLogger(mOptions.GetLogLevel(), &mTimer),
       mEMMC(&mInterrupt, &mTimer, &mActLED),
-      mUSBHCI(&mInterrupt, &mTimer, TRUE) {}
+      mUSBHCI(&mInterrupt, &mTimer, TRUE),
+      mSerialCDC(&mInterrupt) {}
 
 void CKernel::diag(const char* fmt, ...) {
     char buf[96];
@@ -78,6 +105,10 @@ bool CKernel::Initialize(void) {
     if (!mTimer.Initialize()) return false;
 
     if (!mUSBHCI.Initialize()) diag("USB: host controller init FAILED");
+
+    // USB-C serial-log gadget (dwc2 OTG) — independent of the xHCI host above.
+    mUsbGadgetOk = mSerialCDC.Initialize();
+    diag("USB-C: serial-log gadget %s", mUsbGadgetOk ? "ready" : "FAILED");
 
     mountStorage();
     return true;
@@ -155,7 +186,7 @@ CStdlibApp::TShutdownMode CKernel::Run(void) {
     // Wire the audio DSP chain (EQ inserted into the engine). Playback is started
     // on demand via the player on hardware; the I2S device is not opened here.
     g_engine.setSampleProcessor(&g_eq);
-    g_engine.setMasterVolume(0.8f);
+    g_engine.setMasterVolume(0.0f);  // boot muted; the left volume rail raises it
 
     // Prefer a USB stick for media; fall back to the SD card. The player must
     // read through the SAME source we index, so logical track paths ("/Music/..")
@@ -188,6 +219,7 @@ CStdlibApp::TShutdownMode CKernel::Run(void) {
     carsh::ui::EqScreen eq(mgr.contentRect());
     carsh::ui::ListScreen sources(mgr.contentRect(), "Src");
     carsh::ui::SettingsScreen settings(mgr.contentRect());
+    carsh::ui::DevicesScreen devices(mgr.contentRect());
     mgr.addScreen(&now, "Now");
     mgr.addScreen(&library, "Lib");
     mgr.addScreen(&search, "Find");
@@ -195,6 +227,11 @@ CStdlibApp::TShutdownMode CKernel::Run(void) {
     mgr.addScreen(&eq, "EQ");
     mgr.addScreen(&sources, "Src");
     mgr.addScreen(&settings, "Set");
+    mgr.addScreen(&devices, "BT");
+
+    // Left volume rail -> engine master volume. Boots muted (setMasterVolume(0)
+    // above); dragging the rail raises it.
+    mgr.setOnVolumeChange([&](float v) { g_engine.setMasterVolume(v); });
 
     // Library list -> tap queues + plays that track.
     std::vector<uint64_t> ids = g_db.allTracks();
@@ -231,6 +268,19 @@ CStdlibApp::TShutdownMode CKernel::Run(void) {
     bool haveTouch = touch.initialize(&fb);  // fb supplies touch coord mapping
     mLogger.Write(FROM, LogNotice, "touch: %s", haveTouch ? "ready" : "absent");
 
+    // Bring the USB-C serial log up BEFORE Bluetooth: BT bring-up runs on this
+    // thread and can block, and its diagnostics must be visible. The retarget
+    // happens inside CircleUsbLog::Run(), so spawn it now and spin the scheduler
+    // until the host serial (utty1) enumerates (bounded ~2s; skipped if no host).
+    if (mUsbGadgetOk) {
+        new carsh::device::CircleUsbLog(&mSerialCDC, &mLogger, &mSerial);
+        for (unsigned i = 0; i < 400; ++i) {
+            CScheduler::Get()->Yield();  // lets the gadget PnP task run + attach
+            if (CDeviceNameService::Get()->GetDevice("utty1", FALSE)) break;
+            mTimer.MsDelay(5);
+        }
+    }
+
     // Bluetooth (A2DP sink + AVRCP). Connect switches the driver profile (keyed
     // on the stable Classic address); AVRCP metadata feeds the BT now-playing;
     // decoded A2DP PCM flows into the BT ring. Live only when BTstack is compiled
@@ -246,6 +296,15 @@ CStdlibApp::TShutdownMode CKernel::Run(void) {
     btcb.onA2dpPcm = [](const float* p, std::size_t f, uint8_t ch) {
         g_btRing.write(p, f * ch);
     };
+    // Scan results feed the BT tab's device cache (upsert by address).
+    btcb.onDeviceDiscovered = [](const carsh::bt::DiscoveredDevice& d) {
+        for (auto& e : g_btDevices)
+            if (e.address == d.address) { e = d; return; }
+        g_btDevices.push_back(d);
+    };
+    btcb.onConnectFailed = [this](const carsh::bt::BdAddr&, int reason) {
+        mLogger.Write(FROM, LogWarning, "BT connect failed: 0x%x", reason);
+    };
     bt.setCallbacks(btcb);
     if (bt.init()) {
         new carsh::device::CircleBtRunLoopTask();
@@ -255,12 +314,43 @@ CStdlibApp::TShutdownMode CKernel::Run(void) {
                       "Bluetooth: not built (define CARSH_HAVE_BTSTACK + add BTstack)");
     }
 
+    // BT tab intents -> the radio. `bt` (static) and g_btDevices (file scope) have
+    // static storage, so the lambdas reference them without capture (no dangling
+    // capture of `devices`). connect() itself stops any in-progress inquiry.
+    devices.onScan = [] {
+        if (bt.isScanning()) bt.stopScan();
+        else { g_btDevices.clear(); bt.startScan(); }
+    };
+    devices.onConnect = [](int i) {
+        if (i < 0 || i >= int(g_btDevices.size())) return;
+        bt.connect(g_btDevices[std::size_t(i)].address);
+    };
+    devices.onDisconnect = [] { bt.disconnect(); };
+
     // Spawn the cooperative decode task (sole ring producer). The scheduler owns
     // it; it runs whenever this (UI) task yields via MsSleep below.
     new carsh::device::CircleDecodeTask(&player);
 
+    // (USB-C serial-log gadget was brought up above, before Bluetooth init.)
+
+    // Audio output: drive the Pi's onboard 3.5mm jack via PWM (no extra hardware).
+    // Opened LAZILY at the first track's sample rate in the loop below (the core
+    // has no resampler, so the device must clock at the track's native rate, and
+    // opening from a closed state avoids tearing down a running DMA). Once open,
+    // its DMA/IRQ callback is the sole ring consumer, so playback advances and
+    // sound comes out the jack. A USB/I2S DAC would slot in here in future.
+    carsh::device::CirclePwmSoundDevice sound(&mInterrupt);
+    unsigned curRate = 0;  // 0 = not opened yet
+
     mLogger.Write(FROM, LogNotice, "entering UI loop");
     unsigned frame = 0;
+    // Diagnostic software audio sink: no I2S DAC is wired yet, so nothing pulls
+    // the engine — playback position would never advance. Each UI tick we consume
+    // ~30 ms of audio here (decode -> ring -> engine DSP), which advances the
+    // position and yields the output peak for the on-screen level meter. When a
+    // DAC is connected, CircleSoundDevice becomes the sole ring consumer instead.
+    std::vector<float> sinkBuf(std::size_t(kRate) / 20 * kChannels);  // 50 ms max
+    float audioPeak = 0.0f;  // 0..1, peak-hold with per-frame decay
     for (;;) {
         if (haveTouch) {
             carsh::hal::TouchEvent ev;
@@ -278,6 +368,57 @@ CStdlibApp::TShutdownMode CKernel::Run(void) {
         }
         // Refresh now-playing from the player each frame.
         carsh::player::PlayerState ps = player.state();
+
+        // Open / adapt the PWM output to the current track's sample rate, lazily.
+        // The core has no resampler, so the device must clock at the track's native
+        // rate (a fixed rate would shift pitch). Opening from closed is clean, and
+        // close() drains the DMA so a rate-change reopen is safe; a single-rate
+        // library opens once and never reopens.
+        // When a phone is connected over A2DP, clock the output at the SBC stream
+        // rate (typically 44.1 kHz); otherwise at the local track's rate. The output
+        // device always renders g_outSink, which mixes BT audio over the local
+        // engine. Reopen only on a rate change (close() drains the DMA safely).
+        unsigned wantRate = curRate;
+        bool wantOpen = false;
+        if (bt.connected()) {
+            uint32_t r = carsh::device::btGlueA2dpSampleRate();
+            wantRate = r ? r : 44100;
+            wantOpen = true;
+        } else if (ps.queueIndex >= 0 && ps.queueIndex < int(ids.size())) {
+            const carsh::library::Track* t =
+                g_db.get(ids[std::size_t(ps.queueIndex)]);
+            wantRate = (t && t->sampleRate) ? t->sampleRate : kRate;
+            wantOpen = true;
+        }
+        if (wantOpen && (wantRate != curRate || !sound.isOpen())) {
+            curRate = wantRate;
+            if (sound.open({curRate, 16, kChannels}, &g_outSink))
+                diag("audio: PWM jack @ %u Hz%s", unsigned(curRate),
+                     bt.connected() ? " (BT)" : "");
+            else
+                diag("audio: PWM open FAILED");
+        }
+
+        // Output level for the meter. With a real device open, its DMA/IRQ
+        // callback is the ring consumer, so we just read its peak (do NOT render
+        // here — a second consumer would violate the ring's SPSC contract).
+        // Without a device, fall back to the diagnostic software sink that pulls
+        // ~one UI tick of audio so the pipeline still runs and position advances.
+        if (sound.isOpen()) {
+            audioPeak = std::max(sound.peak(), audioPeak * 0.80f);
+        } else if (ps.transport == carsh::player::Transport::Playing) {
+            std::size_t framesTick = std::size_t(kRate) * 30 / 1000;  // ~30 ms
+            if (framesTick * kChannels > sinkBuf.size())
+                framesTick = sinkBuf.size() / kChannels;
+            std::size_t framesOut = g_engine.render(sinkBuf.data(), framesTick);
+            float peak = 0.0f;
+            for (std::size_t i = 0; i < framesOut * kChannels; ++i)
+                peak = std::max(peak, std::fabs(sinkBuf[i]));
+            audioPeak = std::max(peak, audioPeak * 0.80f);  // fast attack, slow decay
+        } else {
+            audioPeak *= 0.80f;
+        }
+
         carsh::ui::NowPlayingScreen::State st;
         if (ps.queueIndex >= 0 && ps.queueIndex < int(ids.size())) {
             const carsh::library::Track* t = g_db.get(ids[std::size_t(ps.queueIndex)]);
@@ -291,17 +432,41 @@ CStdlibApp::TShutdownMode CKernel::Run(void) {
         st.playing = ps.transport == carsh::player::Transport::Playing;
         now.setState(st);
 
+        // BT tab: reflect scan state + the discovered/connected device list. The
+        // connected device is upserted into the cache so it always shows, even on
+        // a passive auto-reconnect (its address may not be a scan result).
+        devices.setScanning(bt.isScanning());
+        {
+            int connIdx = -1;
+            if (bt.connected()) {
+                carsh::bt::BdAddr ca = bt.connectedAddress();
+                for (std::size_t i = 0; i < g_btDevices.size(); ++i)
+                    if (g_btDevices[i].address == ca) { connIdx = int(i); break; }
+                if (connIdx < 0) {
+                    carsh::bt::DiscoveredDevice d; d.address = ca; d.name = "(connected)";
+                    connIdx = int(g_btDevices.size());
+                    g_btDevices.push_back(d);
+                }
+            }
+            std::vector<std::string> rows;
+            rows.reserve(g_btDevices.size());
+            for (std::size_t i = 0; i < g_btDevices.size(); ++i)
+                rows.push_back(carsh::bt::deviceRow(g_btDevices[i], int(i) == connIdx));
+            devices.setDevices(rows, connIdx);
+        }
+
         mgr.render(canvas);
 
         // Storage/USB diagnostics panel (toggle: tap the top-right corner).
         // Mirrors the boot/scan log (SD/USB mount, indexed file/track counts)
         // onto the display so storage issues are visible without a serial cable.
         if (mDiagVisible) {
+            int dx = mgr.contentRect().x;  // clear of the left volume rail
             int n = int(mDiag.size());
-            canvas.fillRect(0, 0, 380, n * 10 + 4, 0xC8000000u);
+            canvas.fillRect(dx, 0, 380, n * 10 + 4, 0xC8000000u);
             int y = 2;
             for (const std::string& l : mDiag) {
-                canvas.drawText(2, y, l, 0xFF33FF66u, 0, 1);
+                canvas.drawText(dx + 2, y, l, 0xFF33FF66u, 0, 1);
                 y += 10;
             }
         }
@@ -309,6 +474,25 @@ CStdlibApp::TShutdownMode CKernel::Run(void) {
         // the panel is shown, dim when hidden).
         canvas.fillRect(rt.width() - 14, 2, 12, 12,
                         mDiagVisible ? 0xFF33FF66u : 0x80FFFFFFu);
+
+        // Output level meter (diagnostic): peak of the engine output this tick,
+        // in the gap just above the tab bar. Green / amber / red near clip. The
+        // underrun counter (u=) climbing means the decoder isn't feeding the ring
+        // fast enough; 0 with a moving bar means the audio pipeline is healthy.
+        {
+            int my = mgr.contentRect().h - 16, mx = mgr.contentRect().x + 4,
+                mw = 280, mh = 12;
+            canvas.drawText(mx, my + 2, "OUT", 0xFFFFFFFFu, 0, 1);
+            int bx = mx + 28;
+            canvas.rectOutline(bx, my, mw, mh, 0xFF666666u);
+            int fill = int(std::min(audioPeak, 1.0f) * float(mw - 2));
+            uint32_t col = audioPeak > 0.9f ? 0xFFFF3030u
+                         : audioPeak > 0.7f ? 0xFFFFD030u : 0xFF30FF30u;
+            if (fill > 0) canvas.fillRect(bx + 1, my + 1, fill, mh - 2, col);
+            char info[40];
+            snprintf(info, sizeof info, "u=%lu", (unsigned long)ps.underrunFrames);
+            canvas.drawText(bx + mw + 6, my + 2, info, 0xFFAAAAAAu, 0, 1);
+        }
 
         rt.present();
 

@@ -54,10 +54,19 @@ tools/      gen_fixtures.py (deterministic audio + library fixtures)
 
 ## Status at a glance
 
+**Running on real hardware:** `kernel8-rpi4.img` boots on a Pi 4 and works as a
+media player — DSI panel, touch input, a USB FAT32 media stick indexed into the
+library, audio out the onboard 3.5 mm jack (PWM), a left-edge logarithmic volume
+rail, and a USB-C serial console for telemetry are all confirmed on the board.
+
 Host-complete: PcmRing/audio engine/gapless, decoders (WAV/FLAC/MP3/Opus/AAC),
 PlayerController, library DB/search/smart-playlists/tags/indexer, BS.1770
 ReplayGain, cover-art+ASCII, RBJ EQ, profiles, EQ presets, OTA
-crypto/package/A-B state machine, the UI toolkit + 7 screens, and the Bluetooth
-integration seam. Hardware-gated (bench): DSI panel, touch digitizer, I2S DAC,
-real-time/underrun behavior, USB across drives, BTstack/controller, WiFi, and the
-OTA flash write + chainloader. The Circle image build itself is H0.
+crypto/package/A-B state machine, the UI toolkit + 8 tabs (incl. BT scan/connect),
+and the Bluetooth integration seam.
+
+Still hardware-gated (bench): I2S DAC (have a working PWM jack), real-time/underrun
+behavior under load, USB across a drive/hub matrix, BTstack on a real radio
+(A2DP/AVRCP — `CARSH_HAVE_BTSTACK=1` compiles+links today; USB ACL path + firmware
+blob remain), WiFi, and the OTA flash write + chainloader. See **[STATUS.md](STATUS.md)**
+and **[HARDWARE_TODO.md](HARDWARE_TODO.md)**.

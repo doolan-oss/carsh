@@ -216,4 +216,53 @@ private:
     ListView list_;
 };
 
+// --- 8. Devices (Bluetooth scan / connect) ----------------------------------
+// A device list (one ListView) plus two buttons: SCAN (toggles to STOP while
+// scanning) and a context-sensitive CONNECT/DISCONN. The app supplies formatted
+// row strings + the connected index each frame; the screen stays pure-widget
+// (no custom draw()/handle()) like ListScreen. Intent is exposed via callbacks.
+class DevicesScreen : public Screen {
+public:
+    explicit DevicesScreen(Rect c)
+        : Screen(c),
+          list_({c.x + 8, c.y + 8, c.w - 16, c.h - 80}),
+          scan_({c.x + 8, c.y + c.h - 64, 160, 56}, "SCAN",
+                [this] { if (onScan) onScan(); }),
+          action_({c.x + 180, c.y + c.h - 64, 200, 56}, "CONNECT", [this] {
+              int i = list_.selectedIndex();
+              if (i < 0) return;
+              if (i == connectedIndex_) { if (onDisconnect) onDisconnect(); }
+              else if (onConnect) onConnect(i);
+          }) {
+        widgets_ = {&list_, &scan_, &action_};
+        list_.setOnSelect([this](int) { refreshAction(); });
+    }
+    const char* name() const override { return "BT"; }
+
+    // View-model, rebuilt each frame from the app's device cache + conn state.
+    void setDevices(const std::vector<std::string>& rows, int connectedIndex) {
+        list_.setItems(rows);
+        connectedIndex_ = connectedIndex;
+        refreshAction();
+    }
+    void setScanning(bool s) { scan_.setLabel(s ? "STOP" : "SCAN"); }
+
+    int selectedIndex() const { return list_.selectedIndex(); }
+    const std::string& scanLabel() const { return scan_.label(); }
+    const std::string& actionLabel() const { return action_.label(); }
+    ListView& list() { return list_; }
+
+    std::function<void()> onScan, onDisconnect;
+    std::function<void(int)> onConnect;
+
+private:
+    void refreshAction() {
+        int i = list_.selectedIndex();
+        action_.setLabel((i >= 0 && i == connectedIndex_) ? "DISCONN" : "CONNECT");
+    }
+    ListView list_;
+    Button scan_, action_;
+    int connectedIndex_ = -1;
+};
+
 }  // namespace carsh::ui
