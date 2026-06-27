@@ -321,12 +321,28 @@ host tests pass, never "validated on the Pi").
   - [x] `AaConnection` bring-up state machine (version → SSL handshake → auth →
         service discovery → channel opens → dispatch), driven end-to-end by a
         scripted phone in host tests.
-  - [ ] *Remaining (breadth):* per-channel handlers (av/sensor/input/media/nav
-        decode — currently routed to a generic callback); the real mbedTLS-backed
-        `IAaCrypto` for the device (live handshake is `[hw]`).
+  - [x] *Per-channel handlers (rung 4c, 2026-06-28):* `AaConnection` now dispatches
+        the Running phase into structured handlers instead of one generic callback —
+        AV setup/start/stop + media (timestamp-stripped H.264/PCM via `onAvMedia`)
+        with `AV_MEDIA_ACK` flow control, input binding + outbound touch
+        (`sendTouch`), sensor start (+ driving-status/night event), and video focus
+        (`onVideoFocusRequest` / `sendVideoFocus`). Host-tested in
+        `tests/aa/AaChannels_test.cpp` (scripted phone, protobuf decoded back). Nav /
+        media-status still fall through to `onChannelMessage`. Wire acceptance by a
+        real phone is `[hw]`.
+  - [x] *Real mbedTLS-backed `IAaCrypto`* — done in rung 4b (host-verified; live
+        handshake `[hw]`).
 - [x] **Phase 2** — H.264 NAL extraction/classification (`H264Nal`) +
   `IH264Decoder` seam, host-tested.
-  - [ ] *Remaining `[hw]`:* the SW decoder impl (openh264) + on-target FPS.
+  - [x] *SW decoder impl (rung 5, 2026-06-28):* `device/CircleH264Decoder` on
+        openh264 (Cisco, BSD, Constrained-Baseline) + `src/aa/Yuv420.h` (I420→RGB888,
+        BT.601). The host build links system openh264 2.4.1 (the line vendored for
+        the Pi) and runs a real **encode→decode→pixel-compare** round trip
+        (`tests/aa/H264Decode_test.cpp`, MAE-bounded so it proves a genuine decode),
+        plus converter anchors. Device gate: `make CARSH_HAVE_OPENH264=1` +
+        `scripts/fetch_openh264.sh`.
+  - [ ] *Remaining `[hw]`:* the aarch64 bare-metal openh264 cross-build, on-target
+        FPS at 800×480, and running `feed()` on a dedicated A72 core.
 - [~] **Phase 3 / rungs 1-3** — `CircleAoaTransport` USB-AOA backend, **bench bring-up
   in progress** (`device/CircleAoaTransport.{h,cpp}` = `CAndroidAutoDevice`, a
   `CUSBFunction` + `IAaTransport`; bound via `scripts/patches/usbdevicefactory-aoa.patch`).
@@ -395,12 +411,42 @@ at ~1 Hz so a slow-booting dongle is seen.
   - Then swap `LoggingCrypto` → `AaCryptoMbedTls` in `CircleAaDriver`; the state
     machine continues handshake → auth → service discovery → channel opens → first AV
     (rungs 5-6 = openh264 decode + the AndroidAuto tab already built).
+  - **[DONE host-side 2026-06-28]** `device/AaCryptoMbedTls.{h,cpp}` implements
+    `IAaCrypto` on mbedTLS exactly as scoped above: HU = TLS 1.2 client, suite pinned
+    to ECDHE-RSA-AES128-GCM-SHA256, `VERIFY_NONE`, ctr_drbg seeded from an injected
+    entropy fn (Circle HW RNG on device), in-memory BIO (`src/aa/AaMemBio.h`, pure +
+    host-tested), and the raw-cert bypass for the aasdk cert's non-standard UTCTime
+    (`loadOwnCert`). The in-memory BIO + the full handshake + encrypt/decrypt
+    round-trip are **host-verified against system mbedTLS 2.28** — the same 2.28 line
+    circle bundles — so the plumbing the phone exercises is proven on the build
+    server (`tests/aa/AaCryptoMbedTls_test.cpp`, incl. forcing the raw-cert path).
+    `CircleAaDriver` now constructs `AaCryptoMbedTls` (HW-RNG entropy) instead of
+    `LoggingCrypto`. `device/Makefile` links the four mbedTLS archives (grouped) with
+    the `MBEDTLS_CONFIG_FILE=<circle-mbedtls/config-circle-mbedtls.h>` define.
+    *Still `[hw]`:* (a) the device link itself (`cd device && make`) — not runnable in
+    the agent env (no cross-toolchain / circle-stdlib checkout); the unit is
+    host-compile-verified against the identical mbedTLS API. (b) The **live phone
+    handshake**, which needs the real Google-registered aasdk head-unit cert dropped
+    into `device/AaHuCert.h` (currently a clearly-labelled placeholder test cert) +
+    confirming the circle-mbedtls config enables the pinned suite (risk #4).
 - [x] **UI integration (Phase 4, host-side)** — `AndroidAutoScreen` (the "AA" tab)
   + `AaVideoGeometry` (aspect-fit + touch→source remap) + Screen focus callbacks,
   host-tested, registered in `kernel.cpp`. The video surface + chrome layout is done;
   it shows a placeholder until the decoder + transport feed it.
-- [ ] **Phase 4 `[hw]`** — wire transport + decoder into `AaConnection`; first projection.
-- [ ] **Phase 5** — polish.
+- [~] **Phase 4 / rung 6 — integration (host-side done 2026-06-28).**
+  `src/aa/AaProjection` ties the live `AaConnection` to the decoder, the AA tab, and
+  audio: video media → `IH264Decoder::feed` → decoded frame → `AndroidAutoScreen::
+  setFrame`; audio media → a PCM hook; channel-open/shutdown → `setConnected`;
+  content-rect touch → `sendTouch` (input channel); AA-tab focus → `sendVideoFocus`
+  (`VIDEO_FOCUS_INDICATION`). Host-tested end to end with fakes
+  (`tests/aa/AaProjection_test.cpp`). `CircleAaDriver` binds the projection to each
+  connection across dongle cycles; `device/kernel.cpp` provides the real hooks +
+  `CircleH264Decoder` (under `CARSH_HAVE_OPENH264`). *Remaining `[hw]`:* the live
+  end-to-end projection on the board, and draining the AA audio ring to the jack with
+  audio focus (rung 7). The device link itself is bench-only here (no toolchain).
+- [ ] **Phase 5 / rung 7** — polish: AV sync / flow-control tuning, audio focus +
+  draining AA PCM to the jack, disconnect/reconnect, raw touch (drag) streaming,
+  optional mic uplink.
 
 The whole protocol spine — framing, protobuf, the full connection handshake, video
 NAL parsing — plus the AA UI surface and the USB-AOA transport scaffold now build

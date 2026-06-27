@@ -13,3 +13,4 @@ device/*.map
 third_party/circle-stdlib/
 third_party/circle-stdlib/
 third_party/btstack/
+third_party/openh264/

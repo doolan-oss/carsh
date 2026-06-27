@@ -4,8 +4,10 @@
 #include <circle/devicenameservice.h>
 #include <circle/logger.h>
 
+#include <cstring>
 #include <vector>
 
+#include "AaCryptoMbedTls.h"     // the mbedTLS-backed IAaCrypto (rung 4b)
 #include "CircleAoaTransport.h"  // CAndroidAutoDevice (the IAaTransport behind uaa1)
 
 namespace carsh::device {
@@ -26,30 +28,27 @@ const char* stateName(carsh::aa::AaState s) {
     return "?";
 }
 
-// Logging stub crypto. The AA version exchange is plaintext, so the connection
-// reaches SslHandshake without real TLS; we log the handshake kick (and any bytes
-// the phone sends) and return empty, so the connection then waits. mbedTLS is next.
-class LoggingCrypto : public carsh::aa::IAaCrypto {
-public:
-    std::vector<uint8_t> handshakeStep(const uint8_t* in, size_t len) override {
-        if (in == nullptr || len == 0)
-            CLogger::Get()->Write(From, LogNotice,
-                                  "crypto: handshake kick reached (TLS not wired — stop here)");
-        else
-            CLogger::Get()->Write(From, LogNotice, "crypto: phone sent %u handshake bytes",
-                                  (unsigned)len);
-        return {};
-    }
-    bool handshakeDone() const override { return false; }
-    std::vector<uint8_t> encrypt(const uint8_t*, size_t) override { return {}; }
-    std::vector<uint8_t> decrypt(const uint8_t*, size_t) override { return {}; }
-};
-
 }  // namespace
+
+int CircleAaDriver::rngEntropy(void* ctx, unsigned char* buf, size_t len) {
+    auto* rng = static_cast<CBcmRandomNumberGenerator*>(ctx);
+    size_t i = 0;
+    while (i < len) {
+        const u32 r = rng->GetNumber();
+        size_t take = len - i;
+        if (take > sizeof(r)) take = sizeof(r);
+        std::memcpy(buf + i, &r, take);
+        i += take;
+    }
+    return 0;
+}
 
 CircleAaDriver::~CircleAaDriver() { teardown(); }
 
 void CircleAaDriver::teardown() {
+    // Drop the projection's dangling connection pointer before freeing it (the
+    // dongle re-cycles, so this runs on every rebind).
+    if (projection_ != nullptr) projection_->setConnection(nullptr);
     delete conn_;
     conn_ = nullptr;
     delete msger_;
@@ -69,21 +68,36 @@ void CircleAaDriver::tick() {
         teardown();
         boundDev_ = aa;
         if (aa != nullptr && aa->isAccessory()) {
-            crypto_ = new LoggingCrypto();
+            auto* crypto = new AaCryptoMbedTls(&CircleAaDriver::rngEntropy, &rng_);
+            if (!crypto->init()) {
+                CLogger::Get()->Write(From, LogError,
+                                      "crypto: mbedTLS init failed (err %d) — TLS disabled",
+                                      crypto->lastError());
+            }
+            crypto_ = crypto;
             msger_ = new carsh::aa::AaMessenger(*aa);
+            // Route channel traffic into the projection (video->decoder->screen,
+            // audio->ring, focus/touch outbound) when one is wired (rung 6); else a
+            // logging fallback so bring-up is still observable on the serial console.
             carsh::aa::AaConnectionCallbacks cbs;
-            cbs.onChannelOpened = [](carsh::aa::ChannelId c) {
-                CLogger::Get()->Write(From, LogNotice, "channel opened: %u", (unsigned)c);
-            };
-            cbs.onChannelMessage = [](carsh::aa::ChannelId c, uint16_t id, const uint8_t*,
-                                      size_t n) {
-                CLogger::Get()->Write(From, LogNotice, "channel msg ch=%u id=%04x len=%u",
-                                      (unsigned)c, (unsigned)id, (unsigned)n);
-            };
-            cbs.onShutdown = [] {
-                CLogger::Get()->Write(From, LogNotice, "phone requested shutdown");
-            };
+            if (projection_ != nullptr) {
+                cbs = projection_->callbacks();
+            } else {
+                cbs.onChannelOpened = [](carsh::aa::ChannelId c) {
+                    CLogger::Get()->Write(From, LogNotice, "channel opened: %u", (unsigned)c);
+                };
+                cbs.onChannelMessage = [](carsh::aa::ChannelId c, uint16_t id,
+                                          const uint8_t*, size_t n) {
+                    CLogger::Get()->Write(From, LogNotice,
+                                          "channel msg ch=%u id=%04x len=%u", (unsigned)c,
+                                          (unsigned)id, (unsigned)n);
+                };
+                cbs.onShutdown = [] {
+                    CLogger::Get()->Write(From, LogNotice, "phone requested shutdown");
+                };
+            }
             conn_ = new carsh::aa::AaConnection(*msger_, *crypto_, cbs);
+            if (projection_ != nullptr) projection_->setConnection(conn_);
             CLogger::Get()->Write(From, LogNotice, "uaa1 bound — sending VERSION_REQUEST");
             conn_->start();
             lastState_ = static_cast<int>(conn_->state());

@@ -20,6 +20,7 @@ OBJS = \
 	CircleBluetooth.o \
 	CircleAoaTransport.o \
 	CircleAaDriver.o \
+	AaCryptoMbedTls.o \
 	BtStackGlue.o \
 	DeviceCrypto.o \
 	$(CARSHTOP)/src/aa/AaMessenger.o \
@@ -65,9 +66,43 @@ BTSTACK_OBJS := \
 OBJS += HalCircle.o CircleHciTransport.o BtStackClassicShims.o $(BTSTACK_OBJS)
 endif
 
+# ---- Optional: openh264 H.264 decoder (AA video, rung 5) -------------------
+# Build with:  make CARSH_HAVE_OPENH264=1
+# Compiles device/CircleH264Decoder.cpp and links the vendored aarch64 openh264
+# decoder static lib (scripts/fetch_openh264.sh + its cross-build notes). The
+# default build omits it — the AA tab shows the placeholder until decode is linked.
+# The decoder unit is host-compile-verified against the system openh264 (same 2.4.x
+# API), so this gate only adds the cross-built archive + the device-only TU.
+ifdef CARSH_HAVE_OPENH264
+OPENH264 := $(CARSHTOP)/third_party/openh264
+OBJS += CircleH264Decoder.o
+endif
+
 include $(CIRCLEHOME)/Rules.mk
 
+# ---- Android Auto TLS: mbedTLS (rung 4b) -----------------------------------
+# AaCryptoMbedTls.cpp is the only unit that includes mbedTLS. circle-stdlib's
+# bundled mbedTLS is built with `cd third_party/circle-stdlib && make mbedtls`,
+# producing the three core archives plus the circle-mbedtls glue (entropy via
+# Circle's HW RNG, threading, the bare-metal config). The same config header must
+# be used when compiling our unit so the struct layouts match the archives, hence
+# the MBEDTLS_CONFIG_FILE define below (inert for every other TU — none include
+# mbedTLS). The four archives are wrapped in a link group so their mutual
+# references (the glue's platform calloc/free <-> crypto) resolve regardless of
+# order. [hw] bench check: confirm config-circle-mbedtls.h enables TLS 1.2 +
+# MBEDTLS_TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256 (AA_PLAN risk #4).
+MBEDTLS_LIBDIR     := $(CIRCLE_STDLIB)/libs/mbedtls/library
+CIRCLE_MBEDTLS_LIB := $(CIRCLE_STDLIB)/src/circle-mbedtls/libcircle-mbedtls.a
+AA_TLS_LIBS := --start-group \
+	$(CIRCLE_MBEDTLS_LIB) \
+	$(MBEDTLS_LIBDIR)/libmbedtls.a \
+	$(MBEDTLS_LIBDIR)/libmbedx509.a \
+	$(MBEDTLS_LIBDIR)/libmbedcrypto.a \
+	--end-group
+
 INCLUDE += -I$(CARSHTOP)/src -I$(CARSHTOP)/third_party
+INCLUDE += -I$(CIRCLE_STDLIB)/include -I$(CIRCLE_STDLIB)/libs/mbedtls/include
+CPPFLAGS += -DMBEDTLS_CONFIG_FILE='<circle-mbedtls/config-circle-mbedtls.h>'
 ifdef CARSH_HAVE_BTSTACK
 # -I$(CURDIR) finds device/btstack_config.h; the rest are the BTstack headers.
 INCLUDE += -I$(CURDIR) \
@@ -79,13 +114,22 @@ INCLUDE += -I$(CURDIR) \
 CPPFLAGS += -DCARSH_HAVE_BTSTACK
 CFLAGS += -DCARSH_HAVE_BTSTACK
 endif
+ifdef CARSH_HAVE_OPENH264
+INCLUDE += -I$(OPENH264)/codec/api    # resolves <wels/codec_api.h>
+CPPFLAGS += -DCARSH_HAVE_OPENH264
+endif
 INCLUDE := $(CIRCLE_STDLIB_INCLUDES) $(INCLUDE)
 # Circle's sound + USB-gadget libraries are not part of the default circle-stdlib
 # lib set; add them ahead of the rest (they depend on libusb/libcircle, which come
 # later) so the audio-output backends and the USB-C serial-log gadget link.
 LIBS := $(CIRCLEHOME)/lib/sound/libsound.a \
         $(CIRCLEHOME)/lib/usb/gadget/libusbgadget.a \
+        $(AA_TLS_LIBS) \
         $(CIRCLE_STDLIB_LIBS)
+ifdef CARSH_HAVE_OPENH264
+# Decoder-only aarch64 archive produced by the cross-build in fetch_openh264.sh.
+LIBS := $(OPENH264)/libopenh264.a $(LIBS)
+endif
 CPPFLAGS += -std=c++17
 
 -include $(DEPS)
