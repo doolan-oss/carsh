@@ -70,7 +70,9 @@ const char FromBt[] = "btglue";  // serial-log tag for BT bring-up
 // Route BTstack's log_info/log_error (incl. the Realtek chipset's firmware
 // decisions) to the serial log, so bring-up is observable. INFO+ only.
 void btDumpLogMessage(int level, const char* format, va_list ap) {
-    if (level < HCI_DUMP_LOG_LEVEL_INFO) return;
+    // Errors only now that bring-up is solved (INFO floods during streaming). Bump
+    // to HCI_DUMP_LOG_LEVEL_INFO temporarily to re-surface chipset/init diagnostics.
+    if (level < HCI_DUMP_LOG_LEVEL_ERROR) return;
     char buf[200];
     vsnprintf(buf, sizeof(buf), format, ap);
     CLogger::Get()->Write(FromBt, level >= HCI_DUMP_LOG_LEVEL_ERROR ? LogError : LogNotice,

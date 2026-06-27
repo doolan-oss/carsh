@@ -57,7 +57,17 @@ this is the prioritized list for the first hardware session. Format:
 - **Remaining (not blocked):** widen to a matrix of drives/hubs; hot-unplug
   mid-read.
 
-### H6 — Bluetooth: USB ACL path + firmware blob + bring-up (Risks R3/R4/R12)
+### H6 — Bluetooth A2DP sink: WORKING on hardware (phone → Pi jack)
+- **Done (UB500 / RTL8761BU, branch `device/bt-dongle-bringup`):** a phone pairs and
+  plays music out the Pi's 3.5 mm jack. Firmware loads from SD (product-id +
+  `hci_enable_custom_pre_init`), HCI event reassembly + USB-IRQ trampoline, USB ACL
+  path (`CUSBBluetoothDevice` patch under `scripts/patches/`), SBC media-header strip
+  → PWM output at the SBC rate.
+- **Remaining polish:** pairing UX (phone can't see "carsh" passively; connect is
+  carsh-initiated by MAC today), AVRCP now-playing + transport controls, BT volume
+  via the engine, onboard CYW43455 (stage 2). Original notes:
+
+### H6 (orig) — Bluetooth: USB ACL path + firmware blob + bring-up (Risks R3/R4/R12)
 - **Module:** BTstack↔Circle HCI transport, A2DP sink, AVRCP CT/TG.
 - **Compiles now:** `make CARSH_HAVE_BTSTACK=1` builds + links BTstack into the
   image (Classic A2DP-sink + AVRCP + SBC, embedded run loop, Circle USB transport,
