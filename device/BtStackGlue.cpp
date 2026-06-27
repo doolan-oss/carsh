@@ -221,6 +221,29 @@ void hciPacketHandler(uint8_t type, uint16_t, uint8_t* packet, uint16_t) {
         case HCI_EVENT_DISCONNECTION_COMPLETE:
             if (g_owner) g_owner->deliverDisconnected();
             break;
+        case GAP_EVENT_INQUIRY_RESULT: {
+            // A device found during a scan -> the scan/connect UI's cache.
+            carsh::bt::DiscoveredDevice d;
+            bd_addr_t addr;
+            gap_event_inquiry_result_get_bd_addr(packet, addr);
+            d.address = toBdAddr(addr);
+            d.classOfDevice = gap_event_inquiry_result_get_class_of_device(packet);
+            if (gap_event_inquiry_result_get_rssi_available(packet))
+                d.rssi = static_cast<int8_t>(gap_event_inquiry_result_get_rssi(packet));
+            if (gap_event_inquiry_result_get_name_available(packet)) {
+                d.name.assign(reinterpret_cast<const char*>(
+                                  gap_event_inquiry_result_get_name(packet)),
+                              gap_event_inquiry_result_get_name_len(packet));
+            }
+            CLogger::Get()->Write(FromBt, LogNotice, "scan: found %s (rssi %d)",
+                                  d.name.empty() ? "(no name)" : d.name.c_str(), d.rssi);
+            if (g_owner) g_owner->deliverDeviceDiscovered(d);
+            break;
+        }
+        case GAP_EVENT_INQUIRY_COMPLETE:
+            CLogger::Get()->Write(FromBt, LogNotice, "scan: complete");
+            if (g_owner) g_owner->deliverScanComplete();
+            break;
         default:
             break;
     }
@@ -289,11 +312,17 @@ bool btGlueInit(CircleBluetooth* owner) {
     g_sbcDecoder = btstack_sbc_decoder_bluedroid_init_instance(&g_sbcContext);
     g_sbcDecoder->configure(&g_sbcContext, SBC_MODE_STANDARD, &sbcPcmHandler, nullptr);
 
-    // 5. HCI connect/disconnect events.
+    // 5. HCI connect/disconnect events + GAP inquiry results.
     g_hciEventCb.callback = &hciPacketHandler;
     hci_add_event_handler(&g_hciEventCb);
 
-    // 6. Power on; the controller reaches HCI_STATE_WORKING asynchronously.
+    // 6. Be visible: the phone sees "carsh" in its Bluetooth list (discoverable)
+    //    and can connect to us as an A2DP speaker (connectable).
+    gap_set_local_name("carsh");
+    gap_discoverable_control(1);
+    gap_connectable_control(1);
+
+    // 7. Power on; the controller reaches HCI_STATE_WORKING asynchronously.
     hci_power_control(HCI_POWER_ON);
     return true;
 }

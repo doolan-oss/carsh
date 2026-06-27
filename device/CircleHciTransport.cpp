@@ -92,9 +92,6 @@ void circleHciTransportProcess() {
         static uint8_t tmp[kEvtMax];
         std::memcpy(tmp, g_evtQ[head].data, len);
         g_evtHead = (head + 1) % kEvtSlots;
-        // Diag: event code (tmp[0]) + length, so we can see the bring-up sequence.
-        CLogger::Get()->Write(FromTransport, LogNotice, "RX evt 0x%02x len %u",
-                              len ? tmp[0] : 0, len);
         if (g_packetHandler) g_packetHandler(HCI_EVENT_PACKET, tmp, len);
     }
 }
@@ -138,16 +135,10 @@ void notifyPacketSent() {
 int transportSendPacket(uint8_t packet_type, uint8_t* packet, int size) {
     if (g_dev == nullptr) return -1;
     switch (packet_type) {
-        case HCI_COMMAND_DATA_PACKET: {
-            // Diag: HCI command opcode is the first 2 bytes, little-endian.
-            uint16_t opcode = (size >= 2)
-                ? static_cast<uint16_t>(packet[0] | (packet[1] << 8)) : 0;
-            boolean ok = g_dev->SendHCICommand(packet, (unsigned)size);
-            CLogger::Get()->Write(FromTransport, LogNotice, "TX cmd 0x%04x len %d -> %s",
-                                  opcode, size, ok ? "ok" : "FAIL");
+        case HCI_COMMAND_DATA_PACKET:
+            g_dev->SendHCICommand(packet, (unsigned)size);
             notifyPacketSent();
             return 0;
-        }
         case HCI_ACL_DATA_PACKET:
             // TODO(hw): ACL OUT over the bulk endpoint. Circle's
             // CUSBBluetoothDevice has no ACL API yet (the one real gap) — needs a
