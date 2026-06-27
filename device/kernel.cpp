@@ -19,6 +19,7 @@
 #include "bt/DeviceRow.h"
 #include "CircleBtRunLoopTask.h"
 #include "CircleDecodeTask.h"
+#include "CircleAaDriver.h"
 #include "CircleAoaTransport.h"
 #include "CircleUsbLog.h"
 #include "CircleFlashTarget.h"
@@ -373,6 +374,8 @@ CStdlibApp::TShutdownMode CKernel::Run(void) {
     carsh::device::CirclePwmSoundDevice sound(&mInterrupt);
     unsigned curRate = 0;  // 0 = not opened yet
 
+    carsh::device::CircleAaDriver aaDriver;  // drives AA over uaa1 from this loop
+
     mLogger.Write(FROM, LogNotice, "entering UI loop");
     unsigned frame = 0;
     // Diagnostic software audio sink: no I2S DAC is wired yet, so nothing pulls
@@ -535,16 +538,11 @@ CStdlibApp::TShutdownMode CKernel::Run(void) {
         // found" over USB-C. ~1 Hz is plenty and cheap.
         if (frame % 33 == 0) mUSBHCI.UpdatePlugAndPlay();
 
-        // AA transport status — once the dongle has switched to accessory mode the
-        // factory registers it as "uaa1"; report it (and the bulk-IN throughput
-        // counter) so the bench sees the AOA switch land. ~2 s cadence.
-        if (frame % 66 == 0) {
-            auto* aoa = static_cast<carsh::device::CAndroidAutoDevice*>(
-                CDeviceNameService::Get()->GetDevice("uaa1", FALSE));
-            if (aoa && aoa->isAccessory())
-                mLogger.Write(FROM, LogNotice, "AA: transport up (uaa1), rx=%u bytes",
-                              aoa->rxBytes());
-        }
+        // Drive the Android Auto connection over the live AOA transport (uaa1):
+        // version exchange now, TLS next (AA_PLAN rung 4). UI-task driven so it never
+        // races with the UpdatePlugAndPlay above (which deletes the transport when
+        // the dongle re-cycles).
+        aaDriver.tick();
 
         // Scheduler-aware sleep: yields to the decode task (and BT/net later)
         // between frames, ~30 fps. The decode task keeps the ring fed meanwhile.
