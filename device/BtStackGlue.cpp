@@ -122,14 +122,19 @@ void a2dpMediaHandler(uint8_t /*seid*/, uint8_t* packet, uint16_t size) {
 void a2dpPacketHandler(uint8_t type, uint16_t, uint8_t* packet, uint16_t) {
     if (type != HCI_EVENT_PACKET) return;
     if (hci_event_packet_get_type(packet) != HCI_EVENT_A2DP_META) return;
-    switch (hci_event_a2dp_meta_get_subevent_code(packet)) {
+    uint8_t sub = hci_event_a2dp_meta_get_subevent_code(packet);
+    switch (sub) {
         case A2DP_SUBEVENT_STREAM_ESTABLISHED:
             g_a2dpCid = a2dp_subevent_stream_established_get_a2dp_cid(packet);
+            CLogger::Get()->Write(FromBt, LogNotice, "A2DP stream ESTABLISHED (cid 0x%04x)",
+                                  g_a2dpCid);
             break;
         case A2DP_SUBEVENT_STREAM_RELEASED:
             g_a2dpCid = 0;
+            CLogger::Get()->Write(FromBt, LogNotice, "A2DP stream released");
             break;
         default:
+            CLogger::Get()->Write(FromBt, LogNotice, "A2DP event 0x%02x", sub);
             break;
     }
 }
@@ -220,10 +225,13 @@ void hciPacketHandler(uint8_t type, uint16_t, uint8_t* packet, uint16_t) {
         case HCI_EVENT_CONNECTION_COMPLETE: {
             bd_addr_t addr;
             hci_event_connection_complete_get_bd_addr(packet, addr);
+            CLogger::Get()->Write(FromBt, LogNotice, "ACL link connected (status %u)",
+                                  hci_event_connection_complete_get_status(packet));
             if (g_owner) g_owner->deliverConnected(toBdAddr(addr));
             break;
         }
         case HCI_EVENT_DISCONNECTION_COMPLETE:
+            CLogger::Get()->Write(FromBt, LogNotice, "ACL link disconnected");
             if (g_owner) g_owner->deliverDisconnected();
             break;
         case GAP_EVENT_INQUIRY_RESULT: {
