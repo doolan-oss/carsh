@@ -282,6 +282,12 @@ bool btGlueInit(CircleBluetooth* owner) {
     //    "rtl8761bu_fw" + "rtl8761bu_config" under the folder below.
     btstack_chipset_realtek_set_firmware_folder_path(kRealtekFirmwareFolder);
     btstack_chipset_realtek_set_config_folder_path(kRealtekFirmwareFolder);
+    // CRITICAL: the chipset picks the firmware blob by USB product id; without it
+    // it can't find the table entry and SKIPS the firmware download (controller
+    // then runs in ROM mode — HCI responds but the radio is dead: no inquiry
+    // results, not discoverable). UB500 = RTL8761BU = 0bda:8771.
+    // TODO(hw): read the real idProduct from the enumerated dongle for other models.
+    btstack_chipset_realtek_set_product_id(0x8771);
     hci_set_chipset(btstack_chipset_realtek_instance());
 
     // Probe the firmware path up front: this is the one unproven link — whether
