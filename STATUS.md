@@ -1,6 +1,7 @@
 # carsh — Module Status
 
 Auditable per-module state. Legend:
+- **hw-validated** — confirmed working on the real Pi 4 (not just built).
 - **host-done** — compiles on the build server AND its host unit tests pass.
 - **stubbed** — logic exists behind its interface; needs hardware to validate.
 - **blocked** — cannot proceed without a hardware fact or a decision (see backlogs).
@@ -11,10 +12,10 @@ Host method: every subsystem is built against the HAL interfaces (`ISoundDevice`
 host FS, synthetic touch). "host-done" never means "validated on the Pi" — see
 HARDWARE_TODO.md for what the bench session must confirm.
 
-> Build server note: the AArch64 cross-toolchain and `qemu-system-aarch64` named in
-> the task brief are **not installed** in this environment (only host g++ 15 +
-> cmake). All work below is host-compiled/host-tested with g++. See HARDWARE_TODO.md
-> item H0.
+> Build note: the AArch64 cross-toolchain (`/opt/arm-toolchain`, aarch64-none-elf
+> 14.2) + circle-stdlib are installed and build `kernel8-rpi4.img`, which now boots
+> on a real Pi 4 (see the device-build section). The host table below is g++
+> host-compiled/host-tested; "host-done" still never means "validated on the Pi".
 
 | Module | Status | Notes |
 |---|---|---|
@@ -51,7 +52,6 @@ HARDWARE_TODO.md for what the bench session must confirm.
 | Tag parsers (MP4/M4A) | deferred | Needs MP4 demux (with AAC-MP4/ALAC). |
 | Library: Indexer | host-done | Interruptible scan, tags+props, RG track+album scan. |
 | Cover-art + ASCII generator | host-done | stb_image decode, downscale, ramp, tint, cache blob. |
-| UI toolkit + 7 screens | todo | |
 | ProfileManager | host-done | MAC→profile, guest clone+remember, persist. |
 | Profile / EQ preset format | host-done | Binary serialize round-trips. |
 | OTA: Crypto (ICrypto) | host-done | OpenSSL host backend (real Ed25519+SHA-256). |
@@ -63,31 +63,38 @@ HARDWARE_TODO.md for what the bench session must confirm.
 | Bluetooth real A2DP/AVRCP | compiles+links, unverified on HW | `CARSH_HAVE_BTSTACK=1` links BTstack (A2DP-sink+AVRCP+SBC); USB ACL path + radio bring-up = H6. |
 | AVRCP now-playing assembly | host-done | `bt::NowPlayingAssembler` accumulates per-attribute subevents; 7 tests (BtParse). |
 
-## Device build (Circle / bare metal) — Step 2 in progress
+## Device build (Circle / bare metal) — booting on real hardware
 
-Foundation proven: the STL-heavy core compiles+links into a real bare-metal image
-with `aarch64-none-elf` + circle-stdlib (`STDLIB_SUPPORT=4`). See device/README.md.
+The image **boots on a real Pi 4 and runs as a working media player**: it brings up
+the DSI panel, takes touch input, mounts a USB media stick and indexes it, and plays
+audio out the onboard 3.5 mm jack (PWM) — with a USB-C serial console for telemetry.
+The STL-heavy core links unchanged into the bare-metal image with `aarch64-none-elf`
++ circle-stdlib (`STDLIB_SUPPORT=4`). See device/README.md.
 
 | Module | Status | Notes |
 |---|---|---|
 | Toolchain + circle-stdlib | done | ARM aarch64-none-elf 14.2; circle-stdlib Step pinned; newlib+libstdc++ build. |
-| `CKernel` (boot/serial/timer) | builds + QEMU-runs | Serial log @115200; boots cleanly under QEMU raspi3b (no fault). |
-| `CircleRenderTarget` (`IRenderTarget`) | builds | Over `CBcmFrameBuffer`, double-buffered, pitch-aware. Pixels need panel/HDMI (H1). |
-| `CircleVfs`/`CircleSource` (`Vfs`) | builds | FatFs (f_open/read/lseek + dir); SD mounted; real Indexer scans it. |
-| `CircleSoundDevice` (`ISoundDevice`) | builds | CI2SSoundBaseDevice pull→float→DAC range. Opened only on HW (H3/H4). |
-| `CircleTouch` (`ITouch`) | builds | CRPiTouchScreen events→queue; active if digitizer present (H2). |
+| `CKernel` (boot/serial/timer) | hw-validated | Boots on real Pi 4; serial log @115200; UI renders on the panel. |
+| `CircleRenderTarget` (`IRenderTarget`) | hw-validated | `CBcmFrameBuffer`, double-buffered, pitch-aware; pixels confirmed on a DSI panel. |
+| `CircleVfs`/`CircleSource` (`Vfs`) | hw-validated | FatFs scans a real USB FAT32 stick; albums/tracks populate the library (hidden dot-folders skipped). |
+| `CirclePwmSoundDevice` (`ISoundDevice`) | hw-validated | Onboard PWM → 3.5 mm jack; audible playback confirmed. Lazy open at track rate; safe close; peak meter. |
+| `CircleSoundDevice` (I2S DAC) | builds | `CI2SSoundBaseDevice` pull→float→DAC range. Awaiting a DAC HAT (H3). |
+| `CircleTouch` (`ITouch`) | hw-validated | `CRPiTouchScreen` pumped >60 Hz; tap/swipe drive the UI on the panel (FingerUp(0,0) handled). |
+| `CircleUsbLog` (USB-C serial console) | hw-validated | CDC-ACM gadget on the USB-C/dwc2 port; logger retargets to `/dev/ttyACM0` on connect, UART fallback. |
+| UI: vertical volume rail | hw-validated | Left-edge slider, boots muted, logarithmic taper (−40 dB range), capped at 0.5 gain. |
 | `CircleFlashTarget` (`IFlashTarget`) | builds | FatFs write of kernel8-A/B.img; rollback = bench (H7). |
-| Full app integrated in `CKernel` | builds | SD→library→player→EQ→profiles→UI+7 screens+touch link bare-metal (1.0 MB img). |
-| Real-time decode/scheduler task | builds | `CircleDecodeTask` under `CScheduler`; UI MsSleep yields. Tune yields at bench (H4). |
+| Full app integrated in `CKernel` | hw-validated | SD→library→player→EQ→profiles→UI+8 tabs+touch all running on the board. |
+| Real-time decode/scheduler task | hw-validated | `CircleDecodeTask` under `CScheduler` feeds playback on hardware. Underrun tuning under load = H4. |
 | OTA device crypto (`DeviceCrypto`) | builds + host-validated | TweetNaCl Ed25519 + SHA-256 (mbedTLS 2.28 has no Ed25519). Cross-checked vs OpenSSL. |
 | OTA verify on device | builds | Kernel reads/verifies staged `/carsh/ota/*.carup` (no auto-flash; user-confirmed). |
-| Bluetooth scaffold (`CircleBluetooth`) | builds (stub) | `bt::IBluetooth` impl + run-loop `CTask` + A2DP→ring/AVRCP→profile wiring; BTstack glue gated by `CARSH_HAVE_BTSTACK`. |
+| Bluetooth scaffold (`CircleBluetooth`) | builds (stub) | `bt::IBluetooth` impl + run-loop `CTask` + A2DP→ring/AVRCP→profile wiring + scan/connect screen; BTstack glue gated by `CARSH_HAVE_BTSTACK`. |
+| BT scan/connect UI (`DevicesScreen`) | host-done | 8th "BT" tab: scan toggle + connect/disconnect; 11 tests via FakeBluetooth (`BtUi_test`). |
 | BTstack A2DP/AVRCP glue | compiles+links | `make CARSH_HAVE_BTSTACK=1` links the full A2DP-sink/AVRCP/SBC closure + Circle USB transport + embedded HAL (img 1.12→1.37 MB). Radio bring-up + USB ACL gap = H6. |
 
-> QEMU note: the image **builds and runs** under `qemu raspi3b` without faulting,
-> but this QEMU's bcm2835 mailbox/UART I/O doesn't surface serial *text* headless
-> (Circle's own samples behave identically — it routes to the framebuffer window).
-> Authoritative runtime/visual validation is the real Pi 4 over UART + HDMI/DSI.
+> The official 7" panel that wouldn't light up turned out to be a loose DSI ribbon,
+> not firmware — re-seating fixed it. Display bring-up was confirmed on the spare
+> ESP32-P4 dev-kit DSI panel. The `scripts/make_sdcard.fish` helper assembles a
+> correct FAT32 boot partition in one step.
 
 ## Deferred host-buildable work (not hardware-gated, not yet done)
 
