@@ -34,6 +34,7 @@ HARDWARE_TODO.md for what the bench session must confirm.
 | UI: Widgets | host-done | Button, Label, ListView (select+scroll), TabBar. |
 | UI: ScreenManager + tabs | host-done | Tab routing, gesture dispatch, render. |
 | UI: 7 screens | host-done | Now/Lib/Find/Queue/EQ/Src/Set; PNG + touch tested. |
+| AA H.264 decode (`CircleH264Decoder`+`Yuv420`) | host-done / `[hw]` FPS | openh264-backed `IH264Decoder`; I420→RGB888 (BT.601) pure converter. Host build links **system openh264 2.4.1** (same line vendored for the Pi) and runs a real encode→decode→pixel-compare round trip (`H264Decode_test`, MAE-checked) + converter anchors. Device links the cross-built decoder via `make CARSH_HAVE_OPENH264=1` (scaffold: `scripts/fetch_openh264.sh`). `[hw]`: aarch64 bare-metal openh264 build, on-target FPS, dedicated-core run. |
 | Decoders (WAV/FLAC/MP3) | host-done | dr_libs; WAV bit-exact, FLAC lossless, MP3 tone. |
 | Decoder: Opus | host-done | libopusfile; real .opus fixture, tone-correlated. |
 | Decoder: AAC (ADTS) | host-done | faad2; real .aac fixture, tone-correlated. |

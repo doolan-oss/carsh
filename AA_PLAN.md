@@ -334,7 +334,15 @@ host tests pass, never "validated on the Pi").
         handshake `[hw]`).
 - [x] **Phase 2** — H.264 NAL extraction/classification (`H264Nal`) +
   `IH264Decoder` seam, host-tested.
-  - [ ] *Remaining `[hw]`:* the SW decoder impl (openh264) + on-target FPS.
+  - [x] *SW decoder impl (rung 5, 2026-06-28):* `device/CircleH264Decoder` on
+        openh264 (Cisco, BSD, Constrained-Baseline) + `src/aa/Yuv420.h` (I420→RGB888,
+        BT.601). The host build links system openh264 2.4.1 (the line vendored for
+        the Pi) and runs a real **encode→decode→pixel-compare** round trip
+        (`tests/aa/H264Decode_test.cpp`, MAE-bounded so it proves a genuine decode),
+        plus converter anchors. Device gate: `make CARSH_HAVE_OPENH264=1` +
+        `scripts/fetch_openh264.sh`.
+  - [ ] *Remaining `[hw]`:* the aarch64 bare-metal openh264 cross-build, on-target
+        FPS at 800×480, and running `feed()` on a dedicated A72 core.
 - [~] **Phase 3 / rungs 1-3** — `CircleAoaTransport` USB-AOA backend, **bench bring-up
   in progress** (`device/CircleAoaTransport.{h,cpp}` = `CAndroidAutoDevice`, a
   `CUSBFunction` + `IAaTransport`; bound via `scripts/patches/usbdevicefactory-aoa.patch`).
