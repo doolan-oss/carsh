@@ -1,16 +1,23 @@
 # Android Auto (wireless, via USB dongle) — implementation plan
 
-Branch: `device/android-auto`. Status tracked at the bottom; this is the working
-plan, refined as phases land.
+Branch: `device/android-auto` (Phases 0–2, **merged to main** PRs #9/#10).
+Hardware bring-up continues on `device/aa-dongle-bringup`. Status tracked at the
+bottom; this is the working plan, refined as phases land.
 
 ## Goal
 
 Wireless Android Auto on the carsh head unit using a **commercial wireless AA
-dongle** (Laser `NAVC-WD25-649`, or the equivalent Response `QM4010`) plugged
-into a Pi 4 USB‑A port. The dongle owns *all* the wireless — it pairs the phone
-over Bluetooth and runs the 5 GHz WiFi link itself — and presents to the head
-unit as a **wired Android Auto phone over USB**. So carsh never touches a radio
-for AA; carsh's job is to be a **USB‑host wired Android Auto head unit**.
+dongle** — the owner's actual device is a **MINIX CA525** ("NEO" wireless
+CarPlay+AA adapter) — plugged into a Pi 4 USB‑A port. The dongle owns *all* the
+wireless — it pairs the phone over Bluetooth and runs the 5 GHz WiFi link itself —
+and presents to the head unit as a **wired Android Auto phone over USB**. So carsh
+never touches a radio for AA; carsh's job is to be a **USB‑host wired Android Auto
+head unit**.
+
+> **Dongle is known-good.** The CA525 has already been paired to the owner's phone
+> successfully in another (certified) car — so the wireless/phone side works; the
+> only unknown is the carsh USB-host wired-AA side. The bring-up ladder below
+> isolates exactly that.
 
 ## Why this is tractable here
 
@@ -98,6 +105,79 @@ dongle and/or the board.
 **Phase 5 — polish** `[hw]`
 - AV sync / flow‑control, audio focus, disconnect/reconnect, optional mic
   uplink for voice. (Voice can be deferred.)
+
+## Hardware bring-up ladder — the actual remaining work (CA525)
+
+The protocol spine is done and merged. Everything below is hardware, sequenced
+**strictly by de-risk order** — each rung proves one unknown in isolation over the
+USB-C serial log before the next is attempted. This reuses the exact bench loop
+that cracked BT A2DP: flash SD → `run_in_background` serial capture on
+`/dev/ttyACM0` → power-cycle → read the log → iterate. **Build a rung's diagnostic,
+read the serial, only then write the next rung.**
+
+**Rung 1 — Enumerate the dongle `[hw, cheapest first light]`.**
+No AOA yet. On boot, walk Circle's USB device tree and dump every descriptor for
+the CA525 to the serial log: initial VID/PID, device/interface class, configs,
+endpoint map (are bulk EPs present pre-switch?), whether it's a composite/hub.
+*Answers:* what mode the dongle powers up in, and what we're switching *from*.
+Likely starts as a vendor/CDC-ish device with no AA bulk pipes until AOA runs.
+
+**Rung 2 — AOA mode-switch `[hw, the identity handshake]`.**
+On the dongle's control endpoint, run the Android Open Accessory sequence
+(reuse `head_unit`'s **exact** strings — Google's AA allowlist matches
+manufacturer/model):
+1. control-IN `bRequest=51` (GET_PROTOCOL) → AOA version (expect ≥1).
+2. control-OUT `bRequest=52` (SEND_STRING) ×6 — manufacturer/model/desc/version/
+   uri/serial. The AA-launching pair is manufacturer=`Android`, model=`Android Auto`.
+3. control-OUT `bRequest=53` (START) → dongle detaches.
+4. It re-enumerates as **`18d1:2d0x`** (Google, PID 0x2d00–0x2d05) exposing two
+   bulk endpoints. *Circle wrinkle:* handle the detach→re-attach and bind the
+   transport to the new device's bulk IN/OUT (device-add callback or rescan).
+*Answers:* does Circle's xHCI host drive AOA + survive the re-enumeration.
+
+**Rung 3 — Bulk throughput spike `[hw, the ESP32's nemesis]`.**
+Before any protocol: blast raw bulk-IN and print sustained **MB/s** to serial.
+Need ~2–5 MB/s for 480p30 H.264 + PCM. *Partly pre-de-risked:* xHCI bulk already
+streams a FAT media stick on this board, so the controller works — but the AA bulk
+pattern (large, back-to-back IN transfers) is what killed the ESP32; prove it here
+in isolation. If it can't sustain, nothing downstream matters.
+
+**Rung 4 — Real TLS, live handshake `[hw]`.**
+Swap `FakeAaCrypto` for an mbedTLS-backed `IAaCrypto` (port `head_unit/aa_crypto.c`;
+circle-stdlib bundles mbedTLS 2.28). Confirm the suite the DHU capture uses —
+`TLSv1.2 ECDHE-RSA-AES128-GCM-SHA256` — is enabled in the mbedTLS config. Feed
+`CircleAoaTransport` into the existing `AaConnection`; the already-tested state
+machine should drive version → **live TLS** → auth → service discovery → channels.
+*Answers:* does the merged core reach service discovery against a real phone.
+
+**Rung 5 — H.264 decode + display `[hw, the standout risk]`.**
+Decision: **software decode** — bare-metal Circle has *no* path to the VideoCore
+HW decoder (that needs VCHIQ/MMAL, i.e. Linux), so HW decode is off the table by
+the [[no-linux-bare-metal]] constraint. Plan:
+- **Decoder: openh264** (Cisco, BSD-2, Constrained-Baseline, has NEON) on a
+  **dedicated A72 core** via Circle `CMultiCoreSupport`. AA video is
+  Constrained-Baseline, so a full profile isn't needed.
+- Keep the advertised **480p (800×480)** video config (we *own* the service-
+  discovery video params, so we cap what the phone sends). Decode YUV → NEON
+  YUV→RGB → scale-blit into `contentRect()` (800×480 → 696×432, ~0.87×).
+- **Measure on-target FPS first** — this is the one number that can force a
+  fallback (lower fps in the video config, or split decode across both spare
+  cores). 800×480 CB on an A72+NEON is feasible but tight; treat FPS as a gate.
+
+**Rung 6 — Integration `[hw]`.** Wire it together behind the existing seams: AA
+video frame → `IRenderTarget` (new "Android Auto" 9th tab, see UI section), AA
+audio PCM → `ISoundDevice`/`PcmRing`, content-rect touch → geometry remap to
+800×480 → AA input channel, `VIDEO_FOCUS_INDICATION` tied to the active tab.
+
+**Rung 7 — Polish `[hw]`.** AV sync / flow-control, audio focus, disconnect/
+reconnect, optional mic uplink (voice deferrable). = Phase 5.
+
+*Host-side work I can do now without the dongle:* scaffold `CircleAoaTransport`
+(IAaTransport impl: AOA control sequence + bulk wrappers, compiled against Circle
+USB but bench-validated later), port `aa_crypto.c` to an mbedTLS `IAaCrypto`, add
+the `openh264` decode backend behind `IH264Decoder` with a host frame-checksum
+test, and build the AndroidAuto screen + touch-remap geometry (host-testable). The
+hardware rungs above then validate each in turn.
 
 ## UI integration — AA as a tab, chrome stays visible (Phase 4)
 
@@ -187,13 +267,46 @@ host tests pass, never "validated on the Pi").
         `IAaCrypto` for the device (live handshake is `[hw]`).
 - [x] **Phase 2** — H.264 NAL extraction/classification (`H264Nal`) +
   `IH264Decoder` seam, host-tested.
-  - [ ] *Remaining `[hw]`:* the SW decoder impl + on-target FPS.
-- [ ] **Phase 3** — `CircleAoaTransport` USB-AOA spike (needs the dongle).
-- [ ] **Phase 4** — integration / first projection.
+  - [ ] *Remaining `[hw]`:* the SW decoder impl (openh264) + on-target FPS.
+- [~] **Phase 3 / rungs 1-3** — `CircleAoaTransport` USB-AOA backend, **bench bring-up
+  in progress** (`device/CircleAoaTransport.{h,cpp}` = `CAndroidAutoDevice`, a
+  `CUSBFunction` + `IAaTransport`; bound via `scripts/patches/usbdevicefactory-aoa.patch`).
+  See the bench-session findings below.
+
+### Bench session — 2026-06-27 (CA525 on real Pi 4)
+
+Methodology: the BT bring-up loop (flash SD → `run_in_background` capture on the USB-C
+console → power-cycle → read log). Key change that unblocked it: bring the USB-C
+console up **before** the xHCI host inits, so Circle's per-device enumeration log is
+captured (it scrolls past on the GPIO UART otherwise), plus pump `UpdatePlugAndPlay()`
+at ~1 Hz so a slow-booting dongle is seen.
+
+- **Rung 1 — enumerate `[DONE]`.** The CA525 powers up (slowly, ~2 s after a media
+  stick would) as **`ven2717-ff40` "Android MINIX", interface `int6-1-1` (PTP)**.
+  Circle has no PTP driver, so it's unbound; with no AOA handshake the dongle
+  disconnects and retries every ~16 s.
+- **Rung 2 — AOA switch `[DONE]`.** The factory hook binds `CAndroidAutoDevice` to
+  `ven2717-ff40`; its `Configure()` runs the AOA sequence (probe returns **AOA v2**),
+  and the dongle **re-enumerates in accessory mode as `ven18d1-2d00`**. Fixed on the
+  way: xHCI DMA asserts on `.rodata` buffers, so the AOA identity strings must be
+  copied to heap buffers before the control transfers.
+- **Rung 3 — bind accessory bulk `[fix pending re-test]`.** The accessory device
+  enumerates but `Configure()` was being **skipped** by a Circle hub bug: after our
+  pre-switch `Configure()` returns FALSE, the hub deletes the device but leaves its
+  per-port `m_bPortConfigured` flag set, so the replacement (accessory) device on the
+  same port is never configured. Fix = `scripts/patches/usbstandardhub-reconfigure.patch`
+  (clear the flag on teardown). **Built but not yet bench-verified — first task next
+  session.** Once it binds, `uaa1` registers and `CAndroidAutoDevice` is the live
+  `IAaTransport`; then rung 4 (real mbedTLS `IAaCrypto` + drive `AaConnection`).
+- [x] **UI integration (Phase 4, host-side)** — `AndroidAutoScreen` (the "AA" tab)
+  + `AaVideoGeometry` (aspect-fit + touch→source remap) + Screen focus callbacks,
+  host-tested, registered in `kernel.cpp`. The video surface + chrome layout is done;
+  it shows a placeholder until the decoder + transport feed it.
+- [ ] **Phase 4 `[hw]`** — wire transport + decoder into `AaConnection`; first projection.
 - [ ] **Phase 5** — polish.
 
-The whole protocol spine — framing, protobuf, the full connection handshake, and
-video NAL parsing — now builds and is regression-tested on the build server with
-no radio, against Google's real DHU capture bytes where possible (143 host tests).
-What's left is breadth (more per-channel decoders) or genuinely hardware-gated
-(live TLS against the dongle, the USB-AOA transport, on-target decode FPS).
+The whole protocol spine — framing, protobuf, the full connection handshake, video
+NAL parsing — plus the AA UI surface and the USB-AOA transport scaffold now build
+(160 host tests; the Pi 4 image links with the AA tab + transport). What's left is
+hardware-gated: the live USB-AOA bring-up (rungs 1-4), the openh264 decoder + FPS
+(rung 5), and final integration (rung 6).

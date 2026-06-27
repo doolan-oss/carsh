@@ -18,6 +18,7 @@ OBJS = \
 	kernel.o \
 	CircleDir.o \
 	CircleBluetooth.o \
+	CircleAoaTransport.o \
 	BtStackGlue.o \
 	DeviceCrypto.o \
 	$(CARSHTOP)/src/ui/Font.o \
