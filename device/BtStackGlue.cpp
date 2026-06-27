@@ -35,6 +35,9 @@ void btGlueDisconnect() {}
 #include "CircleHciTransport.h"
 #include "bt/NowPlaying.h"  // platform-independent AVRCP metadata assembly
 
+#include <circle/logger.h>  // bench bring-up diagnostics over the serial log
+#include <cstdio>           // fopen self-test: does newlib reach the SD card?
+
 // BTstack is C; include its headers with C linkage. Specific headers only (NOT
 // the umbrella btstack.h, which drags in BLE/mesh we don't build).
 extern "C" {
@@ -58,6 +61,8 @@ extern "C" {
 
 namespace carsh::device {
 namespace {
+
+const char FromBt[] = "btglue";  // serial-log tag for BT bring-up
 
 CircleBluetooth* g_owner = nullptr;
 btstack_packet_callback_registration_t g_hciEventCb;
@@ -191,6 +196,22 @@ void avrcpPacketHandler(uint8_t type, uint16_t, uint8_t* packet, uint16_t) {
 void hciPacketHandler(uint8_t type, uint16_t, uint8_t* packet, uint16_t) {
     if (type != HCI_EVENT_PACKET) return;
     switch (hci_event_packet_get_type(packet)) {
+        case BTSTACK_EVENT_STATE:
+            // The headline bring-up signal: HCI_STATE_WORKING means the controller
+            // (incl. the Realtek firmware download) came up successfully.
+            if (btstack_event_state_get_state(packet) == HCI_STATE_WORKING) {
+                CLogger::Get()->Write(FromBt, LogNotice,
+                                      "HCI WORKING — controller up (firmware loaded)");
+            } else {
+                CLogger::Get()->Write(FromBt, LogNotice, "HCI state -> %u",
+                                      btstack_event_state_get_state(packet));
+            }
+            break;
+        case HCI_EVENT_COMMAND_COMPLETE:
+            // First sign the command/event USB path works (e.g. HCI Reset reply).
+            CLogger::Get()->Write(FromBt, LogDebug, "HCI command complete (opcode 0x%04x)",
+                                  hci_event_command_complete_get_command_opcode(packet));
+            break;
         case HCI_EVENT_CONNECTION_COMPLETE: {
             bd_addr_t addr;
             hci_event_connection_complete_get_bd_addr(packet, addr);
@@ -209,6 +230,7 @@ void hciPacketHandler(uint8_t type, uint16_t, uint8_t* packet, uint16_t) {
 
 bool btGlueInit(CircleBluetooth* owner) {
     g_owner = owner;
+    CLogger::Get()->Write(FromBt, LogNotice, "BT bring-up start (Realtek USB dongle)");
 
     // 1. Memory pools + embedded run loop (pumped by CircleBtRunLoopTask).
     btstack_memory_init();
@@ -220,11 +242,31 @@ bool btGlueInit(CircleBluetooth* owner) {
     hci_init(circleHciTransportInstance(), nullptr);
 
     // 3. Realtek chipset: load the rtlbt firmware + config blob from SD by USB
-    //    product id (R3). TODO(hw): confirm the folder + that the dongle's PID has
-    //    a matching blob shipped under SD:/firmware/rtlbt.
+    //    product id. The RTL8761BU (UB500, USB 0bda:8771) wants files
+    //    "rtl8761bu_fw" + "rtl8761bu_config" under the folder below.
     btstack_chipset_realtek_set_firmware_folder_path(kRealtekFirmwareFolder);
     btstack_chipset_realtek_set_config_folder_path(kRealtekFirmwareFolder);
     hci_set_chipset(btstack_chipset_realtek_instance());
+
+    // Probe the firmware path up front: this is the one unproven link — whether
+    // newlib's fopen() actually reaches the mounted FatFs "SD:" volume. If this
+    // fails at the bench, the chipset's own firmware load will too, and we know to
+    // switch to a FatFs-backed reader instead of guessing.
+    {
+        const char* probe = "SD:/firmware/rtlbt/rtl8761bu_fw";
+        FILE* f = std::fopen(probe, "rb");
+        if (f) {
+            std::fseek(f, 0, SEEK_END);
+            long sz = std::ftell(f);
+            std::fclose(f);
+            CLogger::Get()->Write(FromBt, LogNotice, "firmware probe OK: %s (%ld bytes)",
+                                  probe, sz);
+        } else {
+            CLogger::Get()->Write(FromBt, LogError,
+                                  "firmware probe FAILED: cannot fopen %s "
+                                  "(check SD path / newlib FatFs glue)", probe);
+        }
+    }
 
     // 4. L2CAP + SDP, then the A2DP sink (SBC) + AVRCP CT/TG profiles.
     l2cap_init();
