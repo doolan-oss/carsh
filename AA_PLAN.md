@@ -93,10 +93,43 @@ dongle and/or the board.
 **Phase 4 — integration** `[hw]`
 - Wire `CircleAoaTransport` + `CircleH264Decoder` into the core; video →
   framebuffer, audio → engine ring, touch → input channel. First projection.
+  Present AA inside one UI tab (see "UI integration" below), not full-screen.
 
 **Phase 5 — polish** `[hw]`
 - AV sync / flow‑control, audio focus, disconnect/reconnect, optional mic
   uplink for voice. (Voice can be deferred.)
+
+## UI integration — AA as a tab, chrome stays visible (Phase 4)
+
+Owner requirements: the AA video feed lives **entirely within one UI tab** (so the
+user can switch to other tabs while AA keeps running), and the **left volume rail +
+tab bar stay visible** without the video covering them.
+
+This maps onto the existing UI cleanly — carsh's chrome is already fixed outside
+the content area:
+- `kRailW = 52` px left volume rail, `kTabH = 48` px full-width bottom tab bar.
+- `Screen::contentRect()` = `{52, 0, w-52, h-48}` → `{52, 0, 748, 432}` on the
+  800×480 panel, which **already excludes both**. So an "Android Auto" screen that
+  blits the decoded frame into `contentRect()` keeps the rail + tabs visible by
+  construction, and tab-switching is unchanged.
+
+Approach when Phase 4 lands:
+1. **New `AndroidAuto` screen** (8th tab). Its draw blits the latest decoded AA
+   frame into `contentRect()`; everything else stays standard chrome.
+2. **Resolution + scale.** AA video sizes are fixed standards (480p = 800×480,
+   720p, 1080p) — you can't request 696×432. Keep the already-advertised **480p**
+   (service-discovery video config), decode 800×480, and **scale-blit** into the
+   696×432 content rect (~0.87×, a cheap, good-quality downscale). Map touches in
+   the content rect back to 800×480 for the AA input channel (pure geometry —
+   host-testable when wired).
+3. **Tie video focus to the active tab.** Send `VIDEO_FOCUS_INDICATION` FOCUSED
+   when the AA tab becomes active and UNFOCUSED when the user switches away, so the
+   phone isn't streaming frames we're not showing. (Reference:
+   `build_video_focus_indication`.)
+
+Not done now: needs the live decoder + framebuffer compositor + an active
+connection (all Phase 4). Captured here so it's built right; the design requires
+no change to the protocol core already written.
 
 ## Hardware notes
 
