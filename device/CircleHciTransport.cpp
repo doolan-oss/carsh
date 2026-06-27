@@ -7,6 +7,9 @@
 #include <circle/usb/usbbluetooth.h>
 #include <circle/devicenameservice.h>
 #include <circle/logger.h>
+#include <circle/synchronize.h>  // DataSyncBarrier/DataMemBarrier
+
+#include <cstring>
 
 extern "C" {
 #include "hci.h"  // HCI packet-type + HCI_EVENT_TRANSPORT_PACKET_SENT constants
@@ -20,16 +23,59 @@ const char FromTransport[] = "bttransport";
 void (*g_packetHandler)(uint8_t packet_type, uint8_t* packet, uint16_t size) = nullptr;
 CUSBBluetoothDevice* g_dev = nullptr;
 
-// Circle delivers HCI events (interrupt EP) here, in USB-completion context.
-// Forward to BTstack as an HCI_EVENT_PACKET.
-// TODO(hw): this runs in IRQ/USB-completion context; for correctness the packet
-// should be trampolined onto the BTstack run loop (btstack_run_loop data source)
-// rather than handed to the stack synchronously. Verify + fix at the bench.
+// Lock-free SPSC queue of inbound HCI event packets. Circle delivers events from
+// the USB interrupt-EP completion callback (IRQ context); we MUST NOT hand them to
+// BTstack there — hci.c would synchronously send the next command as a *blocking
+// USB control transfer from inside the USB completion handler*, deadlocking the
+// USB stack (observed at the bench: freeze right after the HCI Reset reply). So
+// the producer (eventStub, IRQ) only enqueues; the consumer (the run-loop task,
+// via circleHciTransportProcess) dequeues and delivers — so follow-up commands go
+// out from task context. Single producer + single consumer, so no locks needed,
+// just a barrier so the slot is fully written before the tail advances.
+constexpr unsigned kEvtSlots = 32;
+constexpr unsigned kEvtMax = 260;  // >= max HCI event (257) and the interrupt EP MPS
+struct EvtSlot {
+    uint16_t len;
+    uint8_t data[kEvtMax];
+};
+EvtSlot g_evtQ[kEvtSlots];
+volatile unsigned g_evtHead = 0;  // written by consumer only
+volatile unsigned g_evtTail = 0;  // written by producer only
+
+// Producer — runs in USB-completion (IRQ) context. Enqueue only.
 void eventStub(const void* buffer, unsigned length) {
-    if (g_packetHandler && length > 0) {
-        g_packetHandler(HCI_EVENT_PACKET, (uint8_t*)buffer, (uint16_t)length);
+    if (length == 0) return;
+    if (length > kEvtMax) length = kEvtMax;
+    unsigned tail = g_evtTail;
+    unsigned next = (tail + 1) % kEvtSlots;
+    if (next == g_evtHead) return;  // full — drop (bring-up rates won't hit this)
+    g_evtQ[tail].len = static_cast<uint16_t>(length);
+    std::memcpy(g_evtQ[tail].data, buffer, length);
+    DataSyncBarrier();  // slot fully written before the tail becomes visible
+    g_evtTail = next;
+}
+
+}  // namespace
+
+// Consumer — called from CircleBtRunLoopTask (run-loop/task context) before each
+// run-loop pass. Delivers queued events to BTstack; any commands hci.c issues in
+// response now go out from here, not from the USB IRQ.
+void circleHciTransportProcess() {
+    while (g_evtHead != g_evtTail) {
+        DataMemBarrier();
+        unsigned head = g_evtHead;
+        uint16_t len = g_evtQ[head].len;
+        static uint8_t tmp[kEvtMax];
+        std::memcpy(tmp, g_evtQ[head].data, len);
+        g_evtHead = (head + 1) % kEvtSlots;
+        // Diag: event code (tmp[0]) + length, so we can see the bring-up sequence.
+        CLogger::Get()->Write(FromTransport, LogNotice, "RX evt 0x%02x len %u",
+                              len ? tmp[0] : 0, len);
+        if (g_packetHandler) g_packetHandler(HCI_EVENT_PACKET, tmp, len);
     }
 }
+
+namespace {
 
 void transportInit(const void* /*config*/) {}
 
@@ -68,10 +114,16 @@ void notifyPacketSent() {
 int transportSendPacket(uint8_t packet_type, uint8_t* packet, int size) {
     if (g_dev == nullptr) return -1;
     switch (packet_type) {
-        case HCI_COMMAND_DATA_PACKET:
-            g_dev->SendHCICommand(packet, (unsigned)size);
+        case HCI_COMMAND_DATA_PACKET: {
+            // Diag: HCI command opcode is the first 2 bytes, little-endian.
+            uint16_t opcode = (size >= 2)
+                ? static_cast<uint16_t>(packet[0] | (packet[1] << 8)) : 0;
+            boolean ok = g_dev->SendHCICommand(packet, (unsigned)size);
+            CLogger::Get()->Write(FromTransport, LogNotice, "TX cmd 0x%04x len %d -> %s",
+                                  opcode, size, ok ? "ok" : "FAIL");
             notifyPacketSent();
             return 0;
+        }
         case HCI_ACL_DATA_PACKET:
             // TODO(hw): ACL OUT over the bulk endpoint. Circle's
             // CUSBBluetoothDevice has no ACL API yet (the one real gap) — needs a

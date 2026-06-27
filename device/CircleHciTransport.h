@@ -24,6 +24,12 @@ namespace carsh::device {
 // static storage; open() locates the "ubt1" USB device at run time.
 const hci_transport_t* circleHciTransportInstance();
 
+// Drain the inbound-event queue into BTstack. MUST be called from the run-loop
+// task (CircleBtRunLoopTask) before each run-loop pass: events arrive on the USB
+// IRQ and are queued (not delivered there), so the follow-up command hci.c issues
+// runs from task context instead of a blocking transfer inside the USB callback.
+void circleHciTransportProcess();
+
 }  // namespace carsh::device
 
 #endif  // CARSH_HAVE_BTSTACK
