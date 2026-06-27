@@ -94,11 +94,19 @@ CAndroidAutoDevice::CAndroidAutoDevice(CUSBFunction* pFunction)
       m_pBulkIn(nullptr),
       m_pBulkOut(nullptr),
       m_pInBuffer(nullptr),
+      m_nDeviceNumber(0),
       m_ringHead(0),
       m_ringTail(0),
       m_rxBytes(0) {}
 
 CAndroidAutoDevice::~CAndroidAutoDevice() {
+    // Unregister from the name service + free the number BEFORE the object dies, so
+    // "uaa1" doesn't dangle after a disconnect (otherwise the next reconnect would
+    // register as uaa2 and the driver, still watching uaa1, would never rebind).
+    if (m_nDeviceNumber != 0) {
+        CDeviceNameService::Get()->RemoveDevice(DevicePrefix, m_nDeviceNumber, FALSE);
+        s_NumberPool.FreeNumber(m_nDeviceNumber);
+    }
     delete m_pBulkIn;
     delete m_pBulkOut;
     delete[] m_pInBuffer;
@@ -159,8 +167,8 @@ bool CAndroidAutoDevice::configureAccessory() {
     m_pInBuffer = new u8[kInTransfer];
     if (m_pInBuffer == nullptr) return false;
 
-    unsigned n = s_NumberPool.AllocateNumber(TRUE, From);
-    CDeviceNameService::Get()->AddDevice(DevicePrefix, n, this, FALSE);
+    m_nDeviceNumber = s_NumberPool.AllocateNumber(TRUE, From);
+    CDeviceNameService::Get()->AddDevice(DevicePrefix, m_nDeviceNumber, this, FALSE);
 
     if (!startInRequest()) {
         CLogger::Get()->Write(From, LogError, "cannot start bulk-IN polling");

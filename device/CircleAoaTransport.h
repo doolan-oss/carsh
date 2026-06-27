@@ -74,6 +74,7 @@ private:
     CUSBEndpoint* m_pBulkIn;
     CUSBEndpoint* m_pBulkOut;
     u8* m_pInBuffer;
+    unsigned m_nDeviceNumber;  // "uaaN" registration; 0 = not registered
     u8 m_ring[kRingSize];
     volatile unsigned m_ringHead;
     volatile unsigned m_ringTail;
