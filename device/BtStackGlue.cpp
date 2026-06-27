@@ -22,6 +22,7 @@ void btGlueStartScan() {}
 void btGlueStopScan() {}
 void btGlueConnect(const unsigned char*) {}
 void btGlueDisconnect() {}
+uint32_t btGlueA2dpSampleRate() { return 0; }
 }  // namespace carsh::device
 
 #else
@@ -84,6 +85,10 @@ const hci_dump_t g_btDump = {nullptr, &btDumpLogPacket, &btDumpLogMessage};
 CircleBluetooth* g_owner = nullptr;
 btstack_packet_callback_registration_t g_hciEventCb;
 
+// A2DP SBC sample rate (from the decoder), so the kernel clocks the PWM output at
+// the stream's rate. Defaults to the most common A2DP rate until the first frame.
+uint32_t g_btSampleRate = 44100;
+
 // Active connection identifiers, learned from BTstack connection events.
 uint16_t g_a2dpCid = 0;
 uint16_t g_avrcpCid = 0;
@@ -117,8 +122,9 @@ carsh::bt::BdAddr toBdAddr(const uint8_t* a) {
 
 // SBC decoder callback: interleaved int16 PCM -> float, forwarded to the engine
 // ring via the owner. The jitter buffer + clock-drift SRC (R12) live downstream.
-void sbcPcmHandler(int16_t* data, int numFrames, int numChannels, int /*sampleRate*/,
+void sbcPcmHandler(int16_t* data, int numFrames, int numChannels, int sampleRate,
                    void* /*ctx*/) {
+    g_btSampleRate = static_cast<uint32_t>(sampleRate);
     if (!g_owner) return;
     const int n = numFrames * numChannels;
     if (n <= 0 || n > (int)(sizeof(g_pcmFloat) / sizeof(g_pcmFloat[0]))) return;
@@ -420,6 +426,8 @@ void btGlueConnect(const unsigned char* addr6) {
 void btGlueDisconnect() {
     if (g_a2dpCid) a2dp_sink_disconnect(g_a2dpCid);
 }
+
+uint32_t btGlueA2dpSampleRate() { return g_btSampleRate; }
 
 }  // namespace carsh::device
 
