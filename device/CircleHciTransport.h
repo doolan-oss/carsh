@@ -2,13 +2,12 @@
 // device (CUSBBluetoothDevice), for the stage-1 USB-dongle path (device/README
 // "Bluetooth"). Compiled only under CARSH_HAVE_BTSTACK.
 //
-// Status: the HCI **command** (control EP) and **event** (interrupt EP) paths use
-// Circle's public CUSBBluetoothDevice API and are wired here. The HCI **ACL** data
-// path (the A2DP media stream) is TODO(hw): Circle's CUSBBluetoothDevice
-// configures the bulk IN/OUT endpoints but exposes no ACL transfer API, so ACL
-// send/receive needs a CUSBBluetoothDevice extension at the bench (a documented
-// third_party patch — see HARDWARE_TODO H6). Until then HCI bring-up (reset,
-// read-local-version, inquiry, connection) works but no audio flows.
+// Status: command (control EP), event (interrupt EP) AND ACL data (bulk EPs) are
+// all wired. ACL send/receive uses CUSBBluetoothDevice::SendHCIData /
+// RegisterHCIDataHandler, added by scripts/patches/usbbluetooth-acl.patch (Circle
+// configures the bulk endpoints but upstream never exposes them). Inbound events
+// and ACL are queued in the USB IRQ and delivered from the run-loop task
+// (circleHciTransportProcess) to avoid re-entrant blocking USB calls.
 #ifndef _carsh_circle_hci_transport_h
 #define _carsh_circle_hci_transport_h
 
