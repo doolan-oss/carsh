@@ -139,9 +139,14 @@ The build links, but it is **not** validated against a radio:
    rather than handed to the stack synchronously.
 4. **SSP / pairing** and the **clock-drift adaptive SRC** (R12) on the A2DP PCM.
 
-## Current milestone (Step 2)
+## Current milestone — booting on real hardware
 
-`CKernel` brings up serial logging + the framebuffer and renders the real carsh
-UI (the same `ui/` toolkit the host tests cover) to the panel. Next milestones
-wire the remaining backends: FAT (`Vfs`), I2S DAC (`ISoundDevice`), touch
-(`ITouch`), the decode/scheduler tasks, then BTstack and OTA flash.
+The image **boots on a real Pi 4 and runs as a media player.** Validated on the
+board: framebuffer/DSI panel, touch input, USB FAT32 media indexed into the
+library, onboard PWM audio out the 3.5 mm jack, the vertical volume rail, and the
+USB-C serial console. The decode + scheduler tasks run live feeding playback.
+
+Remaining hardware work (see ../HARDWARE_TODO.md): I2S DAC HAT (PWM jack works
+today), BTstack on a real radio (USB ACL path + Realtek firmware blob — H6),
+WiFi, and the OTA flash write + chainloader. Backends that build but await their
+peripheral: `CircleSoundDevice` (I2S), `CircleFlashTarget` (OTA slot write).
