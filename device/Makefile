@@ -20,6 +20,7 @@ OBJS = \
 	CircleBluetooth.o \
 	CircleAoaTransport.o \
 	CircleAaDriver.o \
+	AaCryptoMbedTls.o \
 	BtStackGlue.o \
 	DeviceCrypto.o \
 	$(CARSHTOP)/src/aa/AaMessenger.o \
@@ -67,7 +68,29 @@ endif
 
 include $(CIRCLEHOME)/Rules.mk
 
+# ---- Android Auto TLS: mbedTLS (rung 4b) -----------------------------------
+# AaCryptoMbedTls.cpp is the only unit that includes mbedTLS. circle-stdlib's
+# bundled mbedTLS is built with `cd third_party/circle-stdlib && make mbedtls`,
+# producing the three core archives plus the circle-mbedtls glue (entropy via
+# Circle's HW RNG, threading, the bare-metal config). The same config header must
+# be used when compiling our unit so the struct layouts match the archives, hence
+# the MBEDTLS_CONFIG_FILE define below (inert for every other TU — none include
+# mbedTLS). The four archives are wrapped in a link group so their mutual
+# references (the glue's platform calloc/free <-> crypto) resolve regardless of
+# order. [hw] bench check: confirm config-circle-mbedtls.h enables TLS 1.2 +
+# MBEDTLS_TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256 (AA_PLAN risk #4).
+MBEDTLS_LIBDIR     := $(CIRCLE_STDLIB)/libs/mbedtls/library
+CIRCLE_MBEDTLS_LIB := $(CIRCLE_STDLIB)/src/circle-mbedtls/libcircle-mbedtls.a
+AA_TLS_LIBS := --start-group \
+	$(CIRCLE_MBEDTLS_LIB) \
+	$(MBEDTLS_LIBDIR)/libmbedtls.a \
+	$(MBEDTLS_LIBDIR)/libmbedx509.a \
+	$(MBEDTLS_LIBDIR)/libmbedcrypto.a \
+	--end-group
+
 INCLUDE += -I$(CARSHTOP)/src -I$(CARSHTOP)/third_party
+INCLUDE += -I$(CIRCLE_STDLIB)/include -I$(CIRCLE_STDLIB)/libs/mbedtls/include
+CPPFLAGS += -DMBEDTLS_CONFIG_FILE='<circle-mbedtls/config-circle-mbedtls.h>'
 ifdef CARSH_HAVE_BTSTACK
 # -I$(CURDIR) finds device/btstack_config.h; the rest are the BTstack headers.
 INCLUDE += -I$(CURDIR) \
@@ -85,6 +108,7 @@ INCLUDE := $(CIRCLE_STDLIB_INCLUDES) $(INCLUDE)
 # later) so the audio-output backends and the USB-C serial-log gadget link.
 LIBS := $(CIRCLEHOME)/lib/sound/libsound.a \
         $(CIRCLEHOME)/lib/usb/gadget/libusbgadget.a \
+        $(AA_TLS_LIBS) \
         $(CIRCLE_STDLIB_LIBS)
 CPPFLAGS += -std=c++17
 

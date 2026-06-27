@@ -395,6 +395,24 @@ at ~1 Hz so a slow-booting dongle is seen.
   - Then swap `LoggingCrypto` → `AaCryptoMbedTls` in `CircleAaDriver`; the state
     machine continues handshake → auth → service discovery → channel opens → first AV
     (rungs 5-6 = openh264 decode + the AndroidAuto tab already built).
+  - **[DONE host-side 2026-06-28]** `device/AaCryptoMbedTls.{h,cpp}` implements
+    `IAaCrypto` on mbedTLS exactly as scoped above: HU = TLS 1.2 client, suite pinned
+    to ECDHE-RSA-AES128-GCM-SHA256, `VERIFY_NONE`, ctr_drbg seeded from an injected
+    entropy fn (Circle HW RNG on device), in-memory BIO (`src/aa/AaMemBio.h`, pure +
+    host-tested), and the raw-cert bypass for the aasdk cert's non-standard UTCTime
+    (`loadOwnCert`). The in-memory BIO + the full handshake + encrypt/decrypt
+    round-trip are **host-verified against system mbedTLS 2.28** — the same 2.28 line
+    circle bundles — so the plumbing the phone exercises is proven on the build
+    server (`tests/aa/AaCryptoMbedTls_test.cpp`, incl. forcing the raw-cert path).
+    `CircleAaDriver` now constructs `AaCryptoMbedTls` (HW-RNG entropy) instead of
+    `LoggingCrypto`. `device/Makefile` links the four mbedTLS archives (grouped) with
+    the `MBEDTLS_CONFIG_FILE=<circle-mbedtls/config-circle-mbedtls.h>` define.
+    *Still `[hw]`:* (a) the device link itself (`cd device && make`) — not runnable in
+    the agent env (no cross-toolchain / circle-stdlib checkout); the unit is
+    host-compile-verified against the identical mbedTLS API. (b) The **live phone
+    handshake**, which needs the real Google-registered aasdk head-unit cert dropped
+    into `device/AaHuCert.h` (currently a clearly-labelled placeholder test cert) +
+    confirming the circle-mbedtls config enables the pinned suite (risk #4).
 - [x] **UI integration (Phase 4, host-side)** — `AndroidAutoScreen` (the "AA" tab)
   + `AaVideoGeometry` (aspect-fit + touch→source remap) + Screen focus callbacks,
   host-tested, registered in `kernel.cpp`. The video surface + chrome layout is done;
