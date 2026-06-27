@@ -143,5 +143,22 @@ else()
   message(STATUS "carsh: mbedTLS not found — AA TLS crypto host test skipped (stub)")
 endif()
 
+# Optional: host-test the device's H.264 decode backend (device/CircleH264Decoder)
+# against the system openh264 (Cisco, BSD). The same library is vendored for the
+# aarch64 image, so an encode->decode->checksum round trip on the build server
+# genuinely exercises the decode + I420->RGB path the device runs. On-target FPS
+# stays [hw]. Without openh264 the test compiles to nothing (see the #ifdef guard).
+find_library(OPENH264_LIB NAMES openh264)
+find_path(OPENH264_INC NAMES wels/codec_api.h)
+if(OPENH264_LIB AND OPENH264_INC)
+  message(STATUS "carsh: openh264 found — AA H.264 decode host test enabled")
+  target_sources(carsh_tests PRIVATE ${CMAKE_SOURCE_DIR}/device/CircleH264Decoder.cpp)
+  target_compile_definitions(carsh_tests PRIVATE CARSH_HAVE_OPENH264=1)
+  target_include_directories(carsh_tests PRIVATE ${OPENH264_INC})
+  target_link_libraries(carsh_tests PRIVATE ${OPENH264_LIB})
+else()
+  message(STATUS "carsh: openh264 not found — AA H.264 decode host test skipped (stub)")
+endif()
+
 enable_testing()
 add_test(NAME unit COMMAND carsh_tests)

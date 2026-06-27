@@ -66,6 +66,18 @@ BTSTACK_OBJS := \
 OBJS += HalCircle.o CircleHciTransport.o BtStackClassicShims.o $(BTSTACK_OBJS)
 endif
 
+# ---- Optional: openh264 H.264 decoder (AA video, rung 5) -------------------
+# Build with:  make CARSH_HAVE_OPENH264=1
+# Compiles device/CircleH264Decoder.cpp and links the vendored aarch64 openh264
+# decoder static lib (scripts/fetch_openh264.sh + its cross-build notes). The
+# default build omits it — the AA tab shows the placeholder until decode is linked.
+# The decoder unit is host-compile-verified against the system openh264 (same 2.4.x
+# API), so this gate only adds the cross-built archive + the device-only TU.
+ifdef CARSH_HAVE_OPENH264
+OPENH264 := $(CARSHTOP)/third_party/openh264
+OBJS += CircleH264Decoder.o
+endif
+
 include $(CIRCLEHOME)/Rules.mk
 
 # ---- Android Auto TLS: mbedTLS (rung 4b) -----------------------------------
@@ -102,6 +114,10 @@ INCLUDE += -I$(CURDIR) \
 CPPFLAGS += -DCARSH_HAVE_BTSTACK
 CFLAGS += -DCARSH_HAVE_BTSTACK
 endif
+ifdef CARSH_HAVE_OPENH264
+INCLUDE += -I$(OPENH264)/codec/api    # resolves <wels/codec_api.h>
+CPPFLAGS += -DCARSH_HAVE_OPENH264
+endif
 INCLUDE := $(CIRCLE_STDLIB_INCLUDES) $(INCLUDE)
 # Circle's sound + USB-gadget libraries are not part of the default circle-stdlib
 # lib set; add them ahead of the rest (they depend on libusb/libcircle, which come
@@ -110,6 +126,10 @@ LIBS := $(CIRCLEHOME)/lib/sound/libsound.a \
         $(CIRCLEHOME)/lib/usb/gadget/libusbgadget.a \
         $(AA_TLS_LIBS) \
         $(CIRCLE_STDLIB_LIBS)
+ifdef CARSH_HAVE_OPENH264
+# Decoder-only aarch64 archive produced by the cross-build in fetch_openh264.sh.
+LIBS := $(OPENH264)/libopenh264.a $(LIBS)
+endif
 CPPFLAGS += -std=c++17
 
 -include $(DEPS)
