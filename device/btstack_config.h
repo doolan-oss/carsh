@@ -16,6 +16,10 @@
 #define HAVE_ASSERT
 #define HAVE_MALLOC                 // newlib malloc is available under Circle
 #define HAVE_EMBEDDED_TIME_MS       // run loop uses hal_time_ms() (device/hal_*)
+// Realtek chipset firmware loading uses fopen/fread guarded by HAVE_POSIX_FILE_IO.
+// circle-stdlib's newlib maps fopen() onto the mounted FatFs volume (kernel mounts
+// "SD:"), so the rtlbt firmware downloads from SD:/firmware/rtlbt. (R3 / H6.)
+#define HAVE_POSIX_FILE_IO
 
 // --- Enabled BTstack features ----------------------------------------------
 #define ENABLE_CLASSIC              // BR/EDR only (A2DP + AVRCP live here)
