@@ -126,11 +126,15 @@ void sbcPcmHandler(int16_t* data, int numFrames, int numChannels, int /*sampleRa
     g_owner->deliverA2dpPcm(g_pcmFloat, (unsigned)numFrames, (unsigned)numChannels);
 }
 
-// A2DP media payload (one AVDTP media packet) -> SBC decoder.
+// A2DP media payload -> SBC decoder. Strip the AVDTP media header first: a 12-byte
+// RTP header + 1-byte SBC header precede the SBC frames (feeding them to the
+// decoder is what caused the "SBC decode: checksum error" at the bench).
 void a2dpMediaHandler(uint8_t /*seid*/, uint8_t* packet, uint16_t size) {
-    if (g_sbcDecoder) {
-        g_sbcDecoder->decode_signed_16(&g_sbcContext, 0 /*packet_status_flag*/, packet, size);
-    }
+    if (!g_sbcDecoder) return;
+    constexpr unsigned kMediaHeader = 12 + 1;  // RTP header + SBC header
+    if (size <= kMediaHeader) return;
+    g_sbcDecoder->decode_signed_16(&g_sbcContext, 0, packet + kMediaHeader,
+                                   static_cast<uint16_t>(size - kMediaHeader));
 }
 
 // A2DP control events: stream open/close. TODO(hw): on SBC config event, call
