@@ -154,9 +154,9 @@ bool AaConnection::sendPlainSpecific(uint16_t msgId, const uint8_t* p, size_t n)
 bool AaConnection::sendPlainControl(uint16_t msgId, const uint8_t* p, size_t n) {
     return msger_.sendControl(msgId, EncryptionType::Plain, p, n);
 }
-// Encrypted control: the 2-byte msg id lives INSIDE the ciphertext, so build
-// [msgId][payload], encrypt, and send as a raw encrypted SPECIFIC frame.
-bool AaConnection::sendEncryptedControl(uint16_t msgId, const uint8_t* p, size_t n) {
+// Encrypted send on any channel: the 2-byte msg id lives INSIDE the ciphertext, so
+// build [msgId][payload], encrypt, and send as a raw encrypted SPECIFIC frame.
+bool AaConnection::sendEncrypted(ChannelId ch, uint16_t msgId, const uint8_t* p, size_t n) {
     std::vector<uint8_t> plain;
     plain.reserve(2 + n);
     plain.push_back(static_cast<uint8_t>((msgId >> 8) & 0xFF));
@@ -164,8 +164,11 @@ bool AaConnection::sendEncryptedControl(uint16_t msgId, const uint8_t* p, size_t
     plain.insert(plain.end(), p, p + n);
     std::vector<uint8_t> cipher = crypto_.encrypt(plain.data(), plain.size());
     if (cipher.empty()) return false;
-    return msger_.sendRaw(ChannelId::Control, EncryptionType::Encrypted,
-                          MessageType::Specific, cipher.data(), cipher.size());
+    return msger_.sendRaw(ch, EncryptionType::Encrypted, MessageType::Specific,
+                          cipher.data(), cipher.size());
+}
+bool AaConnection::sendEncryptedControl(uint16_t msgId, const uint8_t* p, size_t n) {
+    return sendEncrypted(ChannelId::Control, msgId, p, n);
 }
 
 void AaConnection::start() {
@@ -295,6 +298,226 @@ void AaConnection::handleControl(uint16_t msgId, const uint8_t* p, size_t n) {
     }
 }
 
+// --- rung 4c: per-channel dispatch in the Running phase ----------------------
+
+void AaConnection::handleChannelMessage(ChannelId ch, uint16_t msgId, const uint8_t* p,
+                                        size_t n) {
+    if (isAvChannel(ch)) {
+        handleAvChannel(ch, msgId, p, n);
+    } else if (ch == ChannelId::Input) {
+        handleInputChannel(msgId, p, n);
+    } else if (ch == ChannelId::Sensor) {
+        handleSensorChannel(msgId, p, n);
+    } else if (cbs_.onChannelMessage) {
+        // Nav / media-status / bluetooth: not decoded here yet.
+        cbs_.onChannelMessage(ch, msgId, p, n);
+    }
+}
+
+void AaConnection::handleAvChannel(ChannelId ch, uint16_t msgId, const uint8_t* p, size_t n) {
+    const size_t i = static_cast<size_t>(ch);
+    switch (static_cast<AvMsgId>(msgId)) {
+        case AvMsgId::SetupRequest: {
+            // AVChannelSetupRequest{ config_index = 1 (uint32) }.
+            uint32_t configIndex = 0;
+            pb::Reader r(p, n);
+            uint32_t field;
+            uint8_t wire;
+            while (!r.eof()) {
+                if (!r.tag(field, wire)) break;
+                if (field == 1 && wire == 0) {
+                    r.u32(configIndex);
+                } else if (!r.skip(wire)) {
+                    break;
+                }
+            }
+            sendAvSetupResponse(ch, static_cast<uint8_t>(configIndex));
+            if (cbs_.onAvSetup) cbs_.onAvSetup(ch, static_cast<uint8_t>(configIndex));
+            break;
+        }
+        case AvMsgId::StartIndication: {
+            // AVChannelStartIndication{ session = 1 (int32), config = 2 (uint32) }.
+            pb::Reader r(p, n);
+            uint32_t field;
+            uint8_t wire;
+            while (!r.eof()) {
+                if (!r.tag(field, wire)) break;
+                if (field == 1 && wire == 0) {
+                    uint64_t v;
+                    if (r.varint(v)) avSession_[i] = static_cast<int32_t>(v);
+                } else if (!r.skip(wire)) {
+                    break;
+                }
+            }
+            if (cbs_.onAvStart) cbs_.onAvStart(ch, true);
+            break;
+        }
+        case AvMsgId::StopIndication:
+            if (cbs_.onAvStart) cbs_.onAvStart(ch, false);
+            break;
+        case AvMsgId::VideoFocusRequest: {
+            // VideoFocusRequest{ disp_channel = 1, focus_mode = 2 (enum) }.
+            uint32_t mode = static_cast<uint32_t>(VideoFocusMode::Focused);
+            pb::Reader r(p, n);
+            uint32_t field;
+            uint8_t wire;
+            while (!r.eof()) {
+                if (!r.tag(field, wire)) break;
+                if (field == 2 && wire == 0) {
+                    r.u32(mode);
+                } else if (!r.skip(wire)) {
+                    break;
+                }
+            }
+            if (cbs_.onVideoFocusRequest)
+                cbs_.onVideoFocusRequest(static_cast<VideoFocusMode>(mode));
+            break;
+        }
+        case AvMsgId::MediaWithTimestamp:
+        case AvMsgId::MediaIndication: {
+            const bool tsPresent =
+                static_cast<AvMsgId>(msgId) == AvMsgId::MediaWithTimestamp;
+            uint64_t ts = 0;
+            const uint8_t* data = p;
+            size_t len = n;
+            if (tsPresent) {
+                if (n < 8) {
+                    sendMediaAck(ch);  // malformed — still ack to keep the stream flowing
+                    break;
+                }
+                for (int b = 0; b < 8; ++b) ts = (ts << 8) | p[b];
+                data = p + 8;
+                len = n - 8;
+            }
+            // Flow control: ack first so the phone keeps streaming, then deliver.
+            sendMediaAck(ch);
+            if (cbs_.onAvMedia && len > 0) cbs_.onAvMedia(ch, tsPresent, ts, data, len);
+            break;
+        }
+        default:
+            if (cbs_.onChannelMessage) cbs_.onChannelMessage(ch, msgId, p, n);
+            break;
+    }
+}
+
+void AaConnection::handleInputChannel(uint16_t msgId, const uint8_t* p, size_t n) {
+    if (static_cast<InputMsgId>(msgId) == InputMsgId::BindingRequest) {
+        // BindingResponse{ status = 1 (int32) = 0 (OK) }.
+        std::vector<uint8_t> body;
+        pb::Writer(body).int32(1, 0);
+        sendEncrypted(ChannelId::Input, static_cast<uint16_t>(InputMsgId::BindingResponse),
+                      body.data(), body.size());
+    } else if (cbs_.onChannelMessage) {
+        cbs_.onChannelMessage(ChannelId::Input, msgId, p, n);
+    }
+}
+
+void AaConnection::handleSensorChannel(uint16_t msgId, const uint8_t* p, size_t n) {
+    if (static_cast<SensorMsgId>(msgId) == SensorMsgId::SensorStartRequest) {
+        // SensorStartRequestMessage{ sensor_type = 1 (enum), refresh_interval = 2 }.
+        uint32_t sensorType = 0;
+        pb::Reader r(p, n);
+        uint32_t field;
+        uint8_t wire;
+        while (!r.eof()) {
+            if (!r.tag(field, wire)) break;
+            if (field == 1 && wire == 0) {
+                r.u32(sensorType);
+            } else if (!r.skip(wire)) {
+                break;
+            }
+        }
+        // SensorStartResponseMessage{ status = 1 (int32) = 0 (OK) }.
+        std::vector<uint8_t> resp;
+        pb::Writer(resp).int32(1, 0);
+        sendEncrypted(ChannelId::Sensor,
+                      static_cast<uint16_t>(SensorMsgId::SensorStartResponse), resp.data(),
+                      resp.size());
+        // Push an initial reading so the phone unblocks (it waits on driving status
+        // before showing the full UI). [hw] to confirm against a DHU capture.
+        sendSensorEvent(sensorType);
+    } else if (cbs_.onChannelMessage) {
+        cbs_.onChannelMessage(ChannelId::Sensor, msgId, p, n);
+    }
+}
+
+// SensorEventIndication carries one repeated sub-message per sensor, and aasdk's
+// field number for each equals the SensorType id (driving_status = 13, night = 10,
+// matching buildServiceDiscoveryResponse above), so encode generically by type.
+void AaConnection::sendSensorEvent(uint32_t sensorType) {
+    std::vector<uint8_t> body;
+    pb::Writer w(body);
+    if (sensorType == static_cast<uint32_t>(SensorType::DrivingStatus)) {
+        // driving_status[13] { status[1] = 0 (UNRESTRICTED) }.
+        w.submessage(static_cast<uint32_t>(SensorType::DrivingStatus),
+                     [](pb::Writer& s) { s.uint32(1, 0); });
+    } else if (sensorType == static_cast<uint32_t>(SensorType::NightData)) {
+        // night_mode[10] { is_night[1] = false }.
+        w.submessage(static_cast<uint32_t>(SensorType::NightData),
+                     [](pb::Writer& s) { s.boolean(1, false); });
+    } else {
+        return;  // GPS/location etc. need real data — omit (phone tolerates absence).
+    }
+    sendEncrypted(ChannelId::Sensor,
+                  static_cast<uint16_t>(SensorMsgId::SensorEventIndication), body.data(),
+                  body.size());
+}
+
+void AaConnection::sendAvSetupResponse(ChannelId ch, uint8_t configIndex) {
+    // AVChannelSetupResponse{ media_status = 1 (OK), max_unacked = 2, configs = 3 }.
+    std::vector<uint8_t> body;
+    pb::Writer w(body);
+    w.uint32(1, 2);                  // media_status = OK
+    w.uint32(2, 1);                  // max_unacked
+    w.uint32(3, configIndex);        // configs[0] = the accepted config index
+    sendEncrypted(ch, static_cast<uint16_t>(AvMsgId::SetupResponse), body.data(),
+                  body.size());
+}
+
+void AaConnection::sendMediaAck(ChannelId ch) {
+    // AVMediaAckIndication{ session = 1 (int32), ack_count = 2 (uint32) }.
+    std::vector<uint8_t> body;
+    pb::Writer w(body);
+    w.int32(1, avSession_[static_cast<size_t>(ch)]);
+    w.uint32(2, 1);
+    sendEncrypted(ch, static_cast<uint16_t>(AvMsgId::MediaAck), body.data(), body.size());
+}
+
+bool AaConnection::sendVideoFocus(VideoFocusMode mode) {
+    if (!channelOpen(ChannelId::Video)) return false;
+    // VideoFocusIndication{ focus_mode = 1 (enum), unrequested = 2 (bool) }.
+    std::vector<uint8_t> body;
+    pb::Writer w(body);
+    w.uint32(1, static_cast<uint32_t>(mode));
+    w.boolean(2, false);
+    return sendEncrypted(ChannelId::Video,
+                         static_cast<uint16_t>(AvMsgId::VideoFocusIndication), body.data(),
+                         body.size());
+}
+
+bool AaConnection::sendTouch(TouchAction action, uint32_t x, uint32_t y,
+                             uint64_t timestamp) {
+    if (!channelOpen(ChannelId::Input)) return false;
+    // InputEventIndication{ timestamp = 1 (int64), touch_event = 2 {
+    //   touch_location[1] { x[1], y[2], pointer_id[3] }, touch_action[2], action_index[3] } }.
+    std::vector<uint8_t> body;
+    pb::Writer w(body);
+    w.tag(0, 1);
+    w.varint(timestamp);
+    w.submessage(2, [&](pb::Writer& te) {
+        te.submessage(1, [&](pb::Writer& loc) {
+            loc.uint32(1, x);
+            loc.uint32(2, y);
+            loc.uint32(3, 0);  // pointer_id
+        });
+        te.uint32(2, static_cast<uint32_t>(action));
+        te.uint32(3, 0);  // action_index
+    });
+    return sendEncrypted(ChannelId::Input,
+                         static_cast<uint16_t>(InputMsgId::InputEventIndication),
+                         body.data(), body.size());
+}
+
 bool AaConnection::poll(uint32_t timeoutMs) {
     if (state_ == AaState::Shutdown) return false;
 
@@ -320,8 +543,8 @@ bool AaConnection::poll(uint32_t timeoutMs) {
 
     if (msg.channel == ChannelId::Control) {
         handleControl(msgId, payload, payloadLen);
-    } else if (cbs_.onChannelMessage) {
-        cbs_.onChannelMessage(msg.channel, msgId, payload, payloadLen);
+    } else {
+        handleChannelMessage(msg.channel, msgId, payload, payloadLen);
     }
     return true;
 }
