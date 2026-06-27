@@ -267,13 +267,23 @@ host tests pass, never "validated on the Pi").
         `IAaCrypto` for the device (live handshake is `[hw]`).
 - [x] **Phase 2** — H.264 NAL extraction/classification (`H264Nal`) +
   `IH264Decoder` seam, host-tested.
-  - [ ] *Remaining `[hw]`:* the SW decoder impl + on-target FPS.
-- [ ] **Phase 3** — `CircleAoaTransport` USB-AOA spike (needs the dongle).
-- [ ] **Phase 4** — integration / first projection.
+  - [ ] *Remaining `[hw]`:* the SW decoder impl (openh264) + on-target FPS.
+- [~] **Phase 3 / rungs 1-3** — `CircleAoaTransport` USB-AOA backend **scaffolded**
+  (`device/CircleAoaTransport.{h,cpp}`): compiles + links into the Pi 4 image. Has
+  the full AOA mode-switch sequence (reqs 51/52/53 + AA identity strings), the
+  Rung-1 descriptor dump, blocking bulk-OUT, and async bulk-IN → SPSC ring → `read()`
+  (the proven CUSBBluetoothDevice/CircleHciTransport pattern), plus the Rung-3
+  throughput counter. *Remaining `[hw]`:* device-acquisition wiring (depends on how
+  the CA525 enumerates — Rung 1 on the bench) + on-board throughput numbers.
+- [x] **UI integration (Phase 4, host-side)** — `AndroidAutoScreen` (the "AA" tab)
+  + `AaVideoGeometry` (aspect-fit + touch→source remap) + Screen focus callbacks,
+  host-tested, registered in `kernel.cpp`. The video surface + chrome layout is done;
+  it shows a placeholder until the decoder + transport feed it.
+- [ ] **Phase 4 `[hw]`** — wire transport + decoder into `AaConnection`; first projection.
 - [ ] **Phase 5** — polish.
 
-The whole protocol spine — framing, protobuf, the full connection handshake, and
-video NAL parsing — now builds and is regression-tested on the build server with
-no radio, against Google's real DHU capture bytes where possible (143 host tests).
-What's left is breadth (more per-channel decoders) or genuinely hardware-gated
-(live TLS against the dongle, the USB-AOA transport, on-target decode FPS).
+The whole protocol spine — framing, protobuf, the full connection handshake, video
+NAL parsing — plus the AA UI surface and the USB-AOA transport scaffold now build
+(160 host tests; the Pi 4 image links with the AA tab + transport). What's left is
+hardware-gated: the live USB-AOA bring-up (rungs 1-4), the openh264 decoder + FPS
+(rung 5), and final integration (rung 6).
