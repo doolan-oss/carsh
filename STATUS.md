@@ -60,7 +60,7 @@ HARDWARE_TODO.md for what the bench session must confirm.
 | OTA: OtaManager apply | host-done | verify→version-gate→write inactive→arm trial. |
 | OTA: flash write + reboot | stubbed — needs hardware | IFlashTarget host stub; real SD write = H7. |
 | Bluetooth seam (IBluetooth) | host-done (stub) | Interfaces + FakeBluetooth; connect→profile, AVRCP→now-playing, A2DP→ring tested. |
-| Bluetooth real A2DP/AVRCP | compiles+links, unverified on HW | `CARSH_HAVE_BTSTACK=1` links BTstack (A2DP-sink+AVRCP+SBC); USB ACL path + radio bring-up = H6. |
+| Bluetooth real A2DP/AVRCP | hw-validated (A2DP audio) | `CARSH_HAVE_BTSTACK=1` + UB500 dongle: a phone pairs and plays music out the 3.5 mm jack. Realtek firmware load, ACL path (CUSBBluetoothDevice patch), SBC→PWM all working on hardware. Pairing UX + AVRCP = polish (H6). |
 | AVRCP now-playing assembly | host-done | `bt::NowPlayingAssembler` accumulates per-attribute subevents; 7 tests (BtParse). |
 
 ## Device build (Circle / bare metal) — booting on real hardware
@@ -89,7 +89,7 @@ The STL-heavy core links unchanged into the bare-metal image with `aarch64-none-
 | OTA verify on device | builds | Kernel reads/verifies staged `/carsh/ota/*.carup` (no auto-flash; user-confirmed). |
 | Bluetooth scaffold (`CircleBluetooth`) | builds (stub) | `bt::IBluetooth` impl + run-loop `CTask` + A2DP→ring/AVRCP→profile wiring + scan/connect screen; BTstack glue gated by `CARSH_HAVE_BTSTACK`. |
 | BT scan/connect UI (`DevicesScreen`) | host-done | 8th "BT" tab: scan toggle + connect/disconnect; 11 tests via FakeBluetooth (`BtUi_test`). |
-| BTstack A2DP/AVRCP glue | compiles+links | `make CARSH_HAVE_BTSTACK=1` links the full A2DP-sink/AVRCP/SBC closure + Circle USB transport + embedded HAL (img 1.12→1.37 MB). Radio bring-up + USB ACL gap = H6. |
+| BTstack A2DP/AVRCP glue | hw-validated (A2DP audio) | On `device/bt-dongle-bringup`: phone→Pi A2DP audio works. Fixed USB-IRQ deadlock, HCI event reassembly, Realtek firmware download (product-id + custom-pre-init), USB ACL path (CUSBBluetoothDevice patch), SBC media-header strip + PWM routing. |
 
 > The official 7" panel that wouldn't light up turned out to be a loose DSI ribbon,
 > not firmware — re-seating fixed it. Display bring-up was confirmed on the spare
