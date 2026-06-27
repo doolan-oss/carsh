@@ -79,6 +79,32 @@ void eventStub(const void* buffer, unsigned length) {
     }
 }
 
+// Inbound ACL data (A2DP media + L2CAP) — same IRQ->queue->drain trampoline as
+// events, with bigger slots. Circle delivers one whole HCI ACL packet per bulk-IN
+// completion (short-packet terminated), so no reassembly is needed here.
+constexpr unsigned kAclSlots = 12;
+constexpr unsigned kAclMax = 2048;
+struct AclSlot {
+    uint16_t len;
+    uint8_t data[kAclMax];
+};
+AclSlot g_aclQ[kAclSlots];
+volatile unsigned g_aclHead = 0;
+volatile unsigned g_aclTail = 0;
+
+// Producer — USB bulk-IN completion (IRQ) context. Enqueue the ACL packet.
+void dataStub(const void* buffer, unsigned length) {
+    if (length == 0) return;
+    if (length > kAclMax) length = kAclMax;
+    unsigned tail = g_aclTail;
+    unsigned next = (tail + 1) % kAclSlots;
+    if (next == g_aclHead) return;  // full — drop
+    g_aclQ[tail].len = static_cast<uint16_t>(length);
+    std::memcpy(g_aclQ[tail].data, buffer, length);
+    DataSyncBarrier();
+    g_aclTail = next;
+}
+
 }  // namespace
 
 // Consumer — called from CircleBtRunLoopTask (run-loop/task context) before each
@@ -94,6 +120,15 @@ void circleHciTransportProcess() {
         g_evtHead = (head + 1) % kEvtSlots;
         if (g_packetHandler) g_packetHandler(HCI_EVENT_PACKET, tmp, len);
     }
+    while (g_aclHead != g_aclTail) {
+        DataMemBarrier();
+        unsigned head = g_aclHead;
+        uint16_t len = g_aclQ[head].len;
+        static uint8_t atmp[kAclMax];
+        std::memcpy(atmp, g_aclQ[head].data, len);
+        g_aclHead = (head + 1) % kAclSlots;
+        if (g_packetHandler) g_packetHandler(HCI_ACL_DATA_PACKET, atmp, len);
+    }
 }
 
 namespace {
@@ -107,6 +142,7 @@ int transportOpen(void) {
         return -1;  // hci_init bails; CircleBluetooth::init() reports false
     }
     g_dev->RegisterHCIEventHandler(&eventStub);
+    g_dev->RegisterHCIDataHandler(&dataStub);  // start ACL bulk-IN polling
     return 0;
 }
 
@@ -140,10 +176,9 @@ int transportSendPacket(uint8_t packet_type, uint8_t* packet, int size) {
             notifyPacketSent();
             return 0;
         case HCI_ACL_DATA_PACKET:
-            // TODO(hw): ACL OUT over the bulk endpoint. Circle's
-            // CUSBBluetoothDevice has no ACL API yet (the one real gap) — needs a
-            // bulk-OUT transfer added to it. Drop until then so the build links
-            // and HCI bring-up still works; no A2DP audio flows.
+            // ACL OUT over the bulk endpoint (the extended CUSBBluetoothDevice).
+            // Blocking transfer, but we're in the run-loop task here, not an IRQ.
+            g_dev->SendHCIData(packet, (unsigned)size);
             notifyPacketSent();
             return 0;
         default:

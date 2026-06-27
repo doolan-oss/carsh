@@ -1,0 +1,176 @@
+--- a/include/circle/usb/usbbluetooth.h
++++ b/include/circle/usb/usbbluetooth.h
+@@ -27,6 +27,8 @@
+ #include <circle/types.h>
+ 
+ typedef void TBTHCIEventHandler (const void *pBuffer, unsigned nLength);
++// carsh: ACL data handler (bulk IN), mirroring TBTHCIEventHandler for events.
++typedef void TBTHCIDataHandler (const void *pBuffer, unsigned nLength);
+ 
+ class CUSBBluetoothDevice : public CUSBFunction
+ {
+@@ -40,12 +42,24 @@
+ 
+ 	void RegisterHCIEventHandler (TBTHCIEventHandler *pHandler);
+ 
++	// carsh additions: the ACL data path (A2DP media + L2CAP), which upstream
++	// Circle configures endpoints for but never exposes. SendHCIData writes an HCI
++	// ACL packet to the bulk OUT endpoint (blocking); RegisterHCIDataHandler starts
++	// continuous bulk-IN polling and delivers each received ACL packet.
++	boolean SendHCIData (const void *pBuffer, unsigned nLength);
++	void RegisterHCIDataHandler (TBTHCIDataHandler *pHandler);
++
+ private:
+ 	boolean StartRequest (void);
+ 
+ 	void CompletionRoutine (CUSBRequest *pURB);
+ 	static void CompletionStub (CUSBRequest *pURB, void *pParam, void *pContext);
+ 
++	// carsh: bulk-IN (ACL) async polling, modelled on StartRequest/CompletionRoutine.
++	boolean StartDataRequest (void);
++	void DataCompletionRoutine (CUSBRequest *pURB);
++	static void DataCompletionStub (CUSBRequest *pURB, void *pParam, void *pContext);
++
+ private:
+ 	CUSBEndpoint *m_pEndpointInterrupt;
+ 	CUSBEndpoint *m_pEndpointBulkIn;
+@@ -55,6 +69,10 @@
+ 
+ 	TBTHCIEventHandler *m_pEventHandler;
+ 
++	// carsh: ACL receive buffer + handler.
++	u8 *m_pACLBuffer;
++	TBTHCIDataHandler *m_pDataHandler;
++
+ 	unsigned m_nDeviceNumber;
+ 	static CNumberPool s_DeviceNumberPool;
+ };
+--- a/lib/usb/usbbluetooth.cpp
++++ b/lib/usb/usbbluetooth.cpp
+@@ -27,6 +27,10 @@
+ static const char FromBluetooth[] = "btusb";
+ static const char DevicePrefix[] = "ubt";
+ 
++// carsh: bulk-IN ACL receive buffer size — large enough for a whole HCI ACL packet
++// (HCI_ACL_PAYLOAD_SIZE is ~1691; round up) so one bulk transfer = one ACL packet.
++#define BT_ACL_BUFFER_SIZE 2048
++
+ CNumberPool CUSBBluetoothDevice::s_DeviceNumberPool (1);
+ 
+ CUSBBluetoothDevice::CUSBBluetoothDevice (CUSBFunction *pFunction)
+@@ -36,6 +40,8 @@
+ 	m_pEndpointBulkOut (0),
+ 	m_pEventBuffer (0),
+ 	m_pEventHandler (0),
++	m_pACLBuffer (0),
++	m_pDataHandler (0),
+ 	m_nDeviceNumber (0)
+ {
+ }
+@@ -43,6 +49,7 @@
+ CUSBBluetoothDevice::~CUSBBluetoothDevice (void)
+ {
+ 	m_pEventHandler = 0;
++	m_pDataHandler = 0;
+ 
+ 	if (m_nDeviceNumber != 0)
+ 	{
+@@ -53,7 +60,10 @@
+ 
+ 	delete [] m_pEventBuffer;
+ 	m_pEventBuffer = 0;
+-	
++
++	delete [] m_pACLBuffer;
++	m_pACLBuffer = 0;
++
+ 	delete m_pEndpointBulkOut;
+ 	m_pEndpointBulkOut = 0;
+ 
+@@ -140,6 +150,11 @@
+ 	m_pEventBuffer = new u8[m_pEndpointInterrupt->GetMaxPacketSize ()];
+ 	assert (m_pEventBuffer != 0);
+ 
++	// carsh: ACL receive buffer. Sized to hold a whole HCI ACL packet so each
++	// short-packet-terminated bulk-IN transfer captures one ACL packet.
++	m_pACLBuffer = new u8[BT_ACL_BUFFER_SIZE];
++	assert (m_pACLBuffer != 0);
++
+ 	assert (m_nDeviceNumber == 0);
+ 	m_nDeviceNumber = s_DeviceNumberPool.AllocateNumber (TRUE, FromBluetooth);
+ 
+@@ -216,3 +231,74 @@
+ 	
+ 	pThis->CompletionRoutine (pURB);
+ }
++
++// ───────────────────────────────────────────────────────────────────────────
++// carsh: HCI ACL data path over the bulk endpoints (A2DP media + L2CAP).
++// ───────────────────────────────────────────────────────────────────────────
++
++boolean CUSBBluetoothDevice::SendHCIData (const void *pBuffer, unsigned nLength)
++{
++	assert (m_pEndpointBulkOut != 0);
++
++	// Blocking bulk OUT (called from the BTstack run-loop task, not an IRQ).
++	return GetHost ()->Transfer (m_pEndpointBulkOut, (void *) pBuffer, nLength) >= 0;
++}
++
++void CUSBBluetoothDevice::RegisterHCIDataHandler (TBTHCIDataHandler *pHandler)
++{
++	m_pDataHandler = pHandler;
++	assert (m_pDataHandler != 0);
++
++	StartDataRequest ();
++}
++
++boolean CUSBBluetoothDevice::StartDataRequest (void)
++{
++	assert (m_pEndpointBulkIn != 0);
++	assert (m_pACLBuffer != 0);
++
++	CUSBRequest *pURB = new CUSBRequest (m_pEndpointBulkIn, m_pACLBuffer, BT_ACL_BUFFER_SIZE);
++	assert (pURB != 0);
++
++	pURB->SetCompletionRoutine (DataCompletionStub, 0, this);
++
++	return GetHost ()->SubmitAsyncRequest (pURB);
++}
++
++void CUSBBluetoothDevice::DataCompletionRoutine (CUSBRequest *pURB)
++{
++	assert (pURB != 0);
++
++	boolean bRestart = TRUE;
++
++	if (pURB->GetStatus () != 0)
++	{
++		if (   m_pDataHandler != 0
++		    && pURB->GetResultLength () > 0)
++		{
++			(*m_pDataHandler) (m_pACLBuffer, pURB->GetResultLength ());
++		}
++	}
++	else
++	{
++		CLogger::Get ()->Write (FromBluetooth, LogWarning, "ACL request failed");
++
++		bRestart = FALSE;
++	}
++
++	delete pURB;
++
++	if (   bRestart
++	    && !StartDataRequest ())
++	{
++		CLogger::Get ()->Write (FromBluetooth, LogError, "Cannot restart ACL request");
++	}
++}
++
++void CUSBBluetoothDevice::DataCompletionStub (CUSBRequest *pURB, void *pParam, void *pContext)
++{
++	CUSBBluetoothDevice *pThis = (CUSBBluetoothDevice *) pContext;
++	assert (pThis != 0);
++
++	pThis->DataCompletionRoutine (pURB);
++}
