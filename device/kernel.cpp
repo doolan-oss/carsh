@@ -250,6 +250,19 @@ CStdlibApp::TShutdownMode CKernel::Run(void) {
     bool haveTouch = touch.initialize(&fb);  // fb supplies touch coord mapping
     mLogger.Write(FROM, LogNotice, "touch: %s", haveTouch ? "ready" : "absent");
 
+    // Bring the USB-C serial log up BEFORE Bluetooth: BT bring-up runs on this
+    // thread and can block, and its diagnostics must be visible. The retarget
+    // happens inside CircleUsbLog::Run(), so spawn it now and spin the scheduler
+    // until the host serial (utty1) enumerates (bounded ~2s; skipped if no host).
+    if (mUsbGadgetOk) {
+        new carsh::device::CircleUsbLog(&mSerialCDC, &mLogger, &mSerial);
+        for (unsigned i = 0; i < 400; ++i) {
+            CScheduler::Get()->Yield();  // lets the gadget PnP task run + attach
+            if (CDeviceNameService::Get()->GetDevice("utty1", FALSE)) break;
+            mTimer.MsDelay(5);
+        }
+    }
+
     // Bluetooth (A2DP sink + AVRCP). Connect switches the driver profile (keyed
     // on the stable Classic address); AVRCP metadata feeds the BT now-playing;
     // decoded A2DP PCM flows into the BT ring. Live only when BTstack is compiled
@@ -300,10 +313,7 @@ CStdlibApp::TShutdownMode CKernel::Run(void) {
     // it; it runs whenever this (UI) task yields via MsSleep below.
     new carsh::device::CircleDecodeTask(&player);
 
-    // Pump the USB-C serial-log gadget; on host connect it retargets the logger to
-    // the USB serial (fallback: the PL011 UART). Frequent servicing for USB PnP.
-    if (mUsbGadgetOk)
-        new carsh::device::CircleUsbLog(&mSerialCDC, &mLogger, &mSerial);
+    // (USB-C serial-log gadget was brought up above, before Bluetooth init.)
 
     // Audio output: drive the Pi's onboard 3.5mm jack via PWM (no extra hardware).
     // Opened LAZILY at the first track's sample rate in the loop below (the core

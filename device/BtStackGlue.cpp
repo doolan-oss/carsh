@@ -299,6 +299,10 @@ bool btGlueInit(CircleBluetooth* owner) {
 }
 
 void btGlueProcess() {
+    // Deliver any HCI events the USB IRQ queued, in THIS (task) context, so the
+    // commands hci.c issues in response are sent from here — not from the USB
+    // completion handler (which would deadlock the USB stack). Then pump BTstack.
+    circleHciTransportProcess();
     btstack_run_loop_embedded_execute_once();
 }
 
