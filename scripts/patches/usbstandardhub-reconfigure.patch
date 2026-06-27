@@ -1,0 +1,17 @@
+diff --git a/lib/usb/usbstandardhub.cpp b/lib/usb/usbstandardhub.cpp
+index c8a78d8..ec950f1 100644
+--- a/lib/usb/usbstandardhub.cpp
++++ b/lib/usb/usbstandardhub.cpp
+@@ -410,6 +410,12 @@ boolean CUSBStandardHub::EnumeratePorts (void)
+ 			delete m_pDevice[nPort];
+ 			m_pDevice[nPort] = 0;
+ 
++			// carsh: the device was torn down, so the port is NOT configured —
++			// clear the flag so a replacement device on the same port (e.g. the
++			// Android Auto dongle re-enumerating in AOA accessory mode after we
++			// trigger the mode-switch) gets Configure()'d instead of skipped.
++			m_bPortConfigured[nPort] = FALSE;
++
+ 			continue;
+ 		}
+ 		

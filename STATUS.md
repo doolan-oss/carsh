@@ -90,6 +90,8 @@ The STL-heavy core links unchanged into the bare-metal image with `aarch64-none-
 | Bluetooth scaffold (`CircleBluetooth`) | builds (stub) | `bt::IBluetooth` impl + run-loop `CTask` + A2DP→ring/AVRCP→profile wiring + scan/connect screen; BTstack glue gated by `CARSH_HAVE_BTSTACK`. |
 | BT scan/connect UI (`DevicesScreen`) | host-done | 8th "BT" tab: scan toggle + connect/disconnect; 11 tests via FakeBluetooth (`BtUi_test`). |
 | BTstack A2DP/AVRCP glue | hw-validated (A2DP audio) | On `device/bt-dongle-bringup`: phone→Pi A2DP audio works. Fixed USB-IRQ deadlock, HCI event reassembly, Realtek firmware download (product-id + custom-pre-init), USB ACL path (CUSBBluetoothDevice patch), SBC media-header strip + PWM routing. |
+| Android Auto UI (`AndroidAutoScreen`+`AaVideoGeometry`) | host-done | 9th "AA" tab: aspect-fit video blit into the content rect + touch→source(800×480) remap + tab-focus callbacks (VIDEO_FOCUS). 11 host tests; links into the Pi image (placeholder until the transport feeds it). |
+| AA USB-AOA transport (`CircleAoaTransport`) | hw bring-up (rungs 1-2 done) | On `device/aa-dongle-bringup`. CA525 enumerates as `ven2717-ff40` (Android PTP); factory hook drives the AOA mode-switch → dongle re-enumerates in accessory mode `ven18d1-2d00` (confirmed on hardware). Accessory bulk-endpoint binding blocked by a Circle hub port-flag bug; fix = `usbstandardhub-reconfigure.patch`, **pending bench re-test**. Async bulk-IN→ring + bulk-OUT mirror the BT ACL pattern. |
 
 > The official 7" panel that wouldn't light up turned out to be a loose DSI ribbon,
 > not firmware — re-seating fixed it. Display bring-up was confirmed on the spare

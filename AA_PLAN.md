@@ -268,13 +268,36 @@ host tests pass, never "validated on the Pi").
 - [x] **Phase 2** — H.264 NAL extraction/classification (`H264Nal`) +
   `IH264Decoder` seam, host-tested.
   - [ ] *Remaining `[hw]`:* the SW decoder impl (openh264) + on-target FPS.
-- [~] **Phase 3 / rungs 1-3** — `CircleAoaTransport` USB-AOA backend **scaffolded**
-  (`device/CircleAoaTransport.{h,cpp}`): compiles + links into the Pi 4 image. Has
-  the full AOA mode-switch sequence (reqs 51/52/53 + AA identity strings), the
-  Rung-1 descriptor dump, blocking bulk-OUT, and async bulk-IN → SPSC ring → `read()`
-  (the proven CUSBBluetoothDevice/CircleHciTransport pattern), plus the Rung-3
-  throughput counter. *Remaining `[hw]`:* device-acquisition wiring (depends on how
-  the CA525 enumerates — Rung 1 on the bench) + on-board throughput numbers.
+- [~] **Phase 3 / rungs 1-3** — `CircleAoaTransport` USB-AOA backend, **bench bring-up
+  in progress** (`device/CircleAoaTransport.{h,cpp}` = `CAndroidAutoDevice`, a
+  `CUSBFunction` + `IAaTransport`; bound via `scripts/patches/usbdevicefactory-aoa.patch`).
+  See the bench-session findings below.
+
+### Bench session — 2026-06-27 (CA525 on real Pi 4)
+
+Methodology: the BT bring-up loop (flash SD → `run_in_background` capture on the USB-C
+console → power-cycle → read log). Key change that unblocked it: bring the USB-C
+console up **before** the xHCI host inits, so Circle's per-device enumeration log is
+captured (it scrolls past on the GPIO UART otherwise), plus pump `UpdatePlugAndPlay()`
+at ~1 Hz so a slow-booting dongle is seen.
+
+- **Rung 1 — enumerate `[DONE]`.** The CA525 powers up (slowly, ~2 s after a media
+  stick would) as **`ven2717-ff40` "Android MINIX", interface `int6-1-1` (PTP)**.
+  Circle has no PTP driver, so it's unbound; with no AOA handshake the dongle
+  disconnects and retries every ~16 s.
+- **Rung 2 — AOA switch `[DONE]`.** The factory hook binds `CAndroidAutoDevice` to
+  `ven2717-ff40`; its `Configure()` runs the AOA sequence (probe returns **AOA v2**),
+  and the dongle **re-enumerates in accessory mode as `ven18d1-2d00`**. Fixed on the
+  way: xHCI DMA asserts on `.rodata` buffers, so the AOA identity strings must be
+  copied to heap buffers before the control transfers.
+- **Rung 3 — bind accessory bulk `[fix pending re-test]`.** The accessory device
+  enumerates but `Configure()` was being **skipped** by a Circle hub bug: after our
+  pre-switch `Configure()` returns FALSE, the hub deletes the device but leaves its
+  per-port `m_bPortConfigured` flag set, so the replacement (accessory) device on the
+  same port is never configured. Fix = `scripts/patches/usbstandardhub-reconfigure.patch`
+  (clear the flag on teardown). **Built but not yet bench-verified — first task next
+  session.** Once it binds, `uaa1` registers and `CAndroidAutoDevice` is the live
+  `IAaTransport`; then rung 4 (real mbedTLS `IAaCrypto` + drive `AaConnection`).
 - [x] **UI integration (Phase 4, host-side)** — `AndroidAutoScreen` (the "AA" tab)
   + `AaVideoGeometry` (aspect-fit + touch→source remap) + Screen focus callbacks,
   host-tested, registered in `kernel.cpp`. The video surface + chrome layout is done;
