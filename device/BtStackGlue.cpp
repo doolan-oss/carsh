@@ -202,6 +202,11 @@ void hciPacketHandler(uint8_t type, uint16_t, uint8_t* packet, uint16_t) {
             if (btstack_event_state_get_state(packet) == HCI_STATE_WORKING) {
                 CLogger::Get()->Write(FromBt, LogNotice,
                                       "HCI WORKING — controller up (firmware loaded)");
+                // Re-assert visibility now that the stack is up (setting it before
+                // power-on doesn't always latch). The phone should now see "carsh".
+                gap_connectable_control(1);
+                gap_discoverable_control(1);
+                CLogger::Get()->Write(FromBt, LogNotice, "discoverable + connectable as 'carsh'");
             } else {
                 CLogger::Get()->Write(FromBt, LogNotice, "HCI state -> %u",
                                       btstack_event_state_get_state(packet));
@@ -316,9 +321,12 @@ bool btGlueInit(CircleBluetooth* owner) {
     g_hciEventCb.callback = &hciPacketHandler;
     hci_add_event_handler(&g_hciEventCb);
 
-    // 6. Be visible: the phone sees "carsh" in its Bluetooth list (discoverable)
-    //    and can connect to us as an A2DP speaker (connectable).
+    // 6. Be visible as an audio device: the phone sees "carsh" in its Bluetooth
+    //    list (discoverable) and can connect to us as an A2DP speaker (connectable).
+    //    Class of device = Audio/Video major, Loudspeaker minor + Audio service so
+    //    phones present carsh as a speaker. (Re-asserted on WORKING, above.)
     gap_set_local_name("carsh");
+    gap_set_class_of_device(0x200414);
     gap_discoverable_control(1);
     gap_connectable_control(1);
 
