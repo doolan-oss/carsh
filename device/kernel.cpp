@@ -21,6 +21,10 @@
 #include "CircleDecodeTask.h"
 #include "CircleAaDriver.h"
 #include "CircleAoaTransport.h"
+#include "aa/AaProjection.h"
+#ifdef CARSH_HAVE_OPENH264
+#include "CircleH264Decoder.h"
+#endif
 #include "CircleUsbLog.h"
 #include "CircleFlashTarget.h"
 #include "CirclePwmSoundDevice.h"
@@ -374,7 +378,55 @@ CStdlibApp::TShutdownMode CKernel::Run(void) {
     carsh::device::CirclePwmSoundDevice sound(&mInterrupt);
     unsigned curRate = 0;  // 0 = not opened yet
 
+    // Android Auto projection wiring (rung 6): decoded video -> the AA tab, AA audio
+    // -> a ring, content-rect touch -> the AA input channel, tab focus -> VIDEO_FOCUS.
+    // The decoder is linked only with CARSH_HAVE_OPENH264; without it the AA tab
+    // stays on the placeholder but TLS/channels/audio/touch still run. The projection
+    // is declared BEFORE aaDriver so it outlives the driver (whose teardown clears
+    // the projection's connection pointer).
+    carsh::audio::PcmRing<float> aaAudioRing(kRate);  // ~1s; drained in rung 7 (audio focus)
+    carsh::aa::AaProjection::Hooks aaHooks;
+    aaHooks.showFrame = [&](const uint8_t* rgb, int w, int h) {
+        androidAuto.setFrame(rgb, w, h);
+    };
+    aaHooks.setConnected = [&](bool up) { androidAuto.setConnected(up); };
+    aaHooks.playAudio = [&](carsh::aa::ChannelId, const uint8_t* pcm, std::size_t len) {
+        // 16-bit LE PCM -> float, into the AA ring. Draining it to the jack with
+        // audio focus / mixing vs the music engine is rung 7.
+        const std::size_t n = len / 2;
+        float buf[512];
+        for (std::size_t off = 0; off < n;) {
+            const std::size_t chunk = n - off < 512 ? n - off : 512;
+            for (std::size_t i = 0; i < chunk; ++i) {
+                const std::size_t b = (off + i) * 2;
+                const int16_t v = static_cast<int16_t>(pcm[b] | (pcm[b + 1] << 8));
+                buf[i] = v * (1.0f / 32768.0f);
+            }
+            aaAudioRing.write(buf, chunk);
+            off += chunk;
+        }
+    };
+    carsh::aa::AaProjection aaProjection(aaHooks);
+#ifdef CARSH_HAVE_OPENH264
+    carsh::device::CircleH264Decoder aaDecoder(&aaProjection);
+    if (aaDecoder.init())
+        aaProjection.setDecoder(&aaDecoder);
+    else
+        mLogger.Write(FROM, LogError, "AA: openh264 decoder init failed");
+#endif
+
     carsh::device::CircleAaDriver aaDriver;  // drives AA over uaa1 from this loop
+    aaDriver.setProjection(&aaProjection);
+
+    // AA tab: forward content-rect touches (already remapped to 800x480 source
+    // coords by AndroidAutoScreen) to the phone as a press+release; tie the phone's
+    // video focus to whether the AA tab is the active one.
+    androidAuto.onTouch = [&](int sx, int sy, carsh::ui::GestureType) {
+        const uint64_t ts = CTimer::GetClockTicks();
+        aaProjection.forwardTouch(sx, sy, carsh::aa::TouchAction::Press, ts);
+        aaProjection.forwardTouch(sx, sy, carsh::aa::TouchAction::Release, ts);
+    };
+    androidAuto.onFocusChanged = [&](bool focused) { aaProjection.setFocus(focused); };
 
     mLogger.Write(FROM, LogNotice, "entering UI loop");
     unsigned frame = 0;

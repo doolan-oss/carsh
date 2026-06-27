@@ -433,8 +433,20 @@ at ~1 Hz so a slow-booting dongle is seen.
   + `AaVideoGeometry` (aspect-fit + touch→source remap) + Screen focus callbacks,
   host-tested, registered in `kernel.cpp`. The video surface + chrome layout is done;
   it shows a placeholder until the decoder + transport feed it.
-- [ ] **Phase 4 `[hw]`** — wire transport + decoder into `AaConnection`; first projection.
-- [ ] **Phase 5** — polish.
+- [~] **Phase 4 / rung 6 — integration (host-side done 2026-06-28).**
+  `src/aa/AaProjection` ties the live `AaConnection` to the decoder, the AA tab, and
+  audio: video media → `IH264Decoder::feed` → decoded frame → `AndroidAutoScreen::
+  setFrame`; audio media → a PCM hook; channel-open/shutdown → `setConnected`;
+  content-rect touch → `sendTouch` (input channel); AA-tab focus → `sendVideoFocus`
+  (`VIDEO_FOCUS_INDICATION`). Host-tested end to end with fakes
+  (`tests/aa/AaProjection_test.cpp`). `CircleAaDriver` binds the projection to each
+  connection across dongle cycles; `device/kernel.cpp` provides the real hooks +
+  `CircleH264Decoder` (under `CARSH_HAVE_OPENH264`). *Remaining `[hw]`:* the live
+  end-to-end projection on the board, and draining the AA audio ring to the jack with
+  audio focus (rung 7). The device link itself is bench-only here (no toolchain).
+- [ ] **Phase 5 / rung 7** — polish: AV sync / flow-control tuning, audio focus +
+  draining AA PCM to the jack, disconnect/reconnect, raw touch (drag) streaming,
+  optional mic uplink.
 
 The whole protocol spine — framing, protobuf, the full connection handshake, video
 NAL parsing — plus the AA UI surface and the USB-AOA transport scaffold now build

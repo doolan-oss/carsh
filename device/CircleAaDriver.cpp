@@ -46,6 +46,9 @@ int CircleAaDriver::rngEntropy(void* ctx, unsigned char* buf, size_t len) {
 CircleAaDriver::~CircleAaDriver() { teardown(); }
 
 void CircleAaDriver::teardown() {
+    // Drop the projection's dangling connection pointer before freeing it (the
+    // dongle re-cycles, so this runs on every rebind).
+    if (projection_ != nullptr) projection_->setConnection(nullptr);
     delete conn_;
     conn_ = nullptr;
     delete msger_;
@@ -73,19 +76,28 @@ void CircleAaDriver::tick() {
             }
             crypto_ = crypto;
             msger_ = new carsh::aa::AaMessenger(*aa);
+            // Route channel traffic into the projection (video->decoder->screen,
+            // audio->ring, focus/touch outbound) when one is wired (rung 6); else a
+            // logging fallback so bring-up is still observable on the serial console.
             carsh::aa::AaConnectionCallbacks cbs;
-            cbs.onChannelOpened = [](carsh::aa::ChannelId c) {
-                CLogger::Get()->Write(From, LogNotice, "channel opened: %u", (unsigned)c);
-            };
-            cbs.onChannelMessage = [](carsh::aa::ChannelId c, uint16_t id, const uint8_t*,
-                                      size_t n) {
-                CLogger::Get()->Write(From, LogNotice, "channel msg ch=%u id=%04x len=%u",
-                                      (unsigned)c, (unsigned)id, (unsigned)n);
-            };
-            cbs.onShutdown = [] {
-                CLogger::Get()->Write(From, LogNotice, "phone requested shutdown");
-            };
+            if (projection_ != nullptr) {
+                cbs = projection_->callbacks();
+            } else {
+                cbs.onChannelOpened = [](carsh::aa::ChannelId c) {
+                    CLogger::Get()->Write(From, LogNotice, "channel opened: %u", (unsigned)c);
+                };
+                cbs.onChannelMessage = [](carsh::aa::ChannelId c, uint16_t id,
+                                          const uint8_t*, size_t n) {
+                    CLogger::Get()->Write(From, LogNotice,
+                                          "channel msg ch=%u id=%04x len=%u", (unsigned)c,
+                                          (unsigned)id, (unsigned)n);
+                };
+                cbs.onShutdown = [] {
+                    CLogger::Get()->Write(From, LogNotice, "phone requested shutdown");
+                };
+            }
             conn_ = new carsh::aa::AaConnection(*msger_, *crypto_, cbs);
+            if (projection_ != nullptr) projection_->setConnection(conn_);
             CLogger::Get()->Write(From, LogNotice, "uaa1 bound — sending VERSION_REQUEST");
             conn_->start();
             lastState_ = static_cast<int>(conn_->state());
