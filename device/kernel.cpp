@@ -53,6 +53,24 @@ carsh::audio::PcmRing<float> g_ring(kRate * kChannels);  // ~1 s stereo (local)
 carsh::audio::PcmRing<float> g_btRing(kRate * kChannels);  // A2DP jitter+decode
 carsh::audio::AudioEngine g_engine(&g_ring, kChannels);
 carsh::dsp::EqProcessor g_eq(kRate);
+
+// PWM output sink: plays decoded A2DP PCM when the BT ring has data, otherwise the
+// local player engine. The DMA/IRQ callback calls render(); the BT ring is the
+// SPSC consumer here (producer is the A2DP decode callback). BT bypasses the
+// engine's volume/EQ for now (the phone controls volume).
+class BtMixSink : public carsh::hal::IAudioSink {
+public:
+    std::size_t render(float* out, std::size_t frames) override {
+        const std::size_t want = frames * kChannels;
+        if (g_btRing.readable() >= want) {
+            std::size_t got = g_btRing.read(out, want);
+            for (std::size_t i = got; i < want; ++i) out[i] = 0.0f;
+            return frames;
+        }
+        return g_engine.render(out, frames);
+    }
+};
+BtMixSink g_outSink;
 carsh::device::CircleSource g_sdSource(0, carsh::hal::SourceType::Sd, "SD:");
 carsh::device::CircleSource g_usbSource(1, carsh::hal::SourceType::Usb, "USB:");
 carsh::profile::ProfileManager g_profiles;
@@ -356,17 +374,29 @@ CStdlibApp::TShutdownMode CKernel::Run(void) {
         // rate (a fixed rate would shift pitch). Opening from closed is clean, and
         // close() drains the DMA so a rate-change reopen is safe; a single-rate
         // library opens once and never reopens.
-        if (ps.queueIndex >= 0 && ps.queueIndex < int(ids.size())) {
+        // When a phone is connected over A2DP, clock the output at the SBC stream
+        // rate (typically 44.1 kHz); otherwise at the local track's rate. The output
+        // device always renders g_outSink, which mixes BT audio over the local
+        // engine. Reopen only on a rate change (close() drains the DMA safely).
+        unsigned wantRate = curRate;
+        bool wantOpen = false;
+        if (bt.connected()) {
+            uint32_t r = carsh::device::btGlueA2dpSampleRate();
+            wantRate = r ? r : 44100;
+            wantOpen = true;
+        } else if (ps.queueIndex >= 0 && ps.queueIndex < int(ids.size())) {
             const carsh::library::Track* t =
                 g_db.get(ids[std::size_t(ps.queueIndex)]);
-            unsigned trackRate = (t && t->sampleRate) ? t->sampleRate : kRate;
-            if (trackRate != curRate) {
-                curRate = trackRate;
-                if (sound.open({curRate, 16, kChannels}, &g_engine))
-                    diag("audio: PWM jack @ %u Hz", unsigned(curRate));
-                else
-                    diag("audio: PWM open FAILED");
-            }
+            wantRate = (t && t->sampleRate) ? t->sampleRate : kRate;
+            wantOpen = true;
+        }
+        if (wantOpen && (wantRate != curRate || !sound.isOpen())) {
+            curRate = wantRate;
+            if (sound.open({curRate, 16, kChannels}, &g_outSink))
+                diag("audio: PWM jack @ %u Hz%s", unsigned(curRate),
+                     bt.connected() ? " (BT)" : "");
+            else
+                diag("audio: PWM open FAILED");
         }
 
         // Output level for the meter. With a real device open, its DMA/IRQ
