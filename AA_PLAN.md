@@ -304,12 +304,38 @@ at ~1 Hz so a slow-booting dongle is seen.
   dongle: `VERSION_REQUEST` → the phone replies `VERSION_RESPONSE` (status OK,
   rx=12 B), state advances to `SslHandshake`. **The bulk path is bidirectional and
   the AA protocol is live end-to-end.** A logging stub crypto stops it there.
-- **Rung 4b — TLS `[next, the real work]`.** The phone now expects a TLS handshake.
-  Needs: (1) mbedTLS 2.28 *built* for bare-metal Circle (source vendored, no lib yet;
-  `circle-mbedtls` has the platform glue); (2) the AA head-unit certificate + key the
-  phone validates (see `dylant9/head_unit`); (3) an mbedTLS-backed `IAaCrypto`
-  (in-memory BIO bridging `handshakeStep`/`encrypt`/`decrypt`, client mode). Then →
-  auth → service discovery → channel opens → first AV (rungs 5-6).
+- **Rung 4b — TLS `[next, fully scoped + de-risked 2026-06-28]`.** The phone now
+  expects a TLS handshake. All unknowns resolved this session:
+  - **mbedTLS builds for bare-metal Circle.** `cd third_party/circle-stdlib && make
+    mbedtls` produces `libs/mbedtls/library/libmbed{crypto,x509,tls}.a` +
+    `src/circle-mbedtls/libcircle-mbedtls.a` (the glue — entropy via Circle's
+    `CBcmRandomNumberGenerator`, threading, config). **Link recipe for
+    `device/Makefile`:** add those four `.a` (crypto last — link order
+    tls→x509→crypto) to `LIBS`; add `-I.../include -I.../libs/mbedtls/include` and
+    `-DMBEDTLS_CONFIG_FILE='<circle-mbedtls/config-circle-mbedtls.h>'` to the AA
+    crypto unit's flags.
+  - **Crypto + cert reference: `dylant9/head_unit:main/aa_crypto.c`** (saved notes
+    below). It's a complete mbedTLS impl that maps 1:1 to `IAaCrypto`. Port to
+    `device/AaCryptoMbedTls.{h,cpp}`:
+    - **HU = SSL client** (`MBEDTLS_SSL_IS_CLIENT`, stream, preset default), RNG =
+      ctr_drbg seeded from the entropy module, **`authmode = VERIFY_NONE`** (AA is
+      self-signed), `ssl_conf_own_cert(cert, pkey)`, `ssl_set_bio` → in-memory BIO.
+    - **In-memory BIO** (16 KB buffers): `bio_send` appends to an out-buffer,
+      `bio_recv` drains an in-buffer (returns `WANT_READ` when empty). `handshakeStep`
+      = push `in` → `mbedtls_ssl_handshake()` (tolerate `WANT_READ/WRITE`) → return
+      the out-buffer. `encrypt` = `ssl_write` → out-buffer; `decrypt` = push cipher →
+      `ssl_read`.
+    - **Cert = the aasdk / JVC-Kenwood HU certificate** (registered with Google's AA
+      program; **GPLv3** — note provenance). It's embedded in `aa_crypto.c` as
+      `aa_cert_der_fallback[]` (raw DER) + `aa_private_key_pem_fallback` (RSA PEM).
+      Self-signed will NOT work — the phone requires this specific cert.
+    - **Critical gotcha:** the cert uses non-standard UTCTime (`-0700` offset) that
+      mbedTLS **rejects** — bypass x509 parsing: set `cert.raw.p/len` to the DER,
+      `cert.version = 3`, `own_buffer = 0`, skip `x509_crt_parse`. Parse the key
+      normally with `mbedtls_pk_parse_key`.
+  - Then swap `LoggingCrypto` → `AaCryptoMbedTls` in `CircleAaDriver`; the state
+    machine continues handshake → auth → service discovery → channel opens → first AV
+    (rungs 5-6 = openh264 decode + the AndroidAuto tab already built).
 - [x] **UI integration (Phase 4, host-side)** — `AndroidAutoScreen` (the "AA" tab)
   + `AaVideoGeometry` (aspect-fit + touch→source remap) + Screen focus callbacks,
   host-tested, registered in `kernel.cpp`. The video surface + chrome layout is done;
