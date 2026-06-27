@@ -1,8 +1,67 @@
 # Android Auto (wireless, via USB dongle) — implementation plan
 
 Branch: `device/android-auto` (Phases 0–2, **merged to main** PRs #9/#10).
-Hardware bring-up continues on `device/aa-dongle-bringup`. Status tracked at the
-bottom; this is the working plan, refined as phases land.
+Hardware bring-up merged via PRs #11/#12. Status tracked at the bottom; this is the
+working plan, refined as phases land.
+
+---
+
+## Autonomous execution brief (read this first if you are an agent)
+
+**Mission.** Carry the Android Auto pipeline forward from where hardware bring-up
+stopped (rung 4a, version exchange working on the board) **through to the video
+pipeline** — TLS, channel decoders, H.264 decode, and integration into the existing
+`AndroidAuto` UI tab. Implement rungs **4b → 6** below.
+
+**The one hard boundary: you have NO hardware.** You cannot flash an SD card, attach
+the dongle, or read the serial console. So:
+- Deliver everything to **"host-green + ready to flash"**: `cmake` host build passes,
+  `./build/carsh_tests` is green, and `cd device && make` cross-compiles + links
+  `kernel8-rpi4.img` clean. **Compile-check the device image after every device-side
+  change** (it catches real Circle API mistakes — see the bench log below).
+- **Never claim anything is hardware-validated.** In `STATUS.md`/`AA_PLAN.md`, mark
+  your work `host-done` or `builds`, never `hw-validated`. The owner does the bench
+  pass that promotes it.
+- Anything whose correctness genuinely needs a live phone/dongle (the TLS handshake
+  completing, on-target decode FPS, sustained bulk throughput) — build it behind its
+  interface, **host-test what you can against fixtures, and leave a clear
+  `[hw]`-tagged validation note** for the bench. Do not fake a pass.
+
+**Definition of done, per rung** (technical detail is in the rung sections below):
+- **4b — TLS.** `device/AaCryptoMbedTls.{h,cpp}` implements `IAaCrypto` (port
+  `dylant9/head_unit:main/aa_crypto.c`). The four mbedTLS `.a`s + the config define
+  link into the image. Add a host test that drives it against a captured handshake
+  **if** a fixture exists in `tests/aa/fixtures/`; otherwise host-test the BIO/round
+  -trip plumbing and tag the live-handshake check `[hw]`. Swap `LoggingCrypto` →
+  `AaCryptoMbedTls` in `CircleAaDriver`.
+- **4c — per-channel handlers.** Flesh out `AaConnection`'s service discovery +
+  channel-open + dispatch for video / media-audio / input (today some route to a
+  generic callback). Host-test against the DHU capture fixtures, same discipline as
+  `AaConnection_test`.
+- **5 — H.264 decode.** Vendor + build **openh264** (BSD, Constrained-Baseline) for
+  aarch64 bare-metal; implement `IH264Decoder` behind the existing seam. **Host-test:
+  decode a captured Annex-B clip and checksum frames** (this is genuinely host-doable;
+  `H264Nal` parsing is already host-tested). On-target FPS is `[hw]`.
+- **6 — integration.** Bridge decoded frames → `AndroidAutoScreen` (already built:
+  aspect-fit blit + touch remap in `src/ui/AndroidAutoScreen.h`), AA audio → an
+  `ISoundDevice`/`PcmRing`, content-rect touch → AA input channel,
+  `VIDEO_FOCUS_INDICATION` ↔ the active tab. Host-test the wiring with fakes.
+
+**Guardrails.**
+- Branch off `main` (e.g. `device/aa-video-pipeline`). **Do not commit to or push
+  `main`.** Open a PR when a rung is done; keep PRs reviewable.
+- `third_party/circle-stdlib/` is **git-ignored** — never commit into it. Any edit to
+  it is a tracked patch under `scripts/patches/` + a README entry (mirror the existing
+  ones). mbedTLS is built with `cd third_party/circle-stdlib && make mbedtls`.
+- Keep `./build/carsh_tests` green at every step; add tests for new core logic.
+- Read `CLAUDE.md` (build/bench/constraints), then the rung sections + bench log
+  below. Update the Status section as you land each rung.
+
+**If you get stuck on something only hardware can answer:** stop, write down the exact
+question + what you'd need captured (e.g. "need a real TLS handshake byte capture as a
+fixture"), and leave it for the bench rather than guessing.
+
+---
 
 ## Goal
 
