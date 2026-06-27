@@ -1,0 +1,31 @@
+diff --git a/lib/usb/usbdevicefactory.cpp b/lib/usb/usbdevicefactory.cpp
+index 7521058..959da48 100644
+--- a/lib/usb/usbdevicefactory.cpp
++++ b/lib/usb/usbdevicefactory.cpp
+@@ -52,6 +52,10 @@
+ #include <circle/usb/usbserialft231x.h>
+ #include <circle/usb/usbtouchscreen.h>
+ 
++// carsh: Android Auto dongle driver factory hook, defined in the app
++// (device/CircleAoaTransport.cpp). extern "C" so this file needs no carsh header.
++extern "C" CUSBFunction *carshCreateAndroidAutoDevice (CUSBFunction *pParent, const char *pName);
++
+ CUSBFunction *CUSBDeviceFactory::GetDevice (CUSBFunction *pParent, CString *pName)
+ {
+ 	assert (pParent != 0);
+@@ -69,6 +73,15 @@ CUSBFunction *CUSBDeviceFactory::GetDevice (CUSBFunction *pParent, CString *pNam
+ 
+ 	CUSBFunction *pResult = 0;
+ 
++	// carsh: Android Auto wireless dongle (CA525 pre-switch + AOA accessory mode).
++	// Defined in the app (device/CircleAoaTransport.cpp); declared extern "C" at
++	// file scope below. Matched first so it wins over generic fallbacks.
++	pResult = carshCreateAndroidAutoDevice (pParent, (const char *) *pName);
++	if (pResult != 0)
++	{
++		return pResult;
++	}
++
+ 	if (   pName->Compare ("int9-0-0") == 0
+ 	    || pName->Compare ("int9-0-2") == 0)
+ 	{

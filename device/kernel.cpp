@@ -19,6 +19,7 @@
 #include "bt/DeviceRow.h"
 #include "CircleBtRunLoopTask.h"
 #include "CircleDecodeTask.h"
+#include "CircleAoaTransport.h"
 #include "CircleUsbLog.h"
 #include "CircleFlashTarget.h"
 #include "CirclePwmSoundDevice.h"
@@ -38,6 +39,7 @@
 #include "profile/ProfileManager.h"
 #include "ui/Canvas.h"
 #include "ui/Screen.h"
+#include "ui/AndroidAutoScreen.h"
 #include "ui/Screens.h"
 
 #define FROM "carsh"
@@ -104,11 +106,25 @@ bool CKernel::Initialize(void) {
     if (!mLogger.Initialize(&mSerial)) return false;
     if (!mTimer.Initialize()) return false;
 
-    if (!mUSBHCI.Initialize()) diag("USB: host controller init FAILED");
-
-    // USB-C serial-log gadget (dwc2 OTG) — independent of the xHCI host above.
+    // Bring the USB-C serial-log gadget up and retarget the logger to it BEFORE the
+    // xHCI host initializes, so Circle's per-device USB enumeration log — including
+    // UNBOUND devices (e.g. the AA dongle, which binds no Circle driver) and any
+    // enumeration errors — is captured over USB-C, instead of scrolling past on the
+    // GPIO UART before the console exists. The dwc2 USB-C gadget is independent of
+    // the xHCI host, so it can come up first. (CScheduler is the kernel's mScheduler
+    // member, valid here in Initialize().)
     mUsbGadgetOk = mSerialCDC.Initialize();
+    if (mUsbGadgetOk) {
+        new carsh::device::CircleUsbLog(&mSerialCDC, &mLogger, &mSerial);
+        for (unsigned i = 0; i < 400; ++i) {
+            CScheduler::Get()->Yield();  // let the gadget PnP task run + host attach
+            if (CDeviceNameService::Get()->GetDevice("utty1", FALSE)) break;
+            mTimer.MsDelay(5);
+        }
+    }
     diag("USB-C: serial-log gadget %s", mUsbGadgetOk ? "ready" : "FAILED");
+
+    if (!mUSBHCI.Initialize()) diag("USB: host controller init FAILED");
 
     mountStorage();
     return true;
@@ -220,6 +236,7 @@ CStdlibApp::TShutdownMode CKernel::Run(void) {
     carsh::ui::ListScreen sources(mgr.contentRect(), "Src");
     carsh::ui::SettingsScreen settings(mgr.contentRect());
     carsh::ui::DevicesScreen devices(mgr.contentRect());
+    carsh::ui::AndroidAutoScreen androidAuto(mgr.contentRect());
     mgr.addScreen(&now, "Now");
     mgr.addScreen(&library, "Lib");
     mgr.addScreen(&search, "Find");
@@ -228,6 +245,10 @@ CStdlibApp::TShutdownMode CKernel::Run(void) {
     mgr.addScreen(&sources, "Src");
     mgr.addScreen(&settings, "Set");
     mgr.addScreen(&devices, "BT");
+    // Android Auto projection tab. Shows the placeholder until the USB-AOA dongle
+    // transport + H.264 decoder land (AA_PLAN rungs 3-6); the screen blits frames
+    // into the content rect, leaving the volume rail + tab bar visible.
+    mgr.addScreen(&androidAuto, "AA");
 
     // Left volume rail -> engine master volume. Boots muted (setMasterVolume(0)
     // above); dragging the rail raises it.
@@ -268,18 +289,28 @@ CStdlibApp::TShutdownMode CKernel::Run(void) {
     bool haveTouch = touch.initialize(&fb);  // fb supplies touch coord mapping
     mLogger.Write(FROM, LogNotice, "touch: %s", haveTouch ? "ready" : "absent");
 
-    // Bring the USB-C serial log up BEFORE Bluetooth: BT bring-up runs on this
-    // thread and can block, and its diagnostics must be visible. The retarget
-    // happens inside CircleUsbLog::Run(), so spawn it now and spin the scheduler
-    // until the host serial (utty1) enumerates (bounded ~2s; skipped if no host).
-    if (mUsbGadgetOk) {
-        new carsh::device::CircleUsbLog(&mSerialCDC, &mLogger, &mSerial);
-        for (unsigned i = 0; i < 400; ++i) {
-            CScheduler::Get()->Yield();  // lets the gadget PnP task run + attach
-            if (CDeviceNameService::Get()->GetDevice("utty1", FALSE)) break;
-            mTimer.MsDelay(5);
-        }
+    // (The USB-C serial-log console is already up — it's brought up before the xHCI
+    // host in Initialize() so the enumeration log is captured.)
+
+    // AOA Rung 1 — list every registered USB device, now that the USB-C console is
+    // up so it is captured over serial (the host's own enumeration log goes out the
+    // GPIO UART before this point). Tells us how the CA525 dongle powers up: a bound
+    // driver name (uhubN / uttyN / umsdN / venXXXX-YYYY), or absent if it enumerated
+    // unbound. Pump plug-and-play first to let a slow dongle settle. See AA_PLAN.
+    for (unsigned i = 0; i < 25; ++i) {
+        mUSBHCI.UpdatePlugAndPlay();
+        CScheduler::Get()->Yield();
+        mTimer.MsDelay(20);
     }
+    mLogger.Write(FROM, LogNotice, "AOA Rung-1: registered USB/devices --");
+    CDeviceNameService::Get()->EnumerateDevices(
+        [](CDevice*, const char* name, boolean bBlock, void* arg) -> boolean {
+            static_cast<CLogger*>(arg)->Write("rung1", LogNotice, "  dev: %s%s", name,
+                                              bBlock ? " [block]" : "");
+            return TRUE;  // keep enumerating
+        },
+        &mLogger);
+    mLogger.Write(FROM, LogNotice, "AOA Rung-1: end device list");
 
     // Bluetooth (A2DP sink + AVRCP). Connect switches the driver profile (keyed
     // on the stable Classic address); AVRCP metadata feeds the BT now-playing;
@@ -495,6 +526,25 @@ CStdlibApp::TShutdownMode CKernel::Run(void) {
         }
 
         rt.present();
+
+        // AOA Rung 1 (continuous) — keep pumping USB plug-and-play so a slow-booting
+        // dongle gets enumerated whenever it finally presents. The CA525 powers an
+        // internal SoC and can take several seconds to bring up its USB interface —
+        // well after the boot enumeration window — so a one-shot scan at boot misses
+        // it. When it appears (or is hot-replugged), Circle logs "Device venXXXX
+        // found" over USB-C. ~1 Hz is plenty and cheap.
+        if (frame % 33 == 0) mUSBHCI.UpdatePlugAndPlay();
+
+        // AA transport status — once the dongle has switched to accessory mode the
+        // factory registers it as "uaa1"; report it (and the bulk-IN throughput
+        // counter) so the bench sees the AOA switch land. ~2 s cadence.
+        if (frame % 66 == 0) {
+            auto* aoa = static_cast<carsh::device::CAndroidAutoDevice*>(
+                CDeviceNameService::Get()->GetDevice("uaa1", FALSE));
+            if (aoa && aoa->isAccessory())
+                mLogger.Write(FROM, LogNotice, "AA: transport up (uaa1), rx=%u bytes",
+                              aoa->rxBytes());
+        }
 
         // Scheduler-aware sleep: yields to the decode task (and BT/net later)
         // between frames, ~30 fps. The decode task keeps the ring fed meanwhile.
