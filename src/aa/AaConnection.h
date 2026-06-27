@@ -32,9 +32,9 @@ enum class AaState {
 };
 
 struct AaConnectionCallbacks {
-    // A decrypted channel message in the Running phase (video/audio/sensor/input/
-    // media/nav). The connection has already stripped framing + decryption + the
-    // 2-byte message id; payload is the protobuf (or media) body.
+    // A decrypted channel message in the Running phase that the structured handlers
+    // below did not consume (e.g. nav, media-status). The connection has already
+    // stripped framing + decryption + the 2-byte message id; payload is the body.
     std::function<void(ChannelId channel, uint16_t msgId, const uint8_t* payload,
                        size_t len)>
         onChannelMessage;
@@ -42,6 +42,25 @@ struct AaConnectionCallbacks {
     std::function<void(ChannelId channel)> onChannelOpened;
     // The phone requested shutdown.
     std::function<void()> onShutdown;
+
+    // --- rung 4c: structured per-channel routing -----------------------------
+    // AV media payload (video channel = H.264 Annex-B; audio channels = PCM). The
+    // 2-byte msg id and any leading 8-byte timestamp are already stripped, so
+    // data/len is the bare bitstream; tsPresent/timestamp carry the PTS when the
+    // media message included one (MEDIA_WITH_TIMESTAMP). The connection has already
+    // sent the flow-control ack for this message.
+    std::function<void(ChannelId channel, bool tsPresent, uint64_t timestamp,
+                       const uint8_t* data, size_t len)>
+        onAvMedia;
+    // An AV channel finished setup — the HU has replied SETUP_RESPONSE for the given
+    // config index. Fired for video + each audio channel.
+    std::function<void(ChannelId channel, uint8_t configIndex)> onAvSetup;
+    // An AV channel stream started (true, START_INDICATION) or stopped (false,
+    // STOP_INDICATION).
+    std::function<void(ChannelId channel, bool started)> onAvStart;
+    // The phone asked for a video focus change (VIDEO_FOCUS_REQUEST{mode}); the app
+    // typically mirrors it back with sendVideoFocus once the tab state agrees.
+    std::function<void(VideoFocusMode mode)> onVideoFocusRequest;
 };
 
 class AaConnection {
@@ -58,9 +77,18 @@ public:
     AaState state() const { return state_; }
     bool channelOpen(ChannelId ch) const;
 
+    // --- rung 4c: outbound channel messages the app drives (rung 6 wiring) ----
+    // Grant/revoke video focus to the phone (VIDEO_FOCUS_INDICATION on the video
+    // channel) — call when the AA tab gains/loses focus. False until video is open.
+    bool sendVideoFocus(VideoFocusMode mode);
+    // Forward a touch to the phone (INPUT_EVENT_INDICATION on the input channel).
+    // x/y are AA source-frame coords (0..799 / 0..479). False until input is open.
+    bool sendTouch(TouchAction action, uint32_t x, uint32_t y, uint64_t timestamp);
+
 private:
     bool sendPlainSpecific(uint16_t msgId, const uint8_t* p, size_t n);
     bool sendPlainControl(uint16_t msgId, const uint8_t* p, size_t n);
+    bool sendEncrypted(ChannelId ch, uint16_t msgId, const uint8_t* p, size_t n);
     bool sendEncryptedControl(uint16_t msgId, const uint8_t* p, size_t n);
 
     void handleControl(uint16_t msgId, const uint8_t* p, size_t n);
@@ -70,11 +98,27 @@ private:
     void handleChannelOpenRequest(const uint8_t* p, size_t n);
     void handlePingRequest(const uint8_t* p, size_t n);
 
+    // Non-control channel dispatch (Running phase).
+    void handleChannelMessage(ChannelId ch, uint16_t msgId, const uint8_t* p, size_t n);
+    void handleAvChannel(ChannelId ch, uint16_t msgId, const uint8_t* p, size_t n);
+    void handleInputChannel(uint16_t msgId, const uint8_t* p, size_t n);
+    void handleSensorChannel(uint16_t msgId, const uint8_t* p, size_t n);
+    void sendAvSetupResponse(ChannelId ch, uint8_t configIndex);
+    void sendMediaAck(ChannelId ch);
+    void sendSensorEvent(uint32_t sensorType);
+
+    static bool isAvChannel(ChannelId ch) {
+        return ch == ChannelId::Video || ch == ChannelId::MediaAudio ||
+               ch == ChannelId::SpeechAudio || ch == ChannelId::SystemAudio;
+    }
+
     AaMessenger& msger_;
     IAaCrypto& crypto_;
     AaConnectionCallbacks cbs_;
     AaState state_ = AaState::VersionExchange;
     std::array<bool, static_cast<size_t>(kMaxChannel) + 1> channelOpen_{};
+    // Per-AV-channel session id from START_INDICATION, echoed in the media ack.
+    std::array<int32_t, static_cast<size_t>(kMaxChannel) + 1> avSession_{};
 };
 
 }  // namespace carsh::aa
