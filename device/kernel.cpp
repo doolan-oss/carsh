@@ -38,6 +38,7 @@
 #include "profile/ProfileManager.h"
 #include "ui/Canvas.h"
 #include "ui/Screen.h"
+#include "ui/AndroidAutoScreen.h"
 #include "ui/Screens.h"
 
 #define FROM "carsh"
@@ -220,6 +221,7 @@ CStdlibApp::TShutdownMode CKernel::Run(void) {
     carsh::ui::ListScreen sources(mgr.contentRect(), "Src");
     carsh::ui::SettingsScreen settings(mgr.contentRect());
     carsh::ui::DevicesScreen devices(mgr.contentRect());
+    carsh::ui::AndroidAutoScreen androidAuto(mgr.contentRect());
     mgr.addScreen(&now, "Now");
     mgr.addScreen(&library, "Lib");
     mgr.addScreen(&search, "Find");
@@ -228,6 +230,10 @@ CStdlibApp::TShutdownMode CKernel::Run(void) {
     mgr.addScreen(&sources, "Src");
     mgr.addScreen(&settings, "Set");
     mgr.addScreen(&devices, "BT");
+    // Android Auto projection tab. Shows the placeholder until the USB-AOA dongle
+    // transport + H.264 decoder land (AA_PLAN rungs 3-6); the screen blits frames
+    // into the content rect, leaving the volume rail + tab bar visible.
+    mgr.addScreen(&androidAuto, "AA");
 
     // Left volume rail -> engine master volume. Boots muted (setMasterVolume(0)
     // above); dragging the rail raises it.

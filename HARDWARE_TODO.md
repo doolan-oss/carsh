@@ -63,9 +63,21 @@ this is the prioritized list for the first hardware session. Format:
   `hci_enable_custom_pre_init`), HCI event reassembly + USB-IRQ trampoline, USB ACL
   path (`CUSBBluetoothDevice` patch under `scripts/patches/`), SBC media-header strip
   → PWM output at the SBC rate.
-- **Remaining polish:** pairing UX (phone can't see "carsh" passively; connect is
-  carsh-initiated by MAC today), AVRCP now-playing + transport controls, BT volume
-  via the engine, onboard CYW43455 (stage 2). Original notes:
+- **Remaining polish (deferred — BT left "basically functional" by owner, 2026-06-27):**
+  1. **BT volume → engine.** The volume rail has *no effect* on BT playback today;
+     only the phone's own volume changes it. Route the BT PCM (`g_btRing`) through
+     the engine gain stage (or apply gain in `BtMixSink`) so the rail controls it.
+  2. **Bonding persists across boots.** Save link keys / pairing to SD so a paired
+     phone reconnects after a power-cycle without re-pairing (`btstack_tlv` on SD).
+  3. **Scan screen shows names AND MACs.** `DevicesScreen` should list the friendly
+     device name *and* the BD_ADDR (GAP inquiry returns both; today connect is by MAC).
+  4. **Incoming-pair approval popup.** When the phone requests pairing, show an
+     accept/reject prompt on the carsh screen (SSP confirmation) instead of silently
+     accepting — wire BTstack's pairing/IO-cap callbacks to a UI dialog.
+  5. **Now-playing display.** Song title, artist/album, and album art via AVRCP
+     metadata + cover-art (the `NowPlayingAssembler` infra already exists; surface it
+     on the Now-Playing screen for the BT source).
+  - Plus: onboard CYW43455 transport (stage 2). Original notes:
 
 ### H6 (orig) — Bluetooth: USB ACL path + firmware blob + bring-up (Risks R3/R4/R12)
 - **Module:** BTstack↔Circle HCI transport, A2DP sink, AVRCP CT/TG.
