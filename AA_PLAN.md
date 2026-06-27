@@ -321,9 +321,17 @@ host tests pass, never "validated on the Pi").
   - [x] `AaConnection` bring-up state machine (version → SSL handshake → auth →
         service discovery → channel opens → dispatch), driven end-to-end by a
         scripted phone in host tests.
-  - [ ] *Remaining (breadth):* per-channel handlers (av/sensor/input/media/nav
-        decode — currently routed to a generic callback); the real mbedTLS-backed
-        `IAaCrypto` for the device (live handshake is `[hw]`).
+  - [x] *Per-channel handlers (rung 4c, 2026-06-28):* `AaConnection` now dispatches
+        the Running phase into structured handlers instead of one generic callback —
+        AV setup/start/stop + media (timestamp-stripped H.264/PCM via `onAvMedia`)
+        with `AV_MEDIA_ACK` flow control, input binding + outbound touch
+        (`sendTouch`), sensor start (+ driving-status/night event), and video focus
+        (`onVideoFocusRequest` / `sendVideoFocus`). Host-tested in
+        `tests/aa/AaChannels_test.cpp` (scripted phone, protobuf decoded back). Nav /
+        media-status still fall through to `onChannelMessage`. Wire acceptance by a
+        real phone is `[hw]`.
+  - [x] *Real mbedTLS-backed `IAaCrypto`* — done in rung 4b (host-verified; live
+        handshake `[hw]`).
 - [x] **Phase 2** — H.264 NAL extraction/classification (`H264Nal`) +
   `IH264Decoder` seam, host-tested.
   - [ ] *Remaining `[hw]`:* the SW decoder impl (openh264) + on-target FPS.

@@ -66,6 +66,59 @@ enum class ControlMsgId : uint16_t {
     AudioFocusResponse = 0x0013,
 };
 
+// AV channel (video / media-audio / speech / system) message ids — the 2-byte id
+// prefixing an encrypted AV channel payload (aasdk AVChannelMessageIdsEnum). Media
+// data uses the low ids; the 0x80xx ids are the per-channel setup/flow handshake.
+enum class AvMsgId : uint16_t {
+    MediaWithTimestamp = 0x0000,  // 8-byte PTS then Annex-B / PCM
+    MediaIndication = 0x0001,     // raw Annex-B / PCM, no timestamp
+    SetupRequest = 0x8000,        // phone -> HU: AVChannelSetupRequest{config_index}
+    StartIndication = 0x8001,     // phone -> HU: stream starting {session, config}
+    StopIndication = 0x8002,      // phone -> HU: stream stopping
+    SetupResponse = 0x8003,       // HU -> phone: AVChannelSetupResponse
+    VideoFocusRequest = 0x8004,   // phone -> HU: requests video focus change
+    VideoFocusIndication = 0x8005,  // HU -> phone: grants/revokes video focus
+    MediaAck = 0x8006,            // HU -> phone: AVMediaAckIndication (flow control)
+    AvInputOpenRequest = 0x8007,
+    AvInputOpenResponse = 0x8008,
+};
+
+// Input channel message ids (aasdk InputChannelMessageIdsEnum). The HU sends touch
+// as INPUT_EVENT_INDICATION; the phone binds keycodes via BINDING_REQUEST.
+enum class InputMsgId : uint16_t {
+    InputEventIndication = 0x8001,  // HU -> phone: touch/key event
+    BindingRequest = 0x8002,        // phone -> HU: bind keycodes
+    BindingResponse = 0x8003,       // HU -> phone: binding status
+};
+
+// Sensor channel message ids (aasdk SensorChannelMessageIdsEnum). The phone starts
+// a sensor; the HU streams SENSOR_EVENT_INDICATION (driving status, night mode, …).
+enum class SensorMsgId : uint16_t {
+    SensorStartRequest = 0x8001,    // phone -> HU: start a sensor
+    SensorStartResponse = 0x8002,   // HU -> phone: start status
+    SensorEventIndication = 0x8003,  // HU -> phone: sensor data
+};
+
+// Sensor type ids (aasdk SensorType) the HU advertises + reports.
+enum class SensorType : uint32_t {
+    DrivingStatus = 13,
+    NightData = 10,
+    Location = 21,
+};
+
+// Video focus modes (aasdk VideoFocusModeEnum) for VIDEO_FOCUS_INDICATION.
+enum class VideoFocusMode : uint32_t {
+    Focused = 1,
+    Unfocused = 2,
+};
+
+// Touch action codes (aasdk TouchActionEnum) for INPUT_EVENT_INDICATION.
+enum class TouchAction : uint32_t {
+    Press = 0,
+    Release = 1,
+    Drag = 2,
+};
+
 // Protocol version the head unit advertises (matches the DHU: 1.7).
 inline constexpr uint16_t kVersionMajor = 1;
 inline constexpr uint16_t kVersionMinor = 7;
