@@ -16,6 +16,7 @@
 
 #include "aa/AaConnection.h"
 #include "aa/AaMessenger.h"
+#include "aa/AaProjection.h"
 #include "aa/IAaCrypto.h"
 
 namespace carsh::device {
@@ -25,6 +26,11 @@ public:
     ~CircleAaDriver();
     void tick();
 
+    // Route the live connection into a projection (video/audio/touch/focus). When
+    // set, its callbacks replace the logging fallback and it is (re)bound to each
+    // new AaConnection across dongle cycles. Call once before the UI loop.
+    void setProjection(carsh::aa::AaProjection* p) { projection_ = p; }
+
 private:
     void teardown();
 
@@ -33,6 +39,7 @@ private:
     static int rngEntropy(void* ctx, unsigned char* buf, size_t len);
 
     CBcmRandomNumberGenerator rng_;  // HW entropy source for the TLS DRBG seed
+    carsh::aa::AaProjection* projection_ = nullptr;  // optional rung-6 wiring
     void* boundDev_ = nullptr;  // CAndroidAutoDevice* — compared only, never deref'd stale
     carsh::aa::IAaCrypto* crypto_ = nullptr;
     carsh::aa::AaMessenger* msger_ = nullptr;
