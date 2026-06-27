@@ -48,8 +48,17 @@ USB-A media stick and the onboard Bluetooth.
 ```sh
 cd device
 export PATH=/opt/arm-toolchain/bin:$PATH
+# One-time: build the bundled mbedTLS for the Android Auto TLS channel (the default
+# image now links AaCryptoMbedTls). See AA_PLAN rung 4b.
+( cd ../third_party/circle-stdlib && make mbedtls )
 make                # -> kernel8-rpi4.img
 ```
+
+The default image links the **AA TLS crypto** (mbedTLS, rung 4b). To also link the
+**H.264 decoder** for live video projection, vendor + cross-build openh264
+(`scripts/fetch_openh264.sh`) and build with `make CARSH_HAVE_OPENH264=1` (rung 5);
+without it the AA tab shows its placeholder but TLS / channels / audio / touch still
+run.
 
 Copy `kernel8-rpi4.img` (keep this name — `config.txt`'s `[pi4]` section loads
 `kernel=kernel8-rpi4.img`) + the Pi firmware + `config.txt` to a **FAT32** SD card
