@@ -42,17 +42,41 @@ EvtSlot g_evtQ[kEvtSlots];
 volatile unsigned g_evtHead = 0;  // written by consumer only
 volatile unsigned g_evtTail = 0;  // written by producer only
 
-// Producer — runs in USB-completion (IRQ) context. Enqueue only.
-void eventStub(const void* buffer, unsigned length) {
-    if (length == 0) return;
-    if (length > kEvtMax) length = kEvtMax;
+// Enqueue one COMPLETE HCI event into the SPSC ring.
+void enqueueEvent(const uint8_t* data, unsigned len) {
     unsigned tail = g_evtTail;
     unsigned next = (tail + 1) % kEvtSlots;
     if (next == g_evtHead) return;  // full — drop (bring-up rates won't hit this)
-    g_evtQ[tail].len = static_cast<uint16_t>(length);
-    std::memcpy(g_evtQ[tail].data, buffer, length);
+    if (len > kEvtMax) len = kEvtMax;
+    g_evtQ[tail].len = static_cast<uint16_t>(len);
+    std::memcpy(g_evtQ[tail].data, data, len);
     DataSyncBarrier();  // slot fully written before the tail becomes visible
     g_evtTail = next;
+}
+
+// HCI-event reassembly buffer. Circle's CUSBBluetoothDevice hands us the interrupt
+// EP in wMaxPacketSize chunks (16 bytes on the RTL8761B), so an HCI event bigger
+// than that (e.g. Read_Local_Name's ~254-byte command-complete) arrives as several
+// fragments. Single producer (the USB IRQ), so the assembly buffer needs no lock.
+constexpr unsigned kAsmMax = 320;  // max event (257) + one more fragment, head-room
+uint8_t g_asm[kAsmMax];
+unsigned g_asmLen = 0;
+
+// Producer — runs in USB-completion (IRQ) context. Reassemble whole HCI events by
+// the length field (total = 2 + param_len), then enqueue each complete event.
+void eventStub(const void* buffer, unsigned length) {
+    if (length == 0) return;
+    if (g_asmLen + length > kAsmMax) { g_asmLen = 0; return; }  // desync guard
+    std::memcpy(g_asm + g_asmLen, buffer, length);
+    g_asmLen += length;
+    while (g_asmLen >= 2) {
+        unsigned total = 2u + g_asm[1];   // event_code + param_len + params
+        if (g_asmLen < total) break;      // more fragments still to come
+        enqueueEvent(g_asm, total);
+        unsigned extra = g_asmLen - total;
+        if (extra) std::memmove(g_asm, g_asm + total, extra);
+        g_asmLen = extra;
+    }
 }
 
 }  // namespace
