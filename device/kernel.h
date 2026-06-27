@@ -14,6 +14,7 @@
 #include <circle/timer.h>
 #include <circle/logger.h>
 #include <circle/usb/usbhcidevice.h>
+#include <circle/usb/gadget/usbcdcgadget.h>
 #include <SDCard/emmc.h>
 #include <fatfs/ff.h>
 #include <circle/sched/scheduler.h>
@@ -43,12 +44,14 @@ private:
     CTimer mTimer;
     CLogger mLogger;
     CEMMCDevice mEMMC;
-    CUSBHCIDevice mUSBHCI;    // USB host controller (enables USB mass storage)
+    CUSBHCIDevice mUSBHCI;    // USB host (xHCI/VL805): USB-A ports, mass storage
+    CUSBCDCGadget mSerialCDC; // USB gadget (dwc2/USB-C): serial-log to the host PC
     CScheduler mScheduler;   // cooperative scheduler for the decode/UI tasks
     FATFS mFileSystem;       // SD: volume
     FATFS mUsbFs;            // USB: volume
     bool mSdMounted = false;
     bool mUsbMounted = false;
+    bool mUsbGadgetOk = false;  // USB-C serial gadget initialized
     std::deque<std::string> mDiag;  // recent storage/USB diagnostic lines
     bool mDiagVisible = true;       // on-screen diagnostics panel (toggle: tap top-right)
 };

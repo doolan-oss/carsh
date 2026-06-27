@@ -23,6 +23,11 @@ public:
     void sendAvrcpCommand(carsh::bt::AvrcpCommand cmd) override;
     bool connected() const override { return connected_; }
     carsh::bt::BdAddr connectedAddress() const override { return addr_; }
+    void startScan() override;
+    void stopScan() override;
+    bool isScanning() const override { return scanning_; }
+    void connect(const carsh::bt::BdAddr& addr) override;
+    void disconnect() override;
 
     // --- Entry points the BTstack glue calls (no BTstack types here) ---------
     void deliverConnected(const carsh::bt::BdAddr& a) {
@@ -39,11 +44,22 @@ public:
     void deliverA2dpPcm(const float* pcm, unsigned frames, unsigned channels) {
         if (cb_.onA2dpPcm) cb_.onA2dpPcm(pcm, frames, (uint8_t)channels);
     }
+    void deliverDeviceDiscovered(const carsh::bt::DiscoveredDevice& d) {
+        if (cb_.onDeviceDiscovered) cb_.onDeviceDiscovered(d);
+    }
+    void deliverScanComplete() {
+        scanning_ = false;
+        if (cb_.onScanComplete) cb_.onScanComplete();
+    }
+    void deliverConnectFailed(const carsh::bt::BdAddr& a, int reason) {
+        if (cb_.onConnectFailed) cb_.onConnectFailed(a, reason);
+    }
 
 private:
     carsh::bt::BluetoothCallbacks cb_;
     carsh::bt::BdAddr addr_{};
     bool connected_ = false;
+    bool scanning_ = false;
 };
 
 }  // namespace carsh::device
