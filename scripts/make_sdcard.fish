@@ -39,6 +39,9 @@ test -b "$dev"; or die "$dev is not a block device"
 set -l repo (realpath (status dirname)/..)
 set -l boot $repo/third_party/circle-stdlib/libs/circle/boot
 set -l kernel $repo/device/kernel8-rpi4.img
+# Optional overlay copied verbatim onto the card (preserves subdirs). Holds e.g.
+# device/sdcard/firmware/rtlbt/{rtl8761bu_fw,rtl8761bu_config} for the BT dongle.
+set -l overlay $repo/device/sdcard
 
 set -l srcs \
     $kernel \
@@ -108,6 +111,11 @@ sudo mount -t vfat $part $mnt; or die "mount failed"
 echo ">> copying boot files"
 for f in $srcs
     sudo cp -v $f $mnt/
+end
+
+if test -d $overlay
+    echo ">> copying SD overlay ($overlay -> card)"
+    sudo cp -rv $overlay/. $mnt/; or die "overlay copy failed"
 end
 
 echo ">> writing config.txt"
