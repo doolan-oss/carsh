@@ -78,7 +78,8 @@ add_executable(carsh_tests
 add_dependencies(carsh_tests carsh_fixtures)
 target_link_libraries(carsh_tests PRIVATE carsh_thirdparty)
 target_compile_definitions(carsh_tests PRIVATE
-  CARSH_FIXTURES_DIR="${FIXTURES_DIR}")
+  CARSH_FIXTURES_DIR="${FIXTURES_DIR}"
+  CARSH_TEST_DIR="${CMAKE_SOURCE_DIR}/tests")
 
 # Optional: real Opus decode via system libopusfile if present on the build
 # server. The bare-metal port is separate; this proves the wrapper + factory.
