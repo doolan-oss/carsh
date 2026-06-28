@@ -21,9 +21,12 @@
 #include "bt/DeviceRow.h"
 #include "CircleBtRunLoopTask.h"
 #include "CircleDecodeTask.h"
+#include "CircleAaDecodeTask.h"
 #include "CircleAaDriver.h"
 #include "CircleAoaTransport.h"
 #include "aa/AaProjection.h"
+#include "aa/AsyncH264Decoder.h"
+#include "audio/JitterBuffer.h"
 #ifdef CARSH_HAVE_OPENH264
 #include "CircleH264Decoder.h"
 #endif
@@ -83,6 +86,19 @@ carsh::audio::PcmRing<float> g_btRing(kRate * kChannels);  // A2DP jitter+decode
 // Android Auto media audio (ch=4, 48 kHz stereo PCM from the phone). Filled by the
 // AA projection's playAudio hook; consumed by the PWM sink below, same as A2DP.
 carsh::audio::PcmRing<float> g_aaRing(kRate * kChannels);  // ~1 s stereo
+
+// AA media-audio prebuffer / underrun handler over g_aaRing (the choppy-audio fix).
+// The ring is fed in real time and drained in real time, so without a prebuffer it
+// hovers near empty and any refill stall (a long H.264 decode) instantly underruns.
+// The JitterBuffer waits until ~kAaPrimeMs is buffered before playing, rides out
+// short reads as silence (no source-switch click), and re-primes before resuming.
+// kAaPrimeMs trades startup latency for stall tolerance — tune on the bench (lower
+// if AA audio lags video noticeably; raise if dropouts persist). It is the consumer
+// (the PWM IRQ via BtMixSink::render); nothing else drains g_aaRing.
+constexpr unsigned kAaPrimeMs = 120;
+carsh::audio::JitterBuffer g_aaJitter(
+    g_aaRing, std::size_t(kRate) * kChannels * kAaPrimeMs / 1000);
+
 carsh::audio::AudioEngine g_engine(&g_ring, kChannels);
 carsh::dsp::EqProcessor g_eq(kRate);
 
@@ -101,12 +117,11 @@ class BtMixSink : public carsh::hal::IAudioSink {
 public:
     std::size_t render(float* out, std::size_t frames) override {
         const std::size_t want = frames * kChannels;
-        if (g_aaRing.readable() >= want) {
-            std::size_t got = g_aaRing.read(out, want);
-            for (std::size_t i = 0; i < got; ++i) out[i] *= g_masterGain;
-            for (std::size_t i = got; i < want; ++i) out[i] = 0.0f;
-            return frames;
-        }
+        // Android Auto (highest priority) via the jitter buffer: it prebuffers, owns
+        // the output while a stream is live (emitting silence on a short read rather
+        // than dropping to the engine and clicking), and returns false only when no
+        // AA stream is engaged — then A2DP / the local engine take over below.
+        if (g_aaJitter.pull(out, want, g_masterGain)) return frames;
         if (g_btRing.readable() >= want) {
             std::size_t got = g_btRing.read(out, want);
             for (std::size_t i = 0; i < got; ++i) out[i] *= g_masterGain;
@@ -439,16 +454,17 @@ CStdlibApp::TShutdownMode CKernel::Run(void) {
     // last screen). Used to auto-show projection without a touch input.
     const int aaTabIndex = 8;
     bool aaAutoShown = false;  // latched when we auto-switch to the AA tab on first frame
+    bool aaAutoShowReq = false;  // decode task requests auto-show; UI task performs it
     carsh::aa::AaProjection::Hooks aaHooks;
     aaHooks.showFrame = [&](const uint8_t* rgb, int w, int h) {
+        // Runs on the DECODE task now (decode is decoupled from the UI loop). setFrame
+        // only stores the frame pointer for the UI task to blit — safe under Circle's
+        // cooperative scheduler (the decode task runs only while the UI task is yielded,
+        // never mid-render). But the auto-show below calls mgr.setActive, which fires
+        // onFocusChanged -> sendVideoFocus over the AA transport; that write must stay
+        // on the UI task (where all other transport writes live), so just request it.
         androidAuto.setFrame(rgb, w, h);
-        // Auto-switch to the AA tab the moment real video is decoded, so projection
-        // appears on the (HDMI/DSI) display without needing a touch to navigate there.
-        // Latched so it only yanks focus once per connection (a user CAN tab away).
-        if (rgb != nullptr && w > 0 && h > 0 && !aaAutoShown) {
-            mgr.setActive(aaTabIndex);
-            aaAutoShown = true;
-        }
+        if (rgb != nullptr && w > 0 && h > 0 && !aaAutoShown) aaAutoShowReq = true;
     };
     aaHooks.setConnected = [&](bool up) {
         androidAuto.setConnected(up);
@@ -456,6 +472,7 @@ CStdlibApp::TShutdownMode CKernel::Run(void) {
         // display isn't stuck on a dead projection screen.
         if (!up) {
             aaAutoShown = false;
+            aaAutoShowReq = false;
             mgr.setActive(0);
         }
     };
@@ -479,10 +496,27 @@ CStdlibApp::TShutdownMode CKernel::Run(void) {
     carsh::aa::AaProjection aaProjection(aaHooks);
 #ifdef CARSH_HAVE_OPENH264
     carsh::device::CircleH264Decoder aaDecoder(&aaProjection);
-    if (aaDecoder.init())
-        aaProjection.setDecoder(&aaDecoder);
-    else
+    // Decouple decode from the AA receive loop: the projection feeds encoded AUs to
+    // this async wrapper (a cheap enqueue), and a dedicated cooperative task pumps
+    // openh264 on its own schedule, so a keyframe decode no longer stalls the loop
+    // that refills g_aaRing (AA_AUDIO_INVESTIGATION fix #3). ~512 KB of AU headroom
+    // (several keyframes) absorbs a brief decode backlog without dropping AUs.
+    carsh::aa::AsyncH264Decoder aaAsync(&aaDecoder, 512 * 1024);
+    carsh::device::AaDecodeStats aaDecodeStats;
+    if (aaDecoder.init()) {
+        aaProjection.setDecoder(&aaAsync);
+        new carsh::device::CircleAaDecodeTask(&aaAsync, &aaDecodeStats);
+#ifdef CARSH_AA_SKIP_DECODE
+        // A/B instrumentation (investigation step 3): pop AUs but skip the actual
+        // openh264 decode. If audio goes smooth with this defined, decode-on-the-
+        // refill-path is confirmed as the choppiness cause. Build:
+        //   make CARSH_HAVE_OPENH264=1 CPPFLAGS=-DCARSH_AA_SKIP_DECODE
+        aaAsync.setDecodeEnabled(false);
+        mLogger.Write(FROM, LogWarning, "AA: DECODE SKIPPED (A/B audio test build)");
+#endif
+    } else {
         mLogger.Write(FROM, LogError, "AA: openh264 decoder init failed");
+    }
 #endif
 
     carsh::device::CircleAaDriver aaDriver;  // drives AA over uaa1 from this loop
@@ -500,6 +534,10 @@ CStdlibApp::TShutdownMode CKernel::Run(void) {
 
     mLogger.Write(FROM, LogNotice, "entering UI loop");
     unsigned frame = 0;
+    // AA tick() latency window (microseconds), reset each ~1 Hz health log. Long
+    // ticks lining up with rising AA underruns is the signature of the prime
+    // hypothesis (decode starving the audio refill) — see AA_AUDIO_INVESTIGATION.
+    unsigned aaTickMaxUs = 0, aaTickSumUs = 0, aaTickCount = 0;
     // Diagnostic software audio sink: no I2S DAC is wired yet, so nothing pulls
     // the engine — playback position would never advance. Each UI tick we consume
     // ~30 ms of audio here (decode -> ring -> engine DSP), which advances the
@@ -522,6 +560,15 @@ CStdlibApp::TShutdownMode CKernel::Run(void) {
                 mgr.onTouch(ev);
             }
         }
+        // Perform a decode-task-requested auto-show on the UI task, so the resulting
+        // VIDEO_FOCUS goes out the AA transport from the UI thread (not the decode
+        // task). Latched so it only yanks focus once per connection.
+        if (aaAutoShowReq && !aaAutoShown) {
+            mgr.setActive(aaTabIndex);
+            aaAutoShown = true;
+            aaAutoShowReq = false;
+        }
+
         // Refresh now-playing from the player each frame.
         carsh::player::PlayerState ps = player.state();
 
@@ -651,8 +698,11 @@ CStdlibApp::TShutdownMode CKernel::Run(void) {
             uint32_t col = audioPeak > 0.9f ? 0xFFFF3030u
                          : audioPeak > 0.7f ? 0xFFFFD030u : 0xFF30FF30u;
             if (fill > 0) canvas.fillRect(bx + 1, my + 1, fill, mh - 2, col);
-            char info[40];
-            snprintf(info, sizeof info, "u=%lu", (unsigned long)ps.underrunFrames);
+            // u = local-engine underrun frames; au = AA media-audio underruns (jitter
+            // buffer). au climbing during projection == choppy AA audio.
+            char info[56];
+            snprintf(info, sizeof info, "u=%lu au=%lu", (unsigned long)ps.underrunFrames,
+                     (unsigned long)g_aaJitter.underruns());
             canvas.drawText(bx + mw + 6, my + 2, info, 0xFFAAAAAAu, 0, 1);
         }
 
@@ -669,8 +719,42 @@ CStdlibApp::TShutdownMode CKernel::Run(void) {
         // Drive the Android Auto connection over the live AOA transport (uaa1):
         // version exchange now, TLS next (AA_PLAN rung 4). UI-task driven so it never
         // races with the UpdatePlugAndPlay above (which deletes the transport when
-        // the dongle re-cycles).
-        aaDriver.tick();
+        // the dongle re-cycles). Timed so we can correlate long ticks with AA audio
+        // underruns (investigation step 2).
+        {
+            const unsigned t0 = CTimer::GetClockTicks();  // 1 MHz free-running (us)
+            aaDriver.tick();
+            const unsigned dt = CTimer::GetClockTicks() - t0;
+            if (dt > aaTickMaxUs) aaTickMaxUs = dt;
+            aaTickSumUs += dt;
+            ++aaTickCount;
+        }
+
+        // AA audio/decode health, ~1 Hz. Underruns climbing while tick/decode spikes
+        // appear is the prime-hypothesis signature; underruns staying at 0 with the
+        // ring occupancy holding near the prime level means the path is healthy.
+        // (Reads counters from the UI task — never logs from the PWM IRQ context.)
+        if (frame % 33 == 0) {
+            const unsigned tickAvg = aaTickCount ? aaTickSumUs / aaTickCount : 0;
+            mLogger.Write(FROM, LogNotice,
+                          "aa-audio: ring=%u/%u prime=%u eng=%d under=%lu primes=%lu "
+                          "tick(us) max=%u avg=%u",
+                          unsigned(g_aaJitter.occupancy()), unsigned(g_aaRing.capacity()),
+                          unsigned(g_aaJitter.primeElements()), g_aaJitter.engaged() ? 1 : 0,
+                          (unsigned long)g_aaJitter.underruns(),
+                          (unsigned long)g_aaJitter.primeEvents(), aaTickMaxUs, tickAvg);
+#ifdef CARSH_HAVE_OPENH264
+            unsigned decMax = 0, decAvg = 0, decN = 0;
+            aaDecodeStats.snapshot(decMax, decAvg, decN);
+            mLogger.Write(FROM, LogNotice,
+                          "aa-decode: n=%u dec(us) max=%u avg=%u q=%u pushed=%lu "
+                          "dropped=%lu",
+                          decN, decMax, decAvg, unsigned(aaAsync.queue().pending()),
+                          (unsigned long)aaAsync.queue().pushed(),
+                          (unsigned long)aaAsync.queue().dropped());
+#endif
+            aaTickMaxUs = aaTickSumUs = aaTickCount = 0;
+        }
 
         // Scheduler-aware sleep: yields to the decode task (and BT/net later)
         // between frames, ~30 fps. The decode task keeps the ring fed meanwhile.
