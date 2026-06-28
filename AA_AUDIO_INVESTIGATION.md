@@ -1,5 +1,16 @@
 # Investigation: choppy Android Auto audio
 
+> **Update 2026-06-28 (host work, NOT yet bench-validated):** the mechanism was
+> confirmed by code-reading (see "Root cause" below), instrumentation was added
+> (steps 1–3), and the two low-risk fixes — a **prebuffer/jitter buffer on
+> `g_aaRing`** and **decoupling H.264 decode from the audio-refill loop via an AU
+> queue** — are implemented, host-compiled, and host-tested (`JitterBuffer`,
+> `AuQueue`, `AsyncH264Decoder` suites; 181 tests green). The dedicated-A72-core
+> decode (candidate fix #1) is provided as a **compiling scaffold**
+> (`device/CircleAaDecodeCore.h`), deliberately not wired. **None of this is proven
+> to fix the choppiness** — the symptom only reproduces on hardware and there has
+> been no bench listen yet. See "What changed" + "Bench validation" at the bottom.
+
 **Status:** open. AA video + audio both work end-to-end on the real Pi 4 (CA525 dongle
 + Galaxy S23 Ultra over USB), validated on the bench 2026-06-28. Video projects and
 auto-displays; AA media audio plays out the 3.5 mm (PWM) jack. **But the audio is
@@ -101,6 +112,67 @@ This is the explicitly-anticipated next step in `scripts/fetch_openh264.sh`:
 - If clock drift is real, add light resampling / drop-or-dup a sample on sustained
   drift, or drive the producer/consumer from a shared clock.
 
+## Root cause (confirmed by reading; mechanism, not yet bench-measured)
+
+Circle runs a **cooperative scheduler on a single core (core 0)**. `CircleDecodeTask`,
+`CircleBtRunLoopTask`, and the UI loop are all cooperative tasks there; they only
+switch at `Yield()`/`MsSleep()`. The PWM output is the exception — its DMA completion
+runs in **IRQ context**, which *does* preempt, so the consumer keeps pulling
+`g_aaRing` at a steady 48 kHz no matter what core 0 is doing.
+
+Two things then combine to starve the producer:
+
+1. **Decode ran inline on the refill loop.** `CircleAaDriver::tick()` →
+   `AaConnection::poll()` (up to 256×/tick) → `AaProjection::onAvMedia`. For a video
+   frame that called `CircleH264Decoder::feed()` (openh264) **synchronously, in the
+   same loop iteration that writes AA audio into `g_aaRing`**. openh264 doesn't yield,
+   so a long keyframe decode blocks core 0 — and thus the audio refill — for its whole
+   duration while the IRQ keeps draining the ring.
+2. **No prebuffer + hard fallthrough.** Playback started at `readable() > 0`, so the
+   ring hovered near-empty (producer and consumer both run at real-time rate). Any
+   stall from (1) instantly underran, and `BtMixSink::render` then abandoned AA for
+   the (silent) local engine on the short read — turning each dip into an audible
+   click rather than a graceful silent pad.
+
+The 1 s ring capacity never helped because nothing kept it *filled*. The "slightly
+laggy video" is the same single-core-decode bottleneck, which is why the dedicated
+core is expected to help both.
+
+## What changed (host-tested; bench-validation still required)
+
+New, platform-independent + host-tested:
+- `src/audio/JitterBuffer.h` — consumer-side prebuffer for `g_aaRing`: waits until
+  `kAaPrimeMs` (≈120 ms, tunable in `kernel.cpp`) is buffered before playing, emits
+  **silence on a short read while keeping AA as the active source** (kills the
+  source-switch click), re-primes before resuming, and disengages + discards the tail
+  when the stream stops. Counters (`underruns`, `primeEvents`, occupancy) drive the
+  logs. Tests: `tests/audio/JitterBuffer_test.cpp`.
+- `src/aa/AuQueue.h` — framed lock-free SPSC byte ring for whole H.264 access units
+  (single-publish framing so the consumer never sees a half-written AU).
+- `src/aa/AsyncH264Decoder.h` — an `IH264Decoder` whose `feed()` just **enqueues** the
+  AU (cheap) and whose `pump()` runs the real decoder elsewhere; carries the A/B
+  "skip decode" toggle (step 3). Tests: `tests/aa/AuQueue_test.cpp`.
+
+Wired into the device image (compiles with the cross toolchain; **not** runnable on
+the host — no audio sink / no Circle):
+- `device/kernel.cpp` — `BtMixSink::render` now drives AA through `g_aaJitter`; the
+  projection feeds `AsyncH264Decoder` instead of the decoder directly; a new
+  cooperative `CircleAaDecodeTask` pumps openh264 off the UI loop; per-second
+  serial health logs (`aa-audio:` ring/underruns/prime/tick-µs, `aa-decode:`
+  decode-µs/queue/drops) + on-screen `au=` underrun counter. The first-frame
+  auto-show was moved to the UI task (it sends `VIDEO_FOCUS` over the transport,
+  which must stay on the UI thread now that decode is off it).
+- `device/CircleAaDecodeTask.h` — the cooperative decode pump + `AaDecodeStats`.
+- `device/CircleAaDecodeCore.h` — **scaffold only**, the `CMultiCoreSupport`
+  dedicated-core version; not constructed. Its header lists the bench bring-up steps
+  (double-buffer the frame, cache maintenance, atomic cross-core flags) that MUST be
+  done before wiring it.
+
+Expected effect (hypothesis, unproven): even on one core, the prebuffer should absorb
+a single-AU decode stall and the decoupling stops decode sitting *inside* the audio
+write, so underruns should drop sharply. The dedicated core (scaffold) is the further
+step for sustained throughput / the laggy video.
+
 ## Validation (bench-only)
 
 The fast loop (see `CLAUDE.md` → "The bench loop"): build
@@ -116,6 +188,30 @@ Heads-up from this session: the **64 KB bulk-IN buffers** fix (in
 `device/CircleAoaTransport.h`) is what made the USB transport stable — do not shrink
 them. And the dongle wedges across Pi reboots; re-plug it to recover.
 
+### Bench checklist for the new prebuffer + decouple work
+
+1. **Confirm the mechanism (step 2/3) before trusting the fix.** Read the new logs:
+   - `aa-audio: ring=… prime=… eng=… under=… primes=… tick(us) max=… avg=…`
+   - `aa-decode: n=… dec(us) max=… avg=… q=… pushed=… dropped=…`
+   With music playing, watch whether `under=` climbs in lockstep with `dec(us) max`
+   spikes / `q=` (queue) backing up. That correlation IS the prime hypothesis.
+2. **A/B the decode (cheap, decisive).** Build with decode skipped:
+   `make CARSH_HAVE_OPENH264=1 CPPFLAGS=-DCARSH_AA_SKIP_DECODE` and listen. AUs still
+   drain (no queue backup) but openh264 never runs. If audio goes smooth, decode load
+   is confirmed as the cause — and the dedicated-core scaffold becomes the priority.
+3. **Then test the real fix build** (`make CARSH_HAVE_OPENH264=1`, decode on): success
+   = `under=` stays at/near 0 and `au=` on screen stops climbing through minutes of
+   music + nav voice. If underruns drop but aren't zero, raise `kAaPrimeMs` in
+   `kernel.cpp` (more latency, more slack); if audio noticeably lags the video, lower
+   it. If `dropped=` on the AU queue climbs, decode can't keep up on one core → wire
+   the `CircleAaDecodeCore` scaffold (do its header checklist first).
+4. **Watch for regressions** the host can't see: video tearing/lag from the moved
+   decode, the auto-show still firing once, and the `alive:`/`inFlight` transport
+   health staying as before (the 64 KB buffers + this change are independent).
+
+**Do not mark this fixed without completing 3.** Host tests only prove the buffer/queue
+logic, not that the Pi's audio is smooth.
+
 ## Key files
 
 | File | Role |
@@ -126,7 +222,11 @@ them. And the dongle wedges across Pi reboots; re-plug it to recover.
 | `src/aa/AaProjection.h` | routes `onAvMedia` → decoder (video) / `playAudio` (audio) |
 | `device/CirclePwmSoundDevice.h` | PWM jack output (the steady-rate consumer) |
 | `src/audio/PcmRing.h` | the SPSC ring (`g_aaRing`) |
-| `device/CircleDecodeTask.h`, `CircleBtRunLoopTask.h` | existing multi-core/task scaffolds to model a decode core on |
+| `src/audio/JitterBuffer.h` | **new** — prebuffer/underrun handler over `g_aaRing` (fix #2) |
+| `src/aa/AuQueue.h`, `src/aa/AsyncH264Decoder.h` | **new** — AU queue + async decoder (fix #3, decouple) |
+| `device/CircleAaDecodeTask.h` | **new** — cooperative decode pump + `AaDecodeStats` (timing) |
+| `device/CircleAaDecodeCore.h` | **new scaffold** — dedicated-A72-core decode (`CMultiCoreSupport`), not wired |
+| `device/CircleDecodeTask.h`, `CircleBtRunLoopTask.h` | existing cooperative-task patterns to model the decode pump on |
 
 ## Context / prior art
 
