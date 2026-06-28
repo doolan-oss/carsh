@@ -49,7 +49,9 @@ private:
     carsh::aa::AaConnection* conn_ = nullptr;
     int lastState_ = -1;
     unsigned ticks_ = 0;
-    unsigned lastInErrSeq_ = 0;  // tracks the transport's IRQ-stashed bulk-IN error seq
+    unsigned lastInErrSeq_ = 0;   // tracks the transport's IRQ-stashed bulk-IN error seq
+    unsigned lastOutErrSeq_ = 0;  // tracks the bulk-OUT error seq (task-context capture)
+    unsigned inRestarts_ = 0;     // bounded bulk-IN re-post attempts after a stall
 };
 
 }  // namespace carsh::device
