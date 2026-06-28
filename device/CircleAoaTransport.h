@@ -61,6 +61,22 @@ public:
     // a transfer error and logged by the driver from task context (see inCompletion).
     unsigned lastInUsbErr() const { return m_lastInUsbErr; }
     unsigned inErrSeq() const { return m_inErrSeq; }
+    // Bulk-IN diagnostics (xHCI bulk-reset hunt): the result length reported on the
+    // last IN error (a length > kInTransfer points at a babble/over-run), and how many
+    // bulk-IN URBs are still posted. inFlight()==0 means the IN pipe is fully dead and
+    // the head unit is deaf — the driver re-posts (restartInPolling) and logs it.
+    unsigned lastInResultLen() const { return m_lastInResultLen; }
+    unsigned inFlight() const { return m_inFlight; }
+    unsigned ringUsed() const { return (m_ringTail - m_ringHead) & kRingMask; }
+    // Last bulk-OUT TUSBError + counter (write() runs in task context, so it captures
+    // the error directly from an owned URB — unlike the IRQ-context IN path).
+    unsigned lastOutUsbErr() const { return m_lastOutUsbErr; }
+    unsigned outErrSeq() const { return m_outErrSeq; }
+
+    // Re-post the bulk-IN URBs after the pipe stalled. ONLY safe to call from task
+    // context when inFlight()==0 (no completion routine is pending, so the buffers are
+    // free of any in-flight URB). Returns true if at least one URB was posted.
+    bool restartInPolling();
 
     // IAaTransport.
     int read(uint8_t* buf, size_t len, uint32_t timeoutMs) override;
@@ -91,6 +107,10 @@ private:
     volatile unsigned m_txBytes;
     volatile unsigned m_lastInUsbErr;
     volatile unsigned m_inErrSeq;
+    volatile unsigned m_lastInResultLen;  // result length at the last bulk-IN error
+    volatile unsigned m_inFlight;         // bulk-IN URBs currently posted
+    volatile unsigned m_lastOutUsbErr;    // TUSBError of the last bulk-OUT failure
+    volatile unsigned m_outErrSeq;        // bulk-OUT failure counter
 };
 
 // Factory hook — called from the patched CUSBDeviceFactory (see

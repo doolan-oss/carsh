@@ -16,6 +16,22 @@ namespace {
 
 const char From[] = "aa";
 
+// Decode a Circle TUSBError (usb.h enum order) for the serial log, so a bulk-reset
+// shows as e.g. "Babble" instead of a bare "2". Babble/over-run on bulk-IN is the
+// prime suspect for the non-deterministic AA video stall.
+const char* usbErrName(unsigned e) {
+    static const char* const kNames[] = {
+        "Stall", "Transaction", "Babble", "FrameOverrun", "DataToggle",
+        "HostBus", "Split", "Timeout", "Aborted", "Unknown",
+    };
+    return e < (sizeof(kNames) / sizeof(kNames[0])) ? kNames[e] : "?";
+}
+
+// Bounded re-post attempts after the bulk-IN pipe goes fully dead, so a wedged
+// endpoint doesn't churn forever — if these don't revive it, the dongle re-cycle
+// (rebind) is the only recovery and the log says so.
+constexpr unsigned kMaxInRestarts = 5;
+
 const char* stateName(carsh::aa::AaState s) {
     using S = carsh::aa::AaState;
     switch (s) {
@@ -59,6 +75,8 @@ void CircleAaDriver::teardown() {
     mbed_ = nullptr;  // freed via crypto_ above (same object); just drop the alias
     lastState_ = -1;
     lastInErrSeq_ = 0;
+    lastOutErrSeq_ = 0;
+    inRestarts_ = 0;  // re-post budget is per-connection; the dongle re-cycle resets it
 }
 
 void CircleAaDriver::tick() {
@@ -143,13 +161,42 @@ void CircleAaDriver::tick() {
     }
 
     // Surface any bulk-IN transfer error the transport stashed from IRQ context (it
-    // can't log there). usbErr is the Circle TUSBError; after this the IN polling has
-    // stopped and the dongle typically re-enumerates.
+    // can't log there). The decoded TUSBError + the result length pin down the failure
+    // mode (Babble / length > 16384 = the dongle over-ran the IN buffer). After an
+    // error that URB stopped; once ALL bulk-IN URBs have stopped (inFlight==0) the head
+    // unit is deaf, so attempt a bounded, logged re-post — race-free precisely because
+    // nothing is in flight.
     if (aa->inErrSeq() != lastInErrSeq_) {
         lastInErrSeq_ = aa->inErrSeq();
         CLogger::Get()->Write(From, LogWarning,
-                              "bulk-IN transfer error (usbErr=%u) — IN polling stopped",
-                              aa->lastInUsbErr());
+                              "bulk-IN error: %s (usbErr=%u) resultLen=%u inFlight=%u "
+                              "ring=%u rx=%u",
+                              usbErrName(aa->lastInUsbErr()), aa->lastInUsbErr(),
+                              aa->lastInResultLen(), aa->inFlight(), aa->ringUsed(),
+                              aa->rxBytes());
+        if (aa->inFlight() == 0) {
+            if (inRestarts_ < kMaxInRestarts) {
+                ++inRestarts_;
+                const bool ok = aa->restartInPolling();
+                CLogger::Get()->Write(From, ok ? LogNotice : LogError,
+                                      "bulk-IN fully stalled — re-post #%u %s",
+                                      inRestarts_, ok ? "submitted" : "FAILED");
+            } else {
+                CLogger::Get()->Write(From, LogError,
+                                      "bulk-IN dead after %u re-posts — awaiting dongle "
+                                      "re-cycle", inRestarts_);
+            }
+        }
+    }
+
+    // Surface any bulk-OUT failure. write() runs in task context, so the transport
+    // captured the real TUSBError from its own URB (the IN path can only stash from
+    // IRQ). A stall/timeout here means the phone stopped draining our OUT endpoint.
+    if (aa->outErrSeq() != lastOutErrSeq_) {
+        lastOutErrSeq_ = aa->outErrSeq();
+        CLogger::Get()->Write(From, LogWarning, "bulk-OUT error: %s (usbErr=%u) tx=%u",
+                              usbErrName(aa->lastOutUsbErr()), aa->lastOutUsbErr(),
+                              aa->txBytes());
     }
 
     const int st = static_cast<int>(conn_->state());
@@ -160,8 +207,15 @@ void CircleAaDriver::tick() {
         CLogger::Get()->Write(From, LogNotice, "state -> %s (tx=%u rx=%u bytes)",
                               stateName(conn_->state()), aa->txBytes(), aa->rxBytes());
     } else if (heartbeat) {
-        CLogger::Get()->Write(From, LogNotice, "alive: state=%s tx=%u rx=%u bytes",
-                              stateName(conn_->state()), aa->txBytes(), aa->rxBytes());
+        // Transport-health heartbeat: tx/rx plus the bulk-pipe state, so a stall is
+        // visible even when the AaState doesn't change (inFlight dropping to 0, the ring
+        // backing up, or the error counters ticking up are the tells).
+        CLogger::Get()->Write(From, LogNotice,
+                              "alive: state=%s tx=%u rx=%u inFlight=%u ring=%u "
+                              "inErr=%u outErr=%u",
+                              stateName(conn_->state()), aa->txBytes(), aa->rxBytes(),
+                              aa->inFlight(), aa->ringUsed(), aa->inErrSeq(),
+                              aa->outErrSeq());
     }
     // TLS bring-up telemetry (rung 4b). In the handshake phase, surface whether
     // mbedTLS made local progress — a ClientHello reaching the wire makes tx grow
