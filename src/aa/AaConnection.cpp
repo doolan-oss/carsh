@@ -134,7 +134,14 @@ std::vector<uint8_t> buildServiceDiscoveryResponse() {
 }  // namespace
 
 AaConnection::AaConnection(AaMessenger& msger, IAaCrypto& crypto, AaConnectionCallbacks cbs)
-    : msger_(msger), crypto_(crypto), cbs_(std::move(cbs)) {}
+    : msger_(msger), crypto_(crypto), cbs_(std::move(cbs)) {
+    // Decrypt ENCRYPTED frames per-frame inside the messenger (aasdk model) — required
+    // for multi-frame (large keyframe) messages; see AaMessenger::setDecryptor.
+    msger_.setDecryptor([this](const uint8_t* p, size_t n) -> std::vector<uint8_t> {
+        if (!crypto_.handshakeDone()) return {};
+        return crypto_.decrypt(p, n);
+    });
+}
 
 bool AaConnection::channelOpen(ChannelId ch) const {
     const int i = static_cast<int>(ch);
@@ -632,17 +639,16 @@ bool AaConnection::poll(uint32_t timeoutMs) {
     size_t payloadLen = msg.payload.size();
     const bool encrypted = (msg.encryption == EncryptionType::Encrypted);
 
-    if (encrypted) {
+    // The messenger decrypts ENCRYPTED frames per-frame and sets msg.decrypted, leaving
+    // msg.messageId + msg.payload ready (id stripped). The branch below is a fallback for
+    // a messenger with no decryptor wired (shouldn't happen in production).
+    if (encrypted && !msg.decrypted) {
         if (!crypto_.handshakeDone()) {
-            // Encrypted frame before the handshake finished — trace it (id sentinel)
-            // then ignore; it should not happen on a healthy link.
             if (cbs_.onRxFrame) cbs_.onRxFrame(msg.channel, 0xFFF0, true, msg.payload.size());
             return true;
         }
         decrypted = crypto_.decrypt(msg.payload.data(), msg.payload.size());
         if (decrypted.size() < 2) {
-            // Decrypt produced nothing usable — a prime suspect if the phone then
-            // resets. Trace with a distinct sentinel id so the bench sees it.
             if (cbs_.onRxFrame) cbs_.onRxFrame(msg.channel, 0xFFF1, true, decrypted.size());
             return true;
         }

@@ -6,9 +6,12 @@
 namespace carsh::aa {
 namespace {
 
-// RX accumulator capacity: a legal frame is at most a few bytes over one USB
-// transfer, so three transfer-sizes holds a partial frame plus a full fresh read.
-constexpr size_t kRxAccCap = 3 * kUsbTransferSize;
+// RX accumulator capacity. A single AA frame's payload size is a uint16, so one frame
+// can be up to 8 (max header) + 65535 bytes — far more than one USB transfer (video
+// keyframes arrive as large frames). The accumulator must hold the largest legal frame
+// plus a fresh read, or it would clear mid-frame and drop bytes — which is fatal on an
+// encrypted channel: dropping ciphertext desyncs the TLS stream permanently.
+constexpr size_t kRxAccCap = 8 + 0xFFFF + kUsbTransferSize;  // ~82 KB
 
 inline uint16_t readBe16(const uint8_t* p) {
     return static_cast<uint16_t>((static_cast<uint16_t>(p[0]) << 8) | p[1]);
@@ -44,53 +47,59 @@ void AaMessenger::processFrame(const uint8_t* raw, ChannelId channel,
     if (ch > kMaxChannel) return;  // unknown channel — skip
 
     const bool isFirst = (frameType == FrameType::First);
-
-    // total_size: the full reassembled message size. Explicit 4-byte field on
-    // FIRST; for BULK (single frame) it equals this frame's payload.
-    uint32_t totalSize = framePayloadSize;
-    if (isFirst) totalSize = readBe32(raw + 4);
-
     const uint8_t* payload = raw + hdrLen;
     Reasm& r = reasm_[static_cast<size_t>(ch)];
 
     if (isFirst || frameType == FrameType::Bulk) {
-        // Start a new message.
+        // Start a new message. Reassembly is FRAME-TYPE driven (accumulate until LAST/
+        // BULK), like aasdk — NOT size driven, since the FIRST frame's total_size is the
+        // ciphertext sum which doesn't match the decrypted plaintext length.
         r.buf.clear();
-        r.active = false;
-        if (totalSize > kMaxMessageSize) return;  // implausible — drop
-        r.buf.resize(totalSize);
-        r.totalExpected = totalSize;
-        r.received = 0;
+        r.active = true;
+        r.decrypted = false;
         r.msgType = msgType;
         r.encryption = enc;
-        r.active = true;
+        if (isFirst) {
+            const uint32_t totalSize = readBe32(raw + 4);
+            if (totalSize > kMaxMessageSize) {  // implausible — drop
+                r.active = false;
+                return;
+            }
+            r.buf.reserve(totalSize);  // hint only
+        }
     }
 
     if (!r.active) return;  // MIDDLE/LAST with no active message — drop
 
-    // Append this frame's payload (clamped to the declared total).
-    size_t toCopy = framePayloadSize;
-    if (r.received + toCopy > r.totalExpected) toCopy = r.totalExpected - r.received;
-    if (toCopy > 0) {
-        std::memcpy(r.buf.data() + r.received, payload, toCopy);
-        r.received += toCopy;
+    // Append this frame's payload. ENCRYPTED frames are decrypted INDIVIDUALLY (aasdk
+    // model) — each frame is its own complete TLS record(s); reassembling ciphertext and
+    // decrypting once corrupts multi-frame (large keyframe) messages and desyncs the TLS
+    // stream. The decrypted plaintext chunks are concatenated into the message.
+    if (enc == EncryptionType::Encrypted && decryptor_) {
+        std::vector<uint8_t> plain = decryptor_(payload, framePayloadSize);
+        r.buf.insert(r.buf.end(), plain.begin(), plain.end());
+        r.decrypted = true;
+    } else {
+        r.buf.insert(r.buf.end(), payload, payload + framePayloadSize);
     }
 
-    const bool complete = (frameType == FrameType::Bulk) ||
-                          (frameType == FrameType::Last) ||
-                          (r.received >= r.totalExpected);
+    const bool complete = (frameType == FrameType::Bulk) || (frameType == FrameType::Last);
     if (!complete) return;
 
     out.channel = channel;
     out.msgType = r.msgType;
     out.encryption = r.encryption;
+    out.decrypted = r.decrypted;
 
-    if (r.encryption == EncryptionType::Plain && r.received >= 2) {
+    // Plaintext (PLAIN, or ENCRYPTED-and-decrypted) carries the 2-byte message id; a
+    // still-ciphertext payload (no decryptor) keeps id=0 for an upstream decrypt.
+    const bool havePlaintext = (r.encryption == EncryptionType::Plain) || r.decrypted;
+    if (havePlaintext && r.buf.size() >= 2) {
         out.messageId = readBe16(r.buf.data());
-        out.payload.assign(r.buf.begin() + 2, r.buf.begin() + static_cast<long>(r.received));
+        out.payload.assign(r.buf.begin() + 2, r.buf.end());
     } else {
         out.messageId = 0;
-        out.payload.assign(r.buf.begin(), r.buf.begin() + static_cast<long>(r.received));
+        out.payload.assign(r.buf.begin(), r.buf.end());
     }
 
     r.buf.clear();
