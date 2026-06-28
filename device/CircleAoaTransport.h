@@ -88,9 +88,16 @@ private:
     void inCompletion(CUSBRequest* pURB);
     static void inCompletionStub(CUSBRequest* pURB, void* pParam, void* pContext);
 
-    static constexpr unsigned kRingSize = 64 * 1024;
+    static constexpr unsigned kRingSize = 256 * 1024;  // RX byte ring (power of two)
     static constexpr unsigned kRingMask = kRingSize - 1;
-    static constexpr unsigned kInTransfer = 16384;
+    // Each bulk-IN URB buffer holds a WHOLE video keyframe (~64 KB seen on the bench).
+    // Circle's xHCI endpoint allows only 2 outstanding URBs (m_pURB[0]/[1]); on the PC
+    // harness we kept 8 small ones in flight and it never glitched. With only 2 slots,
+    // 16 KB each was too little — a bursty keyframe outran the buffering, corrupting the
+    // stream (a misaligned plaintext frame appeared mid-run) and eventually faulting the
+    // controller (xHCI completion code 4 on the IN endpoint -> hard hang). Bigger buffers
+    // give the dongle far more headroom between our completion+re-arm cycles.
+    static constexpr unsigned kInTransfer = 64 * 1024;
     // Keep multiple bulk-IN URBs posted so a posted buffer is always available during
     // the phone's channel-open/AV-setup burst (a single-buffer re-arm leaves gaps that
     // make the dongle reset). xHCI allows 2 outstanding URBs per endpoint.

@@ -7,6 +7,8 @@
 
 #include <circle/bcmframebuffer.h>
 #include <circle/devicenameservice.h>
+#include <circle/synchronize.h>  // EnableIRQs() for the panic-flush handler
+#include <circle/timer.h>        // CTimer::GetClockTicks() for the flush spin
 
 #include <cstdarg>
 #include <cstdio>
@@ -50,6 +52,26 @@
 #define FROM "carsh"
 
 namespace {
+// --- Panic flush over USB-C -------------------------------------------------
+// On an assert()/exception, Circle writes a LogPanic line + stack trace to the
+// current log target (here the USB-C CDC serial gadget) and then spins in for(;;).
+// But the gadget's TX is driven by the dwc2 USB IRQ, and the fault often fires
+// INSIDE the xHCI ISR (our bulk-IN completion runs in that context) with IRQs
+// masked — so the queued bytes never reach /dev/ttyACM0 and the board just goes
+// silent. Registered via CLogger::RegisterPanicHandler(), this runs right after the
+// panic text is queued: re-enable IRQs so the dwc2 TX can fire, then spin-pump the
+// gadget for a few seconds so the whole panic + backtrace flush to the host before
+// the halt. (We are dying anyway, so re-enabling IRQs mid-ISR is acceptable.)
+CUSBCDCGadget* g_panicGadget = nullptr;
+void carshPanicFlush(void) {
+    if (g_panicGadget == nullptr) return;
+    EnableIRQs();
+    const unsigned start = CTimer::GetClockTicks();  // free-running 1 MHz counter
+    while (CTimer::GetClockTicks() - start < 4u * 1000000u) {  // ~4 s
+        g_panicGadget->UpdatePlugAndPlay();
+    }
+}
+
 // Long-lived app state at file scope: the PcmRing's buffer is large (~1 s of
 // audio) and must not sit on the stack, and these persist across the run loop.
 constexpr unsigned kRate = 48000;
@@ -121,6 +143,10 @@ bool CKernel::Initialize(void) {
     mUsbGadgetOk = mSerialCDC.Initialize();
     if (mUsbGadgetOk) {
         new carsh::device::CircleUsbLog(&mSerialCDC, &mLogger, &mSerial);
+        // Let an assert/exception panic flush its message over USB-C before halting
+        // (the normal pump task is dead by then — see carshPanicFlush).
+        g_panicGadget = &mSerialCDC;
+        CLogger::Get()->RegisterPanicHandler(carshPanicFlush);
         for (unsigned i = 0; i < 400; ++i) {
             CScheduler::Get()->Yield();  // let the gadget PnP task run + host attach
             if (CDeviceNameService::Get()->GetDevice("utty1", FALSE)) break;
