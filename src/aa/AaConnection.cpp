@@ -230,8 +230,10 @@ void AaConnection::handleSslHandshake(const uint8_t* p, size_t n) {
 
 void AaConnection::handleServiceDiscoveryRequest(const uint8_t* /*p*/, size_t /*n*/) {
     std::vector<uint8_t> resp = buildServiceDiscoveryResponse();
-    sendEncryptedControl(static_cast<uint16_t>(ControlMsgId::ServiceDiscoveryResponse),
-                         resp.data(), resp.size());
+    // SPECIFIC, not control (aasdk ControlServiceChannel::sendServiceDiscoveryResponse).
+    sendEncrypted(ChannelId::Control,
+                  static_cast<uint16_t>(ControlMsgId::ServiceDiscoveryResponse),
+                  resp.data(), resp.size());
     state_ = AaState::Running;
 }
 
@@ -283,7 +285,7 @@ void AaConnection::handlePingRequest(const uint8_t* p, size_t n) {
     w.int32(1, id);
     w.tag(0, 2);
     w.varint(timestamp);
-    sendPlainControl(static_cast<uint16_t>(ControlMsgId::PingResponse), body.data(), body.size());
+    sendPlainSpecific(static_cast<uint16_t>(ControlMsgId::PingResponse), body.data(), body.size());
 }
 
 // The phone requests audio focus right after service discovery and BLOCKS waiting
@@ -315,16 +317,18 @@ void AaConnection::handleAudioFocusRequest(const uint8_t* p, size_t n) {
     }
     std::vector<uint8_t> body;
     pb::Writer(body).uint32(1, focusState);
-    sendEncryptedControl(static_cast<uint16_t>(ControlMsgId::AudioFocusResponse),
-                         body.data(), body.size());
+    sendEncrypted(ChannelId::Control,
+                  static_cast<uint16_t>(ControlMsgId::AudioFocusResponse), body.data(),
+                  body.size());
 }
 
 // Always grant navigation focus. NavFocusResponse{ focus_type = 1 (GAIN) }.
 void AaConnection::handleNavFocusRequest(const uint8_t* /*p*/, size_t /*n*/) {
     std::vector<uint8_t> body;
     pb::Writer(body).uint32(1, 1);  // GAIN
-    sendEncryptedControl(static_cast<uint16_t>(ControlMsgId::NavFocusResponse),
-                         body.data(), body.size());
+    sendEncrypted(ChannelId::Control,
+                  static_cast<uint16_t>(ControlMsgId::NavFocusResponse), body.data(),
+                  body.size());
 }
 
 void AaConnection::handleControl(uint16_t msgId, const uint8_t* p, size_t n) {
@@ -473,10 +477,10 @@ void AaConnection::handleInputChannel(uint16_t msgId, const uint8_t* p, size_t n
         // BindingResponse{ status = 1 (int32) = 0 (OK) }.
         std::vector<uint8_t> body;
         pb::Writer(body).int32(1, 0);
-        // BINDING_RESPONSE is a channel-CONTROL message (like setup responses).
-        sendEncryptedChannelControl(ChannelId::Input,
-                                    static_cast<uint16_t>(InputMsgId::BindingResponse),
-                                    body.data(), body.size());
+        // BINDING_RESPONSE is SPECIFIC (aasdk InputServiceChannel::sendBindingResponse).
+        sendEncrypted(ChannelId::Input,
+                      static_cast<uint16_t>(InputMsgId::BindingResponse), body.data(),
+                      body.size());
     } else if (cbs_.onChannelMessage) {
         cbs_.onChannelMessage(ChannelId::Input, msgId, p, n);
     }
@@ -500,10 +504,10 @@ void AaConnection::handleSensorChannel(uint16_t msgId, const uint8_t* p, size_t 
         // SensorStartResponseMessage{ status = 1 (int32) = 0 (OK) }.
         std::vector<uint8_t> resp;
         pb::Writer(resp).int32(1, 0);
-        // SENSOR_START_RESPONSE is a channel-CONTROL message (like setup responses).
-        sendEncryptedChannelControl(ChannelId::Sensor,
-                                    static_cast<uint16_t>(SensorMsgId::SensorStartResponse),
-                                    resp.data(), resp.size());
+        // SENSOR_START_RESPONSE is SPECIFIC (aasdk SensorServiceChannel::sendSensorStartResponse).
+        sendEncrypted(ChannelId::Sensor,
+                      static_cast<uint16_t>(SensorMsgId::SensorStartResponse), resp.data(),
+                      resp.size());
         // Remember this sensor as started so the periodic tick only feeds subscribed
         // sensors, and push one reading immediately so the phone unblocks quickly.
         if (sensorType < sensorStarted_.size()) sensorStarted_[sensorType] = true;
@@ -559,10 +563,11 @@ void AaConnection::sendAvSetupResponse(ChannelId ch, uint8_t /*configIndex*/) {
     w.uint32(1, 2);                  // media_status = OK (AVChannelSetupStatus::OK = 2)
     w.uint32(2, 1);                  // max_unacked (matches the functional NexusDrive HU)
     w.uint32(3, 0);                  // configs[0] = the HU's selected (only) config index
-    // SETUP_RESPONSE is a channel-CONTROL message; sending it SPECIFIC makes the phone
-    // treat it as stray media and never start the AV stream.
-    sendEncryptedChannelControl(ch, static_cast<uint16_t>(AvMsgId::SetupResponse),
-                                body.data(), body.size());
+    // SETUP_RESPONSE is SPECIFIC, NOT control (aasdk VideoServiceChannel/AudioServiceChannel
+    // ::sendAVChannelSetupResponse). Only CHANNEL_OPEN_RESPONSE is control. carsh sending
+    // this as control is what made the phone set the channel up but never START streaming.
+    sendEncrypted(ch, static_cast<uint16_t>(AvMsgId::SetupResponse), body.data(),
+                  body.size());
 }
 
 void AaConnection::sendMediaAck(ChannelId ch) {
