@@ -3,6 +3,7 @@
 
 #include <circle/devicenameservice.h>
 #include <circle/logger.h>
+#include <circle-mbedtls/threadingmodule.h>  // installs mbedTLS THREADING_ALT mutex glue
 
 #include <cstring>
 #include <vector>
@@ -55,7 +56,9 @@ void CircleAaDriver::teardown() {
     msger_ = nullptr;
     delete crypto_;
     crypto_ = nullptr;
+    mbed_ = nullptr;  // freed via crypto_ above (same object); just drop the alias
     lastState_ = -1;
+    lastInErrSeq_ = 0;
 }
 
 void CircleAaDriver::tick() {
@@ -68,6 +71,17 @@ void CircleAaDriver::tick() {
         teardown();
         boundDev_ = aa;
         if (aa != nullptr && aa->isAccessory()) {
+            // circle-mbedtls is built MBEDTLS_THREADING_C + MBEDTLS_THREADING_ALT, so
+            // mbedTLS's mutex callbacks MUST be installed (mbedtls_threading_set_alt)
+            // before any mbedTLS context is created — otherwise the default ALT
+            // mutex_lock is a fail-stub returning MBEDTLS_ERR_THREADING_BAD_INPUT_DATA
+            // (-0x001c) on the first lock, aborting the handshake before the
+            // ClientHello (observed on the bench: tx stuck at the VERSION_REQUEST).
+            // CTLSSimpleSupport would normally do this; carsh drives raw mbedTLS, so
+            // install it here. The function-static runs once, on the first bind (before
+            // the first crypto context) and persists across dongle reconnect cycles.
+            static CircleMbedTLS::CThreadingModule s_mbedThreading;
+            (void)s_mbedThreading;
             auto* crypto = new AaCryptoMbedTls(&CircleAaDriver::rngEntropy, &rng_);
             if (!crypto->init()) {
                 CLogger::Get()->Write(From, LogError,
@@ -75,6 +89,7 @@ void CircleAaDriver::tick() {
                                       crypto->lastError());
             }
             crypto_ = crypto;
+            mbed_ = crypto;  // typed alias for TLS telemetry below
             msger_ = new carsh::aa::AaMessenger(*aa);
             // Route channel traffic into the projection (video->decoder->screen,
             // audio->ring, focus/touch outbound) when one is wired (rung 6); else a
@@ -96,6 +111,17 @@ void CircleAaDriver::tick() {
                     CLogger::Get()->Write(From, LogNotice, "phone requested shutdown");
                 };
             }
+            // Diagnostic: log every received frame (esp. in the Running phase) on the
+            // serial console regardless of projection wiring, so we can see what the
+            // phone sends after service discovery.
+            cbs.onRxFrame = [](carsh::aa::ChannelId ch, uint16_t id, bool enc, size_t n) {
+                CLogger::Get()->Write(From, LogNotice, "rx frame ch=%u id=%04x enc=%u len=%u",
+                                      (unsigned)ch, (unsigned)id, enc ? 1u : 0u, (unsigned)n);
+            };
+            cbs.onTxFrame = [](carsh::aa::ChannelId ch, uint16_t id, bool enc) {
+                CLogger::Get()->Write(From, LogNotice, "tx frame ch=%u id=%04x enc=%u",
+                                      (unsigned)ch, (unsigned)id, enc ? 1u : 0u);
+            };
             conn_ = new carsh::aa::AaConnection(*msger_, *crypto_, cbs);
             if (projection_ != nullptr) projection_->setConnection(conn_);
             CLogger::Get()->Write(From, LogNotice, "uaa1 bound — sending VERSION_REQUEST");
@@ -106,20 +132,49 @@ void CircleAaDriver::tick() {
 
     if (conn_ == nullptr) return;
 
-    // Drain up to a few messages per tick (poll(0) is non-blocking — returns false
-    // when no complete frame is buffered).
-    for (int i = 0; i < 8; ++i) {
+    // Drain ALL buffered messages this tick (poll(0) is non-blocking — returns false
+    // when no complete frame is buffered). The phone fires a burst of ~12-20 channel-
+    // open + AV-setup messages in ~20ms right after service discovery and times out if
+    // the head unit doesn't answer them promptly; capping at a few per tick (one tick
+    // ≈ 33ms at 30fps) spread the replies across frames and tripped that timeout. The
+    // cap is a safety bound, not the steady state.
+    for (int i = 0; i < 256; ++i) {
         if (!conn_->poll(0)) break;
     }
 
+    // Surface any bulk-IN transfer error the transport stashed from IRQ context (it
+    // can't log there). usbErr is the Circle TUSBError; after this the IN polling has
+    // stopped and the dongle typically re-enumerates.
+    if (aa->inErrSeq() != lastInErrSeq_) {
+        lastInErrSeq_ = aa->inErrSeq();
+        CLogger::Get()->Write(From, LogWarning,
+                              "bulk-IN transfer error (usbErr=%u) — IN polling stopped",
+                              aa->lastInUsbErr());
+    }
+
     const int st = static_cast<int>(conn_->state());
-    if (st != lastState_) {
+    const bool changed = (st != lastState_);
+    const bool heartbeat = (++ticks_ % 60 == 0);
+    if (changed) {
         lastState_ = st;
-        CLogger::Get()->Write(From, LogNotice, "state -> %s (rx=%u bytes)",
-                              stateName(conn_->state()), aa->rxBytes());
-    } else if (++ticks_ % 60 == 0) {
-        CLogger::Get()->Write(From, LogNotice, "alive: state=%s rx=%u bytes",
-                              stateName(conn_->state()), aa->rxBytes());
+        CLogger::Get()->Write(From, LogNotice, "state -> %s (tx=%u rx=%u bytes)",
+                              stateName(conn_->state()), aa->txBytes(), aa->rxBytes());
+    } else if (heartbeat) {
+        CLogger::Get()->Write(From, LogNotice, "alive: state=%s tx=%u rx=%u bytes",
+                              stateName(conn_->state()), aa->txBytes(), aa->rxBytes());
+    }
+    // TLS bring-up telemetry (rung 4b). In the handshake phase, surface whether
+    // mbedTLS made local progress — a ClientHello reaching the wire makes tx grow
+    // past the version request — and any fatal mbedTLS error. If the pinned cipher
+    // suite is absent from circle-mbedtls (risk #4), the ClientHello is never
+    // produced: tx stays flat and mbedErr is nonzero. That distinguishes a local
+    // crypto failure from the phone rejecting/ignoring a well-formed handshake (tx
+    // grows, mbedErr stays 0, rx stays flat = phone silent).
+    if ((changed || heartbeat) && conn_->state() == carsh::aa::AaState::SslHandshake &&
+        mbed_ != nullptr) {
+        CLogger::Get()->Write(From, LogNotice, "tls: handshakeDone=%d mbedErr=-0x%04x",
+                              crypto_->handshakeDone() ? 1 : 0,
+                              static_cast<unsigned>(-mbed_->lastError()));
     }
 }
 

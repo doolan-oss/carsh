@@ -82,9 +82,10 @@ void driveToRunning(AaConnection& conn, FakeAaTransport& hu) {
 }
 
 void openChannel(AaConnection& conn, FakeAaTransport& hu, ChannelId ch) {
+    // The phone opens a channel by sending CHANNEL_OPEN_REQUEST on that channel itself.
     std::vector<uint8_t> openReq;
     pb::Writer(openReq).uint32(2, static_cast<uint32_t>(ch));
-    phoneSend(hu, ChannelId::Control, EncryptionType::Encrypted, 0x0007, openReq);
+    phoneSend(hu, ch, EncryptionType::Encrypted, 0x0007, openReq);
     REQUIRE(conn.poll(0));
     REQUIRE(conn.channelOpen(ch));
 }
@@ -154,7 +155,7 @@ TEST(AaProjection, EndToEndWiring) {
     // Off-video touches (negative source coords) are dropped.
     CHECK(!proj.forwardTouch(-1, 5, TouchAction::Press, 42));
 
-    // Focus -> VIDEO_FOCUS_INDICATION on the video channel.
+    // Focus -> VIDEO_FOCUS_REQUEST on the video channel (HU drives projection).
     hu.clearSent();
     CHECK(proj.setFocus(true));
     CHECK(huSent(hu, ChannelId::Video,

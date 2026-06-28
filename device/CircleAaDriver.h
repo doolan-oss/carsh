@@ -21,6 +21,8 @@
 
 namespace carsh::device {
 
+class AaCryptoMbedTls;  // typed handle for TLS bring-up diagnostics (lastError)
+
 class CircleAaDriver {
 public:
     ~CircleAaDriver();
@@ -42,10 +44,12 @@ private:
     carsh::aa::AaProjection* projection_ = nullptr;  // optional rung-6 wiring
     void* boundDev_ = nullptr;  // CAndroidAutoDevice* — compared only, never deref'd stale
     carsh::aa::IAaCrypto* crypto_ = nullptr;
+    AaCryptoMbedTls* mbed_ = nullptr;  // == crypto_, typed, for lastError() telemetry
     carsh::aa::AaMessenger* msger_ = nullptr;
     carsh::aa::AaConnection* conn_ = nullptr;
     int lastState_ = -1;
     unsigned ticks_ = 0;
+    unsigned lastInErrSeq_ = 0;  // tracks the transport's IRQ-stashed bulk-IN error seq
 };
 
 }  // namespace carsh::device

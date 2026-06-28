@@ -61,6 +61,21 @@ struct AaConnectionCallbacks {
     // The phone asked for a video focus change (VIDEO_FOCUS_REQUEST{mode}); the app
     // typically mirrors it back with sendVideoFocus once the tab state agrees.
     std::function<void(VideoFocusMode mode)> onVideoFocusRequest;
+
+    // Diagnostic tap: fired for EVERY frame the messenger receives, BEFORE decrypt or
+    // dispatch (raw on-wire view). channel/encrypted/rawLen describe the frame as it
+    // arrived (wireMsgId is meaningful only for plaintext frames; for encrypted ones
+    // the real id lives inside the ciphertext). Used by the device build to observe
+    // what the phone sends in the Running phase over the serial console; unused/no-op
+    // in host tests. Keep it cheap — it runs in the receive path.
+    std::function<void(ChannelId channel, uint16_t wireMsgId, bool encrypted,
+                       size_t rawLen)>
+        onRxFrame;
+
+    // Diagnostic tap: fired for every frame the HU SENDS, with the resolved channel +
+    // msgId + encrypted flag (before framing/encryption). Symmetric to onRxFrame so the
+    // device build can confirm on the serial console that it answers the phone's burst.
+    std::function<void(ChannelId channel, uint16_t msgId, bool encrypted)> onTxFrame;
 };
 
 class AaConnection {
@@ -80,23 +95,38 @@ public:
     // --- rung 4c: outbound channel messages the app drives (rung 6 wiring) ----
     // Grant/revoke video focus to the phone (VIDEO_FOCUS_INDICATION on the video
     // channel) — call when the AA tab gains/loses focus. False until video is open.
-    bool sendVideoFocus(VideoFocusMode mode);
+    bool sendVideoFocus(VideoFocusMode mode, bool unrequested = false);
     // Forward a touch to the phone (INPUT_EVENT_INDICATION on the input channel).
     // x/y are AA source-frame coords (0..799 / 0..479). False until input is open.
     bool sendTouch(TouchAction action, uint32_t x, uint32_t y, uint64_t timestamp);
+
+    // Push the periodic sensor readings the phone needs to enable projection: a
+    // DRIVING_STATUS (unrestricted/parked) + NIGHT_MODE event. The phone WAITS on
+    // driving status before it will start the AV stream, so the driver must call this
+    // on a ~1 Hz tick once Running + the sensor channel is open (matches the reference;
+    // a no-op otherwise).
+    void sendSensorTick();
 
 private:
     bool sendPlainSpecific(uint16_t msgId, const uint8_t* p, size_t n);
     bool sendPlainControl(uint16_t msgId, const uint8_t* p, size_t n);
     bool sendEncrypted(ChannelId ch, uint16_t msgId, const uint8_t* p, size_t n);
     bool sendEncryptedControl(uint16_t msgId, const uint8_t* p, size_t n);
+    // Encrypted CONTROL-type message on an arbitrary channel (e.g. the channel-open
+    // response, which the phone expects back on the channel being opened).
+    bool sendEncryptedChannelControl(ChannelId ch, uint16_t msgId, const uint8_t* p,
+                                     size_t n);
 
     void handleControl(uint16_t msgId, const uint8_t* p, size_t n);
     void handleVersionResponse(const uint8_t* p, size_t n);
     void handleSslHandshake(const uint8_t* p, size_t n);
     void handleServiceDiscoveryRequest(const uint8_t* p, size_t n);
-    void handleChannelOpenRequest(const uint8_t* p, size_t n);
+    // frameCh is the channel the request ARRIVED on — authoritative (the phone sends
+    // CHANNEL_OPEN_REQUEST on the target channel, not Control).
+    void handleChannelOpenRequest(ChannelId frameCh, const uint8_t* p, size_t n);
     void handlePingRequest(const uint8_t* p, size_t n);
+    void handleAudioFocusRequest(const uint8_t* p, size_t n);
+    void handleNavFocusRequest(const uint8_t* p, size_t n);
 
     // Non-control channel dispatch (Running phase).
     void handleChannelMessage(ChannelId ch, uint16_t msgId, const uint8_t* p, size_t n);
@@ -119,6 +149,10 @@ private:
     std::array<bool, static_cast<size_t>(kMaxChannel) + 1> channelOpen_{};
     // Per-AV-channel session id from START_INDICATION, echoed in the media ack.
     std::array<int32_t, static_cast<size_t>(kMaxChannel) + 1> avSession_{};
+    // Which sensor types the phone has actually started (SENSOR_START_REQUEST), so the
+    // periodic tick only emits events the phone subscribed to — sending unsolicited
+    // sensor data (e.g. night mode for a sensor it never started) makes it bail.
+    std::array<bool, 32> sensorStarted_{};
 };
 
 }  // namespace carsh::aa
