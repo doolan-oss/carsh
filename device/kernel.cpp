@@ -7,6 +7,8 @@
 
 #include <circle/bcmframebuffer.h>
 #include <circle/devicenameservice.h>
+#include <circle/synchronize.h>  // EnableIRQs() for the panic-flush handler
+#include <circle/timer.h>        // CTimer::GetClockTicks() for the flush spin
 
 #include <cstdarg>
 #include <cstdio>
@@ -50,6 +52,26 @@
 #define FROM "carsh"
 
 namespace {
+// --- Panic flush over USB-C -------------------------------------------------
+// On an assert()/exception, Circle writes a LogPanic line + stack trace to the
+// current log target (here the USB-C CDC serial gadget) and then spins in for(;;).
+// But the gadget's TX is driven by the dwc2 USB IRQ, and the fault often fires
+// INSIDE the xHCI ISR (our bulk-IN completion runs in that context) with IRQs
+// masked — so the queued bytes never reach /dev/ttyACM0 and the board just goes
+// silent. Registered via CLogger::RegisterPanicHandler(), this runs right after the
+// panic text is queued: re-enable IRQs so the dwc2 TX can fire, then spin-pump the
+// gadget for a few seconds so the whole panic + backtrace flush to the host before
+// the halt. (We are dying anyway, so re-enabling IRQs mid-ISR is acceptable.)
+CUSBCDCGadget* g_panicGadget = nullptr;
+void carshPanicFlush(void) {
+    if (g_panicGadget == nullptr) return;
+    EnableIRQs();
+    const unsigned start = CTimer::GetClockTicks();  // free-running 1 MHz counter
+    while (CTimer::GetClockTicks() - start < 4u * 1000000u) {  // ~4 s
+        g_panicGadget->UpdatePlugAndPlay();
+    }
+}
+
 // Long-lived app state at file scope: the PcmRing's buffer is large (~1 s of
 // audio) and must not sit on the stack, and these persist across the run loop.
 constexpr unsigned kRate = 48000;
@@ -58,19 +80,36 @@ constexpr uint8_t kChannels = 2;
 carsh::library::Database g_db;
 carsh::audio::PcmRing<float> g_ring(kRate * kChannels);  // ~1 s stereo (local)
 carsh::audio::PcmRing<float> g_btRing(kRate * kChannels);  // A2DP jitter+decode
+// Android Auto media audio (ch=4, 48 kHz stereo PCM from the phone). Filled by the
+// AA projection's playAudio hook; consumed by the PWM sink below, same as A2DP.
+carsh::audio::PcmRing<float> g_aaRing(kRate * kChannels);  // ~1 s stereo
 carsh::audio::AudioEngine g_engine(&g_ring, kChannels);
 carsh::dsp::EqProcessor g_eq(kRate);
 
-// PWM output sink: plays decoded A2DP PCM when the BT ring has data, otherwise the
-// local player engine. The DMA/IRQ callback calls render(); the BT ring is the
-// SPSC consumer here (producer is the A2DP decode callback). BT bypasses the
-// engine's volume/EQ for now (the phone controls volume).
+// Head-unit master output gain (dB-mapped, from the left volume rail). Applied to AA
+// and A2DP here; the local player engine applies the SAME value internally via
+// setMasterVolume, so all three sources track the one HU volume control. Android Auto
+// has no phone-side volume (unlike A2DP/AVRCP), so the HU gain is the only control.
+float g_masterGain = 0.0f;
+
+// PWM output sink. Source priority: Android Auto audio > A2DP > the local player
+// engine — whichever has buffered PCM wins (in practice only one is active). AA and
+// BT are raw PCM, so the HU master gain is applied here; the local engine already
+// applied it internally. The DMA/IRQ callback calls render(); each ring is an SPSC
+// consumer here.
 class BtMixSink : public carsh::hal::IAudioSink {
 public:
     std::size_t render(float* out, std::size_t frames) override {
         const std::size_t want = frames * kChannels;
+        if (g_aaRing.readable() >= want) {
+            std::size_t got = g_aaRing.read(out, want);
+            for (std::size_t i = 0; i < got; ++i) out[i] *= g_masterGain;
+            for (std::size_t i = got; i < want; ++i) out[i] = 0.0f;
+            return frames;
+        }
         if (g_btRing.readable() >= want) {
             std::size_t got = g_btRing.read(out, want);
+            for (std::size_t i = 0; i < got; ++i) out[i] *= g_masterGain;
             for (std::size_t i = got; i < want; ++i) out[i] = 0.0f;
             return frames;
         }
@@ -121,6 +160,10 @@ bool CKernel::Initialize(void) {
     mUsbGadgetOk = mSerialCDC.Initialize();
     if (mUsbGadgetOk) {
         new carsh::device::CircleUsbLog(&mSerialCDC, &mLogger, &mSerial);
+        // Let an assert/exception panic flush its message over USB-C before halting
+        // (the normal pump task is dead by then — see carshPanicFlush).
+        g_panicGadget = &mSerialCDC;
+        CLogger::Get()->RegisterPanicHandler(carshPanicFlush);
         for (unsigned i = 0; i < 400; ++i) {
             CScheduler::Get()->Yield();  // let the gadget PnP task run + host attach
             if (CDeviceNameService::Get()->GetDevice("utty1", FALSE)) break;
@@ -207,7 +250,7 @@ CStdlibApp::TShutdownMode CKernel::Run(void) {
     // Wire the audio DSP chain (EQ inserted into the engine). Playback is started
     // on demand via the player on hardware; the I2S device is not opened here.
     g_engine.setSampleProcessor(&g_eq);
-    g_engine.setMasterVolume(0.0f);  // boot muted; the left volume rail raises it
+    g_engine.setMasterVolume(0.0f);  // safe default until the rail is seeded (~30%) below
 
     // Prefer a USB stick for media; fall back to the SD card. The player must
     // read through the SAME source we index, so logical track paths ("/Music/..")
@@ -255,9 +298,17 @@ CStdlibApp::TShutdownMode CKernel::Run(void) {
     // into the content rect, leaving the volume rail + tab bar visible.
     mgr.addScreen(&androidAuto, "AA");
 
-    // Left volume rail -> engine master volume. Boots muted (setMasterVolume(0)
-    // above); dragging the rail raises it.
-    mgr.setOnVolumeChange([&](float v) { g_engine.setMasterVolume(v); });
+    // Left volume rail -> the one HU master gain, applied to the local engine AND to
+    // AA/A2DP (in BtMixSink::render). v is the dB-mapped gain from the rail.
+    mgr.setOnVolumeChange([&](float v) {
+        g_masterGain = v;
+        g_engine.setMasterVolume(v);
+    });
+    // Boot at 30% on the rail (was muted) so audio is audible without a touch input
+    // to raise it — useful for HDMI bring-up; seed the master gain to match.
+    mgr.setVolume(0.30f);
+    g_masterGain = mgr.volumeGain();
+    g_engine.setMasterVolume(g_masterGain);
 
     // Library list -> tap queues + plays that track.
     std::vector<uint64_t> ids = g_db.allTracks();
@@ -384,15 +435,34 @@ CStdlibApp::TShutdownMode CKernel::Run(void) {
     // stays on the placeholder but TLS/channels/audio/touch still run. The projection
     // is declared BEFORE aaDriver so it outlives the driver (whose teardown clears
     // the projection's connection pointer).
-    carsh::audio::PcmRing<float> aaAudioRing(kRate);  // ~1s; drained in rung 7 (audio focus)
+    // Index of the "AA" tab (must match the addScreen order above: it is the 9th /
+    // last screen). Used to auto-show projection without a touch input.
+    const int aaTabIndex = 8;
+    bool aaAutoShown = false;  // latched when we auto-switch to the AA tab on first frame
     carsh::aa::AaProjection::Hooks aaHooks;
     aaHooks.showFrame = [&](const uint8_t* rgb, int w, int h) {
         androidAuto.setFrame(rgb, w, h);
+        // Auto-switch to the AA tab the moment real video is decoded, so projection
+        // appears on the (HDMI/DSI) display without needing a touch to navigate there.
+        // Latched so it only yanks focus once per connection (a user CAN tab away).
+        if (rgb != nullptr && w > 0 && h > 0 && !aaAutoShown) {
+            mgr.setActive(aaTabIndex);
+            aaAutoShown = true;
+        }
     };
-    aaHooks.setConnected = [&](bool up) { androidAuto.setConnected(up); };
+    aaHooks.setConnected = [&](bool up) {
+        androidAuto.setConnected(up);
+        // On disconnect, drop the latch and return to the Now Playing tab so the
+        // display isn't stuck on a dead projection screen.
+        if (!up) {
+            aaAutoShown = false;
+            mgr.setActive(0);
+        }
+    };
     aaHooks.playAudio = [&](carsh::aa::ChannelId, const uint8_t* pcm, std::size_t len) {
-        // 16-bit LE PCM -> float, into the AA ring. Draining it to the jack with
-        // audio focus / mixing vs the music engine is rung 7.
+        // 16-bit LE PCM -> float, into the global AA ring that the PWM sink drains to
+        // the jack (the only AA audio channel opened is MediaAudio = 48 kHz stereo,
+        // matching the output, so no rate/format conversion is needed).
         const std::size_t n = len / 2;
         float buf[512];
         for (std::size_t off = 0; off < n;) {
@@ -402,7 +472,7 @@ CStdlibApp::TShutdownMode CKernel::Run(void) {
                 const int16_t v = static_cast<int16_t>(pcm[b] | (pcm[b + 1] << 8));
                 buf[i] = v * (1.0f / 32768.0f);
             }
-            aaAudioRing.write(buf, chunk);
+            g_aaRing.write(buf, chunk);
             off += chunk;
         }
     };
@@ -466,7 +536,13 @@ CStdlibApp::TShutdownMode CKernel::Run(void) {
         // engine. Reopen only on a rate change (close() drains the DMA safely).
         unsigned wantRate = curRate;
         bool wantOpen = false;
-        if (bt.connected()) {
+        if (g_aaRing.readable() > 0) {
+            // Android Auto media audio is streaming (48 kHz stereo PCM) — open the
+            // jack at that rate so the PWM sink drains g_aaRing. Highest priority:
+            // while projecting, AA owns the output.
+            wantRate = kRate;
+            wantOpen = true;
+        } else if (bt.connected()) {
             uint32_t r = carsh::device::btGlueA2dpSampleRate();
             wantRate = r ? r : 44100;
             wantOpen = true;

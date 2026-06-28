@@ -63,6 +63,9 @@ public:
     }
     float volume() const { return volume_.value(); }
     void setVolume(float v) { volume_.setValue(v); }
+    // The dB-mapped output gain for the current rail position (same value the
+    // onVolumeChange callback delivers); used to seed the master gain at boot.
+    float volumeGain() const { return volume_.gain(); }
 
     void addScreen(Screen* s, const std::string& tabLabel) {
         screens_.push_back(s);
