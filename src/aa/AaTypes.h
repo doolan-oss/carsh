@@ -72,15 +72,16 @@ enum class ControlMsgId : uint16_t {
 enum class AvMsgId : uint16_t {
     MediaWithTimestamp = 0x0000,  // 8-byte PTS then Annex-B / PCM
     MediaIndication = 0x0001,     // raw Annex-B / PCM, no timestamp
+    // AVChannelMessageIdsEnum (aasdk) — exact values matter; carsh had these shifted.
     SetupRequest = 0x8000,        // phone -> HU: AVChannelSetupRequest{config_index}
     StartIndication = 0x8001,     // phone -> HU: stream starting {session, config}
     StopIndication = 0x8002,      // phone -> HU: stream stopping
     SetupResponse = 0x8003,       // HU -> phone: AVChannelSetupResponse
-    VideoFocusRequest = 0x8004,   // phone -> HU: requests video focus change
-    VideoFocusIndication = 0x8005,  // HU -> phone: grants/revokes video focus
-    MediaAck = 0x8006,            // HU -> phone: AVMediaAckIndication (flow control)
-    AvInputOpenRequest = 0x8007,
-    AvInputOpenResponse = 0x8008,
+    MediaAck = 0x8004,            // HU -> phone: AVMediaAckIndication (flow control)
+    AvInputOpenRequest = 0x8005,  // phone -> HU
+    AvInputOpenResponse = 0x8006,  // HU -> phone
+    VideoFocusRequest = 0x8007,   // phone -> HU: requests video focus (drives AV_START)
+    VideoFocusIndication = 0x8008,  // HU -> phone: focus state (reply to the request)
 };
 
 // Input channel message ids (aasdk InputChannelMessageIdsEnum). The HU sends touch
@@ -126,7 +127,9 @@ inline constexpr uint16_t kVersionMinor = 7;
 // Wire-format sizing. A USB bulk transfer caps a single frame; a reassembled
 // message can span many frames up to kMaxMessageSize.
 inline constexpr size_t kUsbTransferSize = 16384;
-inline constexpr size_t kMaxMessageSize = 256 * 1024;
+// Big enough for a large H.264 video keyframe (reassembled, still-encrypted blob).
+// Dropping an over-cap message would desync the TLS stream, so keep generous headroom.
+inline constexpr size_t kMaxMessageSize = 1024 * 1024;
 
 // Assemble the frame-header flag byte from its three fields.
 inline constexpr uint8_t frameFlags(FrameType ft, MessageType mt, EncryptionType enc) {

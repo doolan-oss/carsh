@@ -13,6 +13,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <vector>
 
 #include "aa/AaTypes.h"
@@ -25,13 +26,23 @@ struct AaMessage {
     ChannelId channel = ChannelId::None;
     MessageType msgType = MessageType::Specific;
     EncryptionType encryption = EncryptionType::Plain;
-    uint16_t messageId = 0;            // valid for PLAIN messages; 0 for ENCRYPTED
-    std::vector<uint8_t> payload;      // message id stripped (PLAIN) / raw ciphertext (ENCRYPTED)
+    uint16_t messageId = 0;            // valid for PLAIN, or ENCRYPTED once decrypted
+    std::vector<uint8_t> payload;      // message id stripped, unless still ciphertext
+    bool decrypted = false;            // true if the messenger already decrypted (per-frame)
 };
 
 class AaMessenger {
 public:
     explicit AaMessenger(IAaTransport& transport);
+
+    // Per-frame decryptor (cipher payload -> plaintext). When set, ENCRYPTED frames are
+    // decrypted INDIVIDUALLY and their plaintext concatenated — this is how aasdk does
+    // it; a multi-frame message is NOT one big ciphertext blob, each frame is its own
+    // self-contained TLS record(s). Without this a fragmented (large keyframe) message
+    // fails to decrypt and desyncs the stream. Returns empty on a decrypt error.
+    void setDecryptor(std::function<std::vector<uint8_t>(const uint8_t*, size_t)> d) {
+        decryptor_ = std::move(d);
+    }
 
     // Receive and reassemble exactly one complete message. Blocks (via the
     // transport's own timeout) until a whole message is available. Returns true
@@ -55,12 +66,11 @@ public:
 
 private:
     struct Reasm {
-        std::vector<uint8_t> buf;
-        size_t totalExpected = 0;
-        size_t received = 0;
+        std::vector<uint8_t> buf;       // accumulated payload (plaintext if decrypted)
         MessageType msgType = MessageType::Specific;
         EncryptionType encryption = EncryptionType::Plain;
         bool active = false;
+        bool decrypted = false;
     };
 
     // Process one complete frame already present at `raw`. Sets produced=true and
@@ -71,6 +81,7 @@ private:
                       AaMessage& out, bool& produced);
 
     IAaTransport& tp_;
+    std::function<std::vector<uint8_t>(const uint8_t*, size_t)> decryptor_;
     std::array<Reasm, static_cast<size_t>(kMaxChannel) + 1> reasm_{};
     std::vector<uint8_t> rxAcc_;  // un-parsed RX bytes carried across reads
 };

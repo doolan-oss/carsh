@@ -348,6 +348,62 @@ host tests pass, never "validated on the Pi").
   `CUSBFunction` + `IAaTransport`; bound via `scripts/patches/usbdevicefactory-aoa.patch`).
   See the bench-session findings below.
 
+### Bench session — 2026-06-28 (CA525 + Galaxy S23 Ultra on real Pi 4)
+
+Picked up at rung 4a (plaintext version exchange) and drove the **whole protocol live
+to full channel setup**. Loop: serial `rx frame`/`tx frame` traces (added this session)
+→ each failure pinpointed a protocol gap → fix → reflash. Sequence of fixes, each
+advancing the live session one stage deeper:
+
+1. **Real cert + mbedTLS threading (rung 4b TLS — DONE live).** Swapped the placeholder
+   for the real aasdk cert (`AaHuCert.h`). The handshake still failed with mbedTLS
+   `-0x001c` (`THREADING_BAD_INPUT_DATA`) and *no ClientHello on the wire* — root cause:
+   circle-mbedtls is built `MBEDTLS_THREADING_C`+`THREADING_ALT`, so `mbedtls_mutex_lock`
+   is a fail-stub until `mbedtls_threading_set_alt()` is installed; carsh drives raw
+   mbedTLS and never installed it (`CTLSSimpleSupport` would have). Fix: construct a
+   `CircleMbedTLS::CThreadingModule` once in `CircleAaDriver` before any context. → **TLS
+   handshake, auth, and service discovery now complete on hardware; state reaches
+   Running.**
+2. **Channel-open routing.** Phone sends `CHANNEL_OPEN_REQUEST (0x0007)` on the *target*
+   channel, not Control; carsh dropped them → phone aborted right after discovery. Route
+   by msg id regardless of channel; frame channel is authoritative; reply on it. (matches
+   `head_unit:aa-fixes`.)
+3. **Audio/Nav focus.** Added `AUDIO_FOCUS_REQUEST (0x12)` / `NAV_FOCUS_REQUEST (0x0D)`
+   handlers — the phone blocks on the audio-focus response after discovery.
+4. **Message *type* of responses.** AV setup / sensor-start / input-binding **responses
+   must be `MessageType::Control`**, not Specific — a Specific SETUP_RESPONSE is treated
+   as stray media and the phone never starts AV. Media-acks / focus-indications / events
+   stay Specific. Also: proactively send `VIDEO_FOCUS_INDICATION(FOCUSED)` after Video
+   setup; SD-encoding fixes (AVInputChannel stream_type/audio_config, VideoFPS `_30=1`).
+5. **Drain the whole burst per tick** (`CircleAaDriver`): the phone fires ~12-20
+   open/setup messages in ~20 ms; answering only 8/tick spread replies past its timeout.
+
+Result: **all 8 channels open and every setup message is answered with the phone
+accepting them** (verified by the `tx frame` trace) — the AA protocol is essentially
+complete on hardware.
+
+**Open blocker — the bulk nemesis (risk #2).** ~0.1-3 s into Running, *during the
+open/setup burst*, the bulk-IN throws `xhciep: Transfer error 4` (USB completion-code-4
+/ `USBErrorUnknown`) and the dongle hard-resets to PTP and re-runs AOA (phone: "comms
+error 2"). The failure point is **non-deterministic** across runs (channel-opens →
+AV-setup → 3 s idle), which rules out a deterministic protocol bug — it's a
+timing-sensitive USB/xHCI issue. Tried and ruled out: **async bulk-OUT** (regressed
+response latency, reverted), **double-buffered bulk-IN** (2 URBs always posted — no
+change, kept), **IN endpoint recovery** (the dongle genuinely re-enumerates; removal is
+just detected ~1 s later by the next `UpdatePlugAndPlay`). The reference hit analogous
+"bulk issues" and solved them with **ESP-IDF-specific** USB-FIFO/pacing tweaks that don't
+translate to the Pi's xHCI.
+
+Dongle sanity-checked on a Linux PC (MTP `smartlinkBox/UDISK`): link type = AA, paired to
+"Dylan's S23 Ultra", a `1280x720-…h264` asset (the dongle is a **720p** device; carsh
+advertises 480p — fine for channel-open per the reference, revisit for streaming). So the
+dongle is healthy; the blocker is Circle-side.
+
+*Next options:* (a) build **OpenAuto** (aasdk) on the PC + `usbmon` capture — definitive
+"Circle vs dongle" answer and a golden bulk trace to diff; (b) Circle-xHCI deep-dive on
+the bulk-IN/OUT path under burst. All this session's code changes are in the working tree
+(uncommitted on `main`).
+
 ### Bench session — 2026-06-27 (CA525 on real Pi 4)
 
 Methodology: the BT bring-up loop (flash SD → `run_in_background` capture on the USB-C

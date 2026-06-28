@@ -56,6 +56,11 @@ public:
 
     bool isAccessory() const { return m_pBulkIn != nullptr && m_pBulkOut != nullptr; }
     unsigned rxBytes() const { return m_rxBytes; }  // Rung-3 throughput counter
+    unsigned txBytes() const { return m_txBytes; }  // bulk-OUT bytes sent (TLS bring-up)
+    // Last bulk-IN TUSBError + a monotonically-rising counter, set from IRQ context on
+    // a transfer error and logged by the driver from task context (see inCompletion).
+    unsigned lastInUsbErr() const { return m_lastInUsbErr; }
+    unsigned inErrSeq() const { return m_inErrSeq; }
 
     // IAaTransport.
     int read(uint8_t* buf, size_t len, uint32_t timeoutMs) override;
@@ -63,22 +68,29 @@ public:
 
 private:
     bool configureAccessory();
-    bool startInRequest();
+    bool startInRequest(u8* buf);  // submit one async bulk-IN using the given buffer
     void inCompletion(CUSBRequest* pURB);
     static void inCompletionStub(CUSBRequest* pURB, void* pParam, void* pContext);
 
     static constexpr unsigned kRingSize = 64 * 1024;
     static constexpr unsigned kRingMask = kRingSize - 1;
     static constexpr unsigned kInTransfer = 16384;
+    // Keep multiple bulk-IN URBs posted so a posted buffer is always available during
+    // the phone's channel-open/AV-setup burst (a single-buffer re-arm leaves gaps that
+    // make the dongle reset). xHCI allows 2 outstanding URBs per endpoint.
+    static constexpr unsigned kInBuffers = 2;
 
     CUSBEndpoint* m_pBulkIn;
     CUSBEndpoint* m_pBulkOut;
-    u8* m_pInBuffer;
+    u8* m_pInBuffer[kInBuffers];
     unsigned m_nDeviceNumber;  // "uaaN" registration; 0 = not registered
     u8 m_ring[kRingSize];
     volatile unsigned m_ringHead;
     volatile unsigned m_ringTail;
     volatile unsigned m_rxBytes;
+    volatile unsigned m_txBytes;
+    volatile unsigned m_lastInUsbErr;
+    volatile unsigned m_inErrSeq;
 };
 
 // Factory hook — called from the patched CUSBDeviceFactory (see

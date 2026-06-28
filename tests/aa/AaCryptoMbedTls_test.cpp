@@ -45,10 +45,22 @@ TEST(AaMemBio, PushRecvDrainSemantics) {
 #include <vector>
 
 #include "AaCryptoMbedTls.h"
+#include "TestServerCert.h"
 
 using carsh::device::AaCryptoMbedTls;
 
 namespace {
+
+// The device's embedded cert (AaHuCert.h) is the real aasdk cert, which mbedTLS
+// cannot PARSE (non-standard UTCTime) — fine on the device (raw-bypass *send* only,
+// the phone accepts it) but a host test drives mbedTLS on BOTH ends, so each peer
+// must also parse the cert it receives. Use a parseable stand-in here via initWith()
+// and keep init()/the real cert for the live [hw] handshake. The raw-cert *send* path
+// is still exercised below via setForceRawCert.
+bool initTest(AaCryptoMbedTls& c) {
+    return c.initWith(carsh::test::kTestCertDer, carsh::test::kTestCertDerLen,
+                      carsh::test::kTestCertKeyPem, carsh::test::kTestCertKeyPemLen);
+}
 
 // Host entropy source for seeding the CTR-DRBG (the device supplies the Pi's HW
 // RNG instead). Non-deterministic is fine — the test asserts behaviour, not bytes.
@@ -90,8 +102,8 @@ TEST(AaCryptoMbedTls, FullHandshakeAndRecordRoundTrip) {
     AaCryptoMbedTls cli(hostEntropy, nullptr);
     AaCryptoMbedTls srv(hostEntropy, nullptr);
     srv.setServer(true);
-    REQUIRE(cli.init());
-    REQUIRE(srv.init());
+    REQUIRE(initTest(cli));
+    REQUIRE(initTest(srv));
 
     REQUIRE(driveHandshake(cli, srv));
     CHECK(cli.handshakeDone());
@@ -115,8 +127,8 @@ TEST(AaCryptoMbedTls, RawCertBypassStillHandshakes) {
     AaCryptoMbedTls srv(hostEntropy, nullptr);
     cli.setForceRawCert(true);  // head unit presents its cert via raw bytes
     srv.setServer(true);
-    REQUIRE(cli.init());
-    REQUIRE(srv.init());
+    REQUIRE(initTest(cli));
+    REQUIRE(initTest(srv));
 
     REQUIRE(driveHandshake(cli, srv));
 

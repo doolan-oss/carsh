@@ -109,9 +109,11 @@ void driveToRunning(AaConnection& conn, FakeAaTransport& hu) {
 }
 
 void openChannel(AaConnection& conn, FakeAaTransport& hu, ChannelId ch) {
+    // The phone sends CHANNEL_OPEN_REQUEST on the target channel itself (the frame
+    // channel is authoritative); the payload channel_id is advisory.
     std::vector<uint8_t> openReq;
     pb::Writer(openReq).uint32(2, static_cast<uint32_t>(ch));
-    phoneSend(hu, ChannelId::Control, EncryptionType::Encrypted, kChannelOpenReq, openReq);
+    phoneSend(hu, ch, EncryptionType::Encrypted, kChannelOpenReq, openReq);
     REQUIRE(conn.poll(0));
     REQUIRE(conn.channelOpen(ch));
 }
@@ -363,9 +365,67 @@ TEST(AaChannels, VideoFocusRequestAndOutboundIndication) {
     CHECK(sawRequest);
     CHECK(requested == VideoFocusMode::Focused);
 
-    // HU grants focus -> VIDEO_FOCUS_INDICATION on the video channel.
+    // HU drives projection -> VIDEO_FOCUS_REQUEST on the video channel (0x8004), the
+    // message the reference HU (Google DHU) sends to make the phone start the stream.
     hu.clearSent();
     REQUIRE(conn.sendVideoFocus(VideoFocusMode::Focused));
     CHECK(huSent(hu, ChannelId::Video,
                  static_cast<uint16_t>(AvMsgId::VideoFocusIndication)));
+}
+
+// The phone sends AUDIO_FOCUS_REQUEST (and NAV_FOCUS_REQUEST) right after service
+// discovery and blocks on the response; missing it tears the link down ~1s into
+// Running (seen on the bench). Verify the HU grants both, with the request->state
+// enum remap for audio focus.
+TEST(AaChannels, AudioAndNavFocusGranted) {
+    using carsh::aa::ControlMsgId;
+    const uint16_t kAudioReq = static_cast<uint16_t>(ControlMsgId::AudioFocusRequest);
+    const uint16_t kAudioResp = static_cast<uint16_t>(ControlMsgId::AudioFocusResponse);
+    const uint16_t kNavReq = static_cast<uint16_t>(ControlMsgId::NavFocusRequest);
+    const uint16_t kNavResp = static_cast<uint16_t>(ControlMsgId::NavFocusResponse);
+
+    auto field1 = [](const std::vector<uint8_t>& body) -> uint32_t {
+        pb::Reader r(body.data(), body.size());
+        uint32_t field;
+        uint8_t wire;
+        uint32_t v = 0xFFFFFFFFu;
+        while (!r.eof()) {
+            if (!r.tag(field, wire)) break;
+            if (field == 1 && wire == 0)
+                r.u32(v);
+            else if (!r.skip(wire))
+                break;
+        }
+        return v;
+    };
+
+    FakeAaTransport hu;
+    AaMessenger msger(hu);
+    FakeAaCrypto crypto(2);
+    AaConnection conn(msger, crypto, {});
+    driveToRunning(conn, hu);
+
+    // AUDIO_FOCUS_REQUEST{focus_type=1 GAIN} -> AUDIO_FOCUS_RESPONSE{state=1 GAIN}.
+    hu.clearSent();
+    std::vector<uint8_t> gain;
+    pb::Writer(gain).uint32(1, 1);
+    phoneSend(hu, ChannelId::Control, EncryptionType::Encrypted, kAudioReq, gain);
+    REQUIRE(conn.poll(0));
+    REQUIRE(huSent(hu, ChannelId::Control, kAudioResp));
+    CHECK_EQ(static_cast<int>(field1(lastHuBody(hu, ChannelId::Control, kAudioResp))), 1);
+
+    // RELEASE(4) must remap to LOSS(3), not echo to 4 (LOSS_TRANSIENT_CAN_DUCK).
+    hu.clearSent();
+    std::vector<uint8_t> release;
+    pb::Writer(release).uint32(1, 4);
+    phoneSend(hu, ChannelId::Control, EncryptionType::Encrypted, kAudioReq, release);
+    REQUIRE(conn.poll(0));
+    CHECK_EQ(static_cast<int>(field1(lastHuBody(hu, ChannelId::Control, kAudioResp))), 3);
+
+    // NAV_FOCUS_REQUEST -> NAV_FOCUS_RESPONSE{focus_type=1 GAIN}.
+    hu.clearSent();
+    phoneSend(hu, ChannelId::Control, EncryptionType::Encrypted, kNavReq, {});
+    REQUIRE(conn.poll(0));
+    REQUIRE(huSent(hu, ChannelId::Control, kNavResp));
+    CHECK_EQ(static_cast<int>(field1(lastHuBody(hu, ChannelId::Control, kNavResp))), 1);
 }
