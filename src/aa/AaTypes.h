@@ -127,7 +127,9 @@ inline constexpr uint16_t kVersionMinor = 7;
 // Wire-format sizing. A USB bulk transfer caps a single frame; a reassembled
 // message can span many frames up to kMaxMessageSize.
 inline constexpr size_t kUsbTransferSize = 16384;
-inline constexpr size_t kMaxMessageSize = 256 * 1024;
+// Big enough for a large H.264 video keyframe (reassembled, still-encrypted blob).
+// Dropping an over-cap message would desync the TLS stream, so keep generous headroom.
+inline constexpr size_t kMaxMessageSize = 1024 * 1024;
 
 // Assemble the frame-header flag byte from its three fields.
 inline constexpr uint8_t frameFlags(FrameType ft, MessageType mt, EncryptionType enc) {
