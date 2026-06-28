@@ -100,7 +100,11 @@ CAndroidAutoDevice::CAndroidAutoDevice(CUSBFunction* pFunction)
       m_rxBytes(0),
       m_txBytes(0),
       m_lastInUsbErr(0),
-      m_inErrSeq(0) {}
+      m_inErrSeq(0),
+      m_lastInResultLen(0),
+      m_inFlight(0),
+      m_lastOutUsbErr(0),
+      m_outErrSeq(0) {}
 
 CAndroidAutoDevice::~CAndroidAutoDevice() {
     // Unregister from the name service + free the number BEFORE the object dies, so
@@ -191,13 +195,27 @@ bool CAndroidAutoDevice::startInRequest(u8* buf) {
     CUSBRequest* pURB = new CUSBRequest(m_pBulkIn, buf, kInTransfer);
     if (pURB == nullptr) return false;
     pURB->SetCompletionRoutine(inCompletionStub, nullptr, this);
-    return GetHost()->SubmitAsyncRequest(pURB);
+    if (!GetHost()->SubmitAsyncRequest(pURB)) return false;
+    m_inFlight++;  // one more bulk-IN URB posted (decremented when it completes)
+    return true;
+}
+
+// Re-post all bulk-IN buffers. The driver calls this from task context ONLY when
+// inFlight()==0, so no completion routine is pending and every buffer is free.
+bool CAndroidAutoDevice::restartInPolling() {
+    if (m_pBulkIn == nullptr || m_inFlight != 0) return false;
+    bool any = false;
+    for (unsigned i = 0; i < kInBuffers; ++i) {
+        if (m_pInBuffer[i] != nullptr && startInRequest(m_pInBuffer[i])) any = true;
+    }
+    return any;
 }
 
 // USB-IRQ context. Enqueue received bytes into the SPSC ring, then re-arm. read()
 // drains the ring from task context — no AA-core work happens in the IRQ.
 void CAndroidAutoDevice::inCompletion(CUSBRequest* pURB) {
     u8* buf = static_cast<u8*>(pURB->GetBuffer());  // this URB's own IN buffer
+    if (m_inFlight > 0) m_inFlight--;  // this URB is no longer posted
     bool restart = true;
     if (pURB->GetStatus() != 0) {  // non-zero status = success, per Circle
         unsigned n = pURB->GetResultLength();
@@ -215,10 +233,15 @@ void CAndroidAutoDevice::inCompletion(CUSBRequest* pURB) {
         }
     } else {
         // Transfer error (usually a device-initiated reset). Stash the USB error code
-        // for TASK-context logging (the driver reads lastInUsbErr()); do NOT log from
-        // here — this is USB-IRQ/completion context and logging to the USB-C serial
-        // gadget from it deadlocks the system.
+        // + the result length for TASK-context logging (the driver reads lastInUsbErr()
+        // / lastInResultLen()); do NOT log from here — this is USB-IRQ/completion
+        // context and logging to the USB-C serial gadget from it deadlocks the system.
+        // The result length matters for the bulk-reset hunt: a length > kInTransfer (or
+        // a babble TUSBError) means the dongle over-ran the buffer. We do NOT re-arm
+        // here; the driver re-posts from task context once the pipe is fully idle
+        // (inFlight==0), which is race-free and lets the recovery be logged + bounded.
         m_lastInUsbErr = static_cast<unsigned>(pURB->GetUSBError());
+        m_lastInResultLen = pURB->GetResultLength();
         m_inErrSeq++;
         restart = false;  // transfer error (likely disconnect)
     }
@@ -251,10 +274,19 @@ int CAndroidAutoDevice::write(const uint8_t* data, size_t len, uint32_t /*timeou
     CUSBHostController* host = GetHost();
     size_t off = 0;
     while (off < len) {
-        int r = host->Transfer(m_pBulkOut, const_cast<uint8_t*>(data + off),
-                               static_cast<unsigned>(len - off));
-        if (r < 0) return -1;
-        if (r == 0) break;
+        // Own the URB (instead of host->Transfer) so we can read the TUSBError on a
+        // failed bulk-OUT — write() is task context, so this is the OUT analogue of the
+        // IN error stash and feeds the same driver diagnostics. Same submit shape +
+        // default timeout (USB_TIMEOUT_NONE) as CUSBHostController::Transfer.
+        CUSBRequest urb(m_pBulkOut, const_cast<uint8_t*>(data + off),
+                        static_cast<unsigned>(len - off));
+        if (!host->SubmitBlockingRequest(&urb)) {
+            m_lastOutUsbErr = static_cast<unsigned>(urb.GetUSBError());
+            m_outErrSeq++;
+            return -1;
+        }
+        const int r = static_cast<int>(urb.GetResultLength());
+        if (r <= 0) break;
         off += static_cast<size_t>(r);
     }
     m_txBytes += static_cast<unsigned>(off);
