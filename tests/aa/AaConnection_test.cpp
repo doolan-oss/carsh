@@ -120,14 +120,16 @@ TEST(AaConnection, FullBringUpHandshake) {
     CHECK(huSent(hu, ChannelId::Control, kSvcDiscoveryResp, EncryptionType::Encrypted));
 
     // 5. Phone opens the video channel -> accepted + encrypted CHANNEL_OPEN_RESPONSE.
+    // The open arrives ON the target channel (Video) as a CONTROL-type message, and
+    // the response goes back on that same channel.
     std::vector<uint8_t> openReq;
-    pb::Writer(openReq).uint32(2, static_cast<uint32_t>(ChannelId::Video));  // channel_id=3
-    phoneSend(hu, ChannelId::Control, EncryptionType::Encrypted, MessageType::Specific,
+    pb::Writer(openReq).uint32(2, static_cast<uint32_t>(ChannelId::Video));  // advisory
+    phoneSend(hu, ChannelId::Video, EncryptionType::Encrypted, MessageType::Control,
               kChannelOpenReq, openReq);
     REQUIRE(conn.poll(100));
     CHECK(conn.channelOpen(ChannelId::Video));
     CHECK(videoOpened);
-    CHECK(huSent(hu, ChannelId::Control, kChannelOpenResp, EncryptionType::Encrypted));
+    CHECK(huSent(hu, ChannelId::Video, kChannelOpenResp, EncryptionType::Encrypted));
 }
 
 // The service-discovery response the HU emits must be well-formed protobuf the
@@ -177,6 +179,6 @@ TEST(AaConnection, ServiceDiscoveryResponseIsValidProtobuf) {
             REQUIRE(r.skip(wire));
         }
     }
-    CHECK(channelDescriptors >= 6);  // audio x3, input, sensor, video, ...
+    CHECK(channelDescriptors == 5);  // media-audio, av-input, sensor, input, video
     CHECK_EQ(huName, std::string("carsh"));
 }

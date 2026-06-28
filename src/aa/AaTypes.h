@@ -76,8 +76,9 @@ enum class AvMsgId : uint16_t {
     StartIndication = 0x8001,     // phone -> HU: stream starting {session, config}
     StopIndication = 0x8002,      // phone -> HU: stream stopping
     SetupResponse = 0x8003,       // HU -> phone: AVChannelSetupResponse
-    VideoFocusRequest = 0x8004,   // phone -> HU: requests video focus change
-    VideoFocusIndication = 0x8005,  // HU -> phone: grants/revokes video focus
+    VideoFocusRequest = 0x8004,   // HU -> phone: HU requests video focus (drives AV_START);
+                                  //   also phone -> HU to ask the HU to change focus
+    VideoFocusIndication = 0x8005,  // phone -> HU: focus state notification
     MediaAck = 0x8006,            // HU -> phone: AVMediaAckIndication (flow control)
     AvInputOpenRequest = 0x8007,
     AvInputOpenResponse = 0x8008,
