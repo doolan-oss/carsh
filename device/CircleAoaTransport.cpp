@@ -93,11 +93,14 @@ CAndroidAutoDevice::CAndroidAutoDevice(CUSBFunction* pFunction)
     : CUSBFunction(pFunction),
       m_pBulkIn(nullptr),
       m_pBulkOut(nullptr),
-      m_pInBuffer(nullptr),
+      m_pInBuffer{nullptr, nullptr},
       m_nDeviceNumber(0),
       m_ringHead(0),
       m_ringTail(0),
-      m_rxBytes(0) {}
+      m_rxBytes(0),
+      m_txBytes(0),
+      m_lastInUsbErr(0),
+      m_inErrSeq(0) {}
 
 CAndroidAutoDevice::~CAndroidAutoDevice() {
     // Unregister from the name service + free the number BEFORE the object dies, so
@@ -109,7 +112,7 @@ CAndroidAutoDevice::~CAndroidAutoDevice() {
     }
     delete m_pBulkIn;
     delete m_pBulkOut;
-    delete[] m_pInBuffer;
+    for (unsigned i = 0; i < kInBuffers; ++i) delete[] m_pInBuffer[i];
 }
 
 boolean CAndroidAutoDevice::Configure(void) {
@@ -164,22 +167,28 @@ bool CAndroidAutoDevice::configureAccessory() {
         CLogger::Get()->Write(From, LogError, "cannot set accessory interface");
         return false;
     }
-    m_pInBuffer = new u8[kInTransfer];
-    if (m_pInBuffer == nullptr) return false;
+    for (unsigned i = 0; i < kInBuffers; ++i) {
+        m_pInBuffer[i] = new u8[kInTransfer];
+        if (m_pInBuffer[i] == nullptr) return false;
+    }
 
     m_nDeviceNumber = s_NumberPool.AllocateNumber(TRUE, From);
     CDeviceNameService::Get()->AddDevice(DevicePrefix, m_nDeviceNumber, this, FALSE);
 
-    if (!startInRequest()) {
-        CLogger::Get()->Write(From, LogError, "cannot start bulk-IN polling");
-        return false;
+    // Post all bulk-IN buffers up front (double-buffered) so the dongle always has a
+    // posted buffer to stream into during the channel-open/AV-setup burst.
+    for (unsigned i = 0; i < kInBuffers; ++i) {
+        if (!startInRequest(m_pInBuffer[i])) {
+            CLogger::Get()->Write(From, LogError, "cannot start bulk-IN polling");
+            return false;
+        }
     }
     CLogger::Get()->Write(From, LogNotice, "accessory bulk endpoints up — AA transport ready");
     return true;
 }
 
-bool CAndroidAutoDevice::startInRequest() {
-    CUSBRequest* pURB = new CUSBRequest(m_pBulkIn, m_pInBuffer, kInTransfer);
+bool CAndroidAutoDevice::startInRequest(u8* buf) {
+    CUSBRequest* pURB = new CUSBRequest(m_pBulkIn, buf, kInTransfer);
     if (pURB == nullptr) return false;
     pURB->SetCompletionRoutine(inCompletionStub, nullptr, this);
     return GetHost()->SubmitAsyncRequest(pURB);
@@ -188,6 +197,7 @@ bool CAndroidAutoDevice::startInRequest() {
 // USB-IRQ context. Enqueue received bytes into the SPSC ring, then re-arm. read()
 // drains the ring from task context — no AA-core work happens in the IRQ.
 void CAndroidAutoDevice::inCompletion(CUSBRequest* pURB) {
+    u8* buf = static_cast<u8*>(pURB->GetBuffer());  // this URB's own IN buffer
     bool restart = true;
     if (pURB->GetStatus() != 0) {  // non-zero status = success, per Circle
         unsigned n = pURB->GetResultLength();
@@ -196,7 +206,7 @@ void CAndroidAutoDevice::inCompletion(CUSBRequest* pURB) {
             for (unsigned i = 0; i < n; ++i) {
                 unsigned next = (tail + 1) & kRingMask;
                 if (next == m_ringHead) break;  // ring full — drop the rest
-                m_ring[tail] = m_pInBuffer[i];
+                m_ring[tail] = buf[i];
                 tail = next;
             }
             DataSyncBarrier();
@@ -204,10 +214,17 @@ void CAndroidAutoDevice::inCompletion(CUSBRequest* pURB) {
             m_rxBytes += n;
         }
     } else {
+        // Transfer error (usually a device-initiated reset). Stash the USB error code
+        // for TASK-context logging (the driver reads lastInUsbErr()); do NOT log from
+        // here — this is USB-IRQ/completion context and logging to the USB-C serial
+        // gadget from it deadlocks the system.
+        m_lastInUsbErr = static_cast<unsigned>(pURB->GetUSBError());
+        m_inErrSeq++;
         restart = false;  // transfer error (likely disconnect)
     }
     delete pURB;
-    if (restart && !startInRequest()) {
+    // Re-arm this buffer (keeps the double-buffered pipe full).
+    if (restart && !startInRequest(buf)) {
         CLogger::Get()->Write(From, LogError, "cannot restart bulk-IN request");
     }
 }
@@ -240,6 +257,7 @@ int CAndroidAutoDevice::write(const uint8_t* data, size_t len, uint32_t /*timeou
         if (r == 0) break;
         off += static_cast<size_t>(r);
     }
+    m_txBytes += static_cast<unsigned>(off);
     return static_cast<int>(off);
 }
 
