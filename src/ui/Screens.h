@@ -111,6 +111,35 @@ private:
     ListView list_;
 };
 
+// --- Queue ------------------------------------------------------------------
+// The play queue: a list of "artist - title" rows with the now-playing row marked
+// (ListView::setCurrent), tap-to-jump, and a CLEAR button. Pure-widget like
+// DevicesScreen; the app rebuilds the rows from the live queue and wires intents.
+class QueueScreen : public Screen {
+public:
+    explicit QueueScreen(Rect c)
+        : Screen(c),
+          list_({c.x + 8, c.y + 8, c.w - 16, c.h - 80}),
+          clear_({c.x + 8, c.y + c.h - 64, 160, 56}, "CLEAR",
+                 [this] { if (onClear) onClear(); }) {
+        widgets_ = {&list_, &clear_};
+        list_.setOnSelect([this](int i) { if (onSelect) onSelect(i); });
+    }
+    const char* name() const override { return "Q"; }
+
+    void setItems(std::vector<std::string> rows) { list_.setItems(std::move(rows)); }
+    // Mark the now-playing row (-1 = nothing playing from this queue).
+    void setCurrent(int i) { list_.setCurrent(i); }
+    ListView& list() { return list_; }
+
+    std::function<void(int)> onSelect;  // tap a row -> jump to it
+    std::function<void()> onClear;      // CLEAR pressed
+
+private:
+    ListView list_;
+    Button clear_;
+};
+
 // --- 3. Search --------------------------------------------------------------
 class SearchScreen : public Screen {
 public:
