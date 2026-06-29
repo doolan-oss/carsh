@@ -509,3 +509,39 @@ NAL parsing — plus the AA UI surface and the USB-AOA transport scaffold now bu
 (160 host tests; the Pi 4 image links with the AA tab + transport). What's left is
 hardware-gated: the live USB-AOA bring-up (rungs 1-4), the openh264 decoder + FPS
 (rung 5), and final integration (rung 6).
+
+---
+
+## Bench bring-up log — 2026-06-29 (rungs 1–7 working; audio "good enough")
+
+Full AA now runs on the real Pi 4 + CA525 + phone: enumerate → AOA → `uaa1` → version
+→ live TLS → service discovery → channels → **H.264 video + media audio both play**,
+and AA media is wired into the player UI (`player::MediaSession`: Now Playing source
+badge + AVRCP-style transport keys over the input channel).
+
+**Rung 7 (choppy audio) — FIXED, branch `claude/aa-decode-core` / PR #24.** Root-caused
+on the bench with new serial instrumentation (`aa-audio:` ring/under/prime/render-µs,
+`aa-decode:` n/dec-µs/queue/dropped). The chain:
+1. 720p software H.264 decode is **~37 ms/frame > the 33 ms real-time budget**. On one
+   core it starved the core-0 audio refill (continuous underruns) AND backed up the AU
+   queue → dropped keyframes → **screen froze** until the next IDR.
+2. Moved decode to a **dedicated A72 core** (`CircleAaDecodeCore`, `CMultiCoreSupport`,
+   `ARM_ALLOW_MULTI_CORE` — rebuilt libcircle). Frames cross to the UI core via a
+   lock-free triple buffer (`FrameRelay`); audio (`g_aaRing`) stays on core 0.
+3. **Dropped video to 480p (800×480 — the panel's native size).** Decode → ~15 ms
+   (real-time, `dropped=0`, freeze gone), less memory-bus contention. AA video
+   resolution enum: `_480p=1` (`AaConnection.cpp` service discovery + a matching
+   800×480 touch surface — the phone won't START the stream on a mismatch).
+4. **Audio delivery is bursty** (dongle WiFi: measured most gaps 161–600 ms, in runs).
+   Refilled `g_aaRing` several times per UI loop; `JitterBuffer` got a 480 ms prebuffer
+   + a small **quick-resume** threshold (resume after a transient gap without a full
+   re-prime — the re-prime was adding a prebuffer-long silence on top of each gap).
+
+Result: `under` ≈ 1 brief blip / 4 s, `primes=1` (never collapses), `dropped=0`,
+real-time decode, video smooth. Residual = the dongle's wireless burstiness (only HU
+lever left is more buffer = more latency). Detail in `AA_AUDIO_INVESTIGATION.md`.
+
+**Still open (see `HARDWARE_TODO.md` H8):** the **intermittent xHCI `Transfer error 4`
+on the bulk-IN during the TLS handshake** that occasionally hard-hangs the board at
+startup ("AA doesn't start up stable"; recovers on power-cycle + dongle re-plug) — the
+top AA bug. And video frame-drop-when-behind (no policy yet).
