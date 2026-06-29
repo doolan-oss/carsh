@@ -34,7 +34,9 @@ HARDWARE_TODO.md for what the bench session must confirm.
 | UI: Widgets | host-done | Button, Label, ListView (select+scroll), TabBar. |
 | UI: ScreenManager + tabs | host-done | Tab routing, gesture dispatch, render. |
 | UI: 7 screens | host-done | Now/Lib/Find/Queue/EQ/Src/Set; PNG + touch tested. |
-| UI: LibraryScreen | host-done | "Lib" tab: hierarchical browse (header + list + BACK/PLAY/SHUFFLE), scope-aware captions; drives `LibraryBrowser`. 4 host tests (`LibraryScreen_test`). |
+| UI: LibraryScreen | host-done | "Lib" tab: hierarchical browse (header + list + BACK/PLAY/SHUFFLE) + an A–Z jump strip (`AzIndexBar`→`firstRowForLetter`→`scrollTo`), scope-aware captions; drives `LibraryBrowser`. 5 host tests (`LibraryScreen_test`). |
+| UI: QueueScreen | host-done | "Q" tab: live play queue with now-playing marker (`ListView::setCurrent`), tap-to-jump, CLEAR. 2 host tests (`QueueScreen_test`). |
+| UI: Now Playing art | host-done | Sidecar album art (`ArtSource`→`generateAscii`) shown for the local source, cached by albumKey, refreshed on album change. `[hw]`: confirm real covers render (device links `Art.o`). |
 | AA H.264 decode (`CircleH264Decoder`+`Yuv420`) | host-done / `[hw]` FPS | openh264-backed `IH264Decoder`; I420→RGB888 (BT.601) pure converter. Host build links **system openh264 2.4.1** (same line vendored for the Pi) and runs a real encode→decode→pixel-compare round trip (`H264Decode_test`, MAE-checked) + converter anchors. Device links the cross-built decoder via `make CARSH_HAVE_OPENH264=1`. **The aarch64 bare-metal decoder lib now builds + links into the image** (`scripts/build_openh264_baremetal.sh`: decoder+common+NEON at Circle's ABI, newlib pthread/sem shim headers in `scripts/openh264_baremetal_include/` + a no-op threading shim `scripts/openh264_baremetal_shim.c`; single-threaded `DecodeFrameNoDelay`, `HAVE_NEON_AARCH64` constant CPU-detect). `[hw]`: on-target decode correctness + FPS, dedicated-core run. |
 | Decoders (WAV/FLAC/MP3) | host-done | dr_libs; WAV bit-exact, FLAC lossless, MP3 tone. |
 | Decoder: Opus | host-done | libopusfile; real .opus fixture, tone-correlated. |
@@ -50,7 +52,8 @@ HARDWARE_TODO.md for what the bench session must confirm.
 | Library: TextNorm | host-done | UTF-8 casefold + accent strip + tokenize. |
 | Library: Database | host-done | Upsert, token search (AND+prefix), browse, persist. `byArtist`/`albumsByArtist` browse helpers (normalized album-artist match). |
 | Library: SmartPlaylist | host-done | Rule engine; All/Any, sort, limit. |
-| Library: LibraryBrowser | host-done | Hierarchical Artists→Albums→Songs nav + play/shuffle scoped to the current level (whole library / artist / album), seedable Fisher-Yates shuffle. 8 host tests (`LibraryBrowser_test`). |
+| Library: LibraryBrowser | host-done | Hierarchical Artists→Albums→Songs nav + play/shuffle scoped to the current level (whole library / artist / album), seedable Fisher-Yates shuffle, `firstRowForLetter` for A–Z jump. 9 host tests (`LibraryBrowser_test`). |
+| Library: LibraryCache | host-done | Boot fast-path: a readdir-only media signature + serialize/deserialize round-trip; skips the tag scan when storage is unchanged, else rescans + writes `SD:/carsh/library.{db,sig}`. Needs `Vfs::writeFile` (CircleVfs FatFs / HostVfs). 4 host tests (`LibraryCache_test`). `[hw]`: confirm the SD write + cache-hit boot. |
 | Tag parsers (ID3v2/Vorbis/FLAC/Opus) | host-done | Real-encoder fixtures; lame UTF-16 quirk handled. |
 | Tag parsers (MP4/M4A) | deferred | Needs MP4 demux (with AAC-MP4/ALAC). |
 | Library: Indexer | host-done | Interruptible scan, tags+props, RG track+album scan. |
