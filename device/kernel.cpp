@@ -101,7 +101,7 @@ carsh::aa::FrameRelay g_aaFrames;
 // kAaPrimeMs trades startup latency for stall tolerance — tune on the bench (lower
 // if AA audio lags video noticeably; raise if dropouts persist). It is the consumer
 // (the PWM IRQ via BtMixSink::render); nothing else drains g_aaRing.
-constexpr unsigned kAaPrimeMs = 120;
+constexpr unsigned kAaPrimeMs = 200;
 carsh::audio::JitterBuffer g_aaJitter(
     g_aaRing, std::size_t(kRate) * kChannels * kAaPrimeMs / 1000);
 
@@ -750,18 +750,25 @@ CStdlibApp::TShutdownMode CKernel::Run(void) {
         // found" over USB-C. ~1 Hz is plenty and cheap.
         if (frame % 33 == 0) mUSBHCI.UpdatePlugAndPlay();
 
-        // Drive the Android Auto connection over the live AOA transport (uaa1):
-        // version exchange now, TLS next (AA_PLAN rung 4). UI-task driven so it never
-        // races with the UpdatePlugAndPlay above (which deletes the transport when
-        // the dongle re-cycles). Timed so we can correlate long ticks with AA audio
-        // underruns (investigation step 2).
-        {
+        // Drive AA + refill g_aaRing MULTIPLE times across the frame interval, not
+        // once. With decode now on core 3, the core-0 limiter is the ~44 ms video
+        // blit in render(); refilling audio only once per ~74 ms loop lets the ring
+        // dip below the prebuffer on jitter -> underruns. Interleaving cheap ticks
+        // (poll() drains USB -> g_aaRing; no decode here anymore) with short sleeps
+        // keeps the ring topped across the blit. UI-task driven so it never races
+        // with the UpdatePlugAndPlay above. Each tick timed for the health log below.
+        auto aaTick = [&] {
             const unsigned t0 = CTimer::GetClockTicks();  // 1 MHz free-running (us)
             aaDriver.tick();
             const unsigned dt = CTimer::GetClockTicks() - t0;
             if (dt > aaTickMaxUs) aaTickMaxUs = dt;
             aaTickSumUs += dt;
             ++aaTickCount;
+        };
+        aaTick();                          // refill right after the render
+        for (int i = 0; i < 3; ++i) {      // ~30 ms total (replaces one MsSleep(30)),
+            mScheduler.MsSleep(10);        // refilling ~every 10 ms so the ring
+            aaTick();                      // survives the next frame's blit
         }
 
         // AA audio/decode health, ~1 Hz. Underruns climbing while tick/decode spikes
@@ -790,9 +797,8 @@ CStdlibApp::TShutdownMode CKernel::Run(void) {
             aaTickMaxUs = aaTickSumUs = aaTickCount = 0;
         }
 
-        // Scheduler-aware sleep: yields to the decode task (and BT/net later)
-        // between frames, ~30 fps. The decode task keeps the ring fed meanwhile.
-        mScheduler.MsSleep(30);
+        // (The ~30 ms inter-frame sleep is now spread across the aaTick() refills
+        // above, so AA audio is topped up several times per frame instead of once.)
         ++frame;
     }
     return ShutdownHalt;
