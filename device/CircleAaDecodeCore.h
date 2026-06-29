@@ -1,51 +1,26 @@
-// CircleAaDecodeCore — SCAFFOLD (NOT WIRED): run the Android Auto H.264 decode on a
-// dedicated A72 core via CMultiCoreSupport, the AA_AUDIO_INVESTIGATION "candidate fix
-// #1" and the long-anticipated next step (scripts/fetch_openh264.sh: "Run feed() on a
-// dedicated A72 core (CMultiCoreSupport)"). It is the bigger sibling of
-// CircleAaDecodeTask: identical pump body, but on its own core so software decode
-// stops stealing core-0 time from the UI/audio loop entirely — expected to fix BOTH
-// the choppy audio (refill never preempted by decode) and the "slightly laggy video"
-// (decode gets a full core for sustained throughput).
+// CircleAaDecodeCore — runs the Android Auto H.264 decode on a dedicated A72 core via
+// CMultiCoreSupport (AA_AUDIO_INVESTIGATION "candidate fix #1"). It is the bigger
+// sibling of the cooperative CircleAaDecodeTask: identical pump body, but on its own
+// core so software decode (~37 ms/frame, bench-measured > the 33 ms real-time budget)
+// stops stealing core-0 time from the UI/audio loop — so the g_aaRing refill is never
+// preempted by decode and AA audio stays smooth. (Video still can't beat real-time on
+// one core; that's a separate throughput problem.)
 //
-// ⚠️  THIS IS A SCAFFOLD. It compiles against Circle but is intentionally NOT
-//     constructed in kernel.cpp. Bringing a second core up changes the whole app
-//     from the proven single-core cooperative model to true SMP, and it can ONLY be
-//     validated on the bench. Before wiring it, the items in "BENCH BRING-UP" below
-//     MUST be done — otherwise the frame handoff races and the picture tears/faults.
+// Requires ARM_ALLOW_MULTI_CORE in Circle's sysconfig.h (see
+// scripts/patches/sysconfig-multicore.patch) — it spins up the secondary cores AND
+// maps RAM inner-shareable cacheable so the cross-core SPSC handoffs are coherent.
+// Gated in kernel.cpp behind CARSH_AA_DECODE_CORE (default on with openh264; build
+// CARSH_NO_DECODE_CORE=1 to fall back to the single-core cooperative task).
 //
-// ── How it differs from the cooperative CircleAaDecodeTask ──────────────────
-// The AuQueue (AsyncH264Decoder's input) is already a lock-free SPSC ring with
-// acquire/release ordering, so producer-on-core-0 / consumer-on-core-3 is safe as-is.
-// The OUTPUT is not: the cooperative task relied on "the decode task only runs while
-// the UI task is yielded" so AndroidAutoScreen::setFrame (a borrowed pointer into the
-// decoder's RGB scratch) was never read mid-write. On a real second core that
-// guarantee is gone — core 0 can blit the RGB buffer while core 3 is rewriting it.
-//
-// ── BENCH BRING-UP checklist (do these before constructing this) ────────────
-//  1. Double-buffer the decoded frame. Decode into one of two RGB buffers, then
-//     publish its index with an atomic release store; the UI core loads it with an
-//     acquire and blits that buffer. Never hand out a pointer into a buffer still
-//     being written. (Put this in the frame sink, between CircleH264Decoder::emit
-//     and AndroidAutoScreen::setFrame.)
-//  2. Cache maintenance. The two cores share the RGB buffer through DRAM; after the
-//     decode core finishes a frame, clean the data cache for that buffer before
-//     publishing, and the UI core should read the freshly-published one. (Circle's
-//     CleanDataCacheRange / the DMA-coherent allocator are the tools.)
-//  3. Make the cross-core flags atomic. In kernel.cpp, aaAutoShowReq becomes
-//     std::atomic<bool> (decode core sets, UI core consumes). AaDecodeStats is
-//     already atomic. g_aaJitter/g_aaRing are unaffected (audio stays core-0).
-//  4. Pick the core and park the rest. Run(nCore) is invoked on cores 1..3; do decode
-//     only on kDecodeCore and return immediately on the others so they park.
-//  5. Construct + Initialize() ONCE, after the UI objects exist, instead of
-//     `new CircleAaDecodeTask(...)`. Keep the openh264 decoder, AsyncH264Decoder and
-//     AaDecodeStats exactly as today — only the pump's home changes.
-//
-// ── Sketch of the kernel.cpp swap (inside the CARSH_HAVE_OPENH264 block) ─────
-//     // instead of: new CircleAaDecodeTask(&aaAsync, &aaDecodeStats);
-//     static CircleAaDecodeCore s_decodeCore(CMemorySystem::Get(), &aaAsync,
-//                                            &aaDecodeStats);
-//     if (!s_decodeCore.Initialize())
-//         mLogger.Write(FROM, LogError, "AA: decode core init failed");
+// ── Cross-core data flow (all SPSC, lock-free, coherent-memory safe) ─────────
+//   core 0 (AA poll):  AsyncH264Decoder::feed() -> AuQueue.push        [producer]
+//   core 3 (this):     pump() -> AuQueue.pop -> openh264 decode -> onFrame ->
+//                      kernel showFrame hook -> FrameRelay::publish    [producer]
+//   core 0 (UI loop):  FrameRelay::acquire -> AndroidAutoScreen::setFrame/blit [consumer]
+// AuQueue + FrameRelay use acquire/release exchanges; on the coherent A72 cluster
+// (inner-shareable, from the multicore MMU) that is sufficient — no explicit cache
+// maintenance. The audio path (g_aaRing) stays entirely on core 0. The auto-show
+// flag is std::atomic<bool> (decode core sets, UI core consumes).
 #ifndef _carsh_circle_aa_decode_core_h
 #define _carsh_circle_aa_decode_core_h
 

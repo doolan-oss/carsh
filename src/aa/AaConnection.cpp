@@ -75,10 +75,12 @@ std::vector<uint8_t> buildServiceDiscoveryResponse() {
         });
     });
 
-    // Input channel: supported buttons + touch surface. The touch surface MUST match the
-    // advertised video resolution (1280x720) — a mismatch (we used 800x480 while
-    // advertising 720p video) is geometrically inconsistent and the phone sets up the
-    // video channel but never STARTS the stream. The DHU advertises {1280,720,2,0}.
+    // Input channel: supported buttons + touch surface. The touch surface MUST match
+    // the advertised video resolution. We advertise 480p = 800x480 (below), which is
+    // the panel's native size: software H.264 of 720p was ~37 ms/frame (> the 33 ms
+    // real-time budget) so the decode queue backed up, dropped keyframes and the
+    // screen froze; 480p is ~42% the pixels (~15 ms, real-time), needs no downscale
+    // blit, and cuts the memory-bus contention that was nicking AA audio. [hw]: 2026.
     w.submessage(1, [](pb::Writer& ch) {
         ch.uint32(1, static_cast<uint32_t>(ChannelId::Input));
         ch.submessage(4, [](pb::Writer& ic) {
@@ -87,8 +89,8 @@ std::vector<uint8_t> buildServiceDiscoveryResponse() {
                 ic.uint32(1, key);
             }
             ic.submessage(2, [](pb::Writer& tc) {
-                tc.uint32(1, 1280);  // width  (TouchConfig has only width + height)
-                tc.uint32(2, 720);   // height
+                tc.uint32(1, 800);   // width  (must match the 480p video below)
+                tc.uint32(2, 480);   // height
             });
         });
     });
@@ -106,7 +108,7 @@ std::vector<uint8_t> buildServiceDiscoveryResponse() {
                                                     // it the phone sets up the channel but
                                                     // never knows it's video, so never starts)
             av.submessage(4, [](pb::Writer& vc) {   // video_configs[0] (VideoConfigData)
-                vc.uint32(1, 2);      // video_resolution = _720p
+                vc.uint32(1, 1);      // video_resolution = _480p (800x480, native panel)
                 vc.uint32(2, 1);      // video_fps = _30
                 vc.uint32(3, 0);      // margin_width
                 vc.uint32(4, 0);      // margin_height
