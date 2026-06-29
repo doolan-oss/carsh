@@ -99,6 +99,10 @@ public:
     // Forward a touch to the phone (INPUT_EVENT_INDICATION on the input channel).
     // x/y are AA source-frame coords (0..799 / 0..479). False until input is open.
     bool sendTouch(TouchAction action, uint32_t x, uint32_t y, uint64_t timestamp);
+    // Send a media transport key (play/pause/next/prev) to the phone as a press +
+    // release ButtonEvent on the input channel — lets the HU drive AA media playback
+    // from its own Now Playing UI. False until the input channel is open.
+    bool sendMediaKey(MediaKey key, uint64_t timestamp);
 
     // Push the periodic sensor readings the phone needs to enable projection: a
     // DRIVING_STATUS (unrestricted/parked) + NIGHT_MODE event. The phone WAITS on
@@ -133,6 +137,8 @@ private:
     void handleAvChannel(ChannelId ch, uint16_t msgId, const uint8_t* p, size_t n);
     void handleInputChannel(uint16_t msgId, const uint8_t* p, size_t n);
     void handleSensorChannel(uint16_t msgId, const uint8_t* p, size_t n);
+    // One ButtonEvent (down or up) for a media key on the input channel.
+    bool sendButtonEvent(MediaKey key, bool pressed, uint64_t timestamp);
     void sendAvSetupResponse(ChannelId ch, uint8_t configIndex);
     void sendMediaAck(ChannelId ch);
     void sendSensorEvent(uint32_t sensorType);
