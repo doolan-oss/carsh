@@ -101,7 +101,7 @@ carsh::aa::FrameRelay g_aaFrames;
 // kAaPrimeMs trades startup latency for stall tolerance — tune on the bench (lower
 // if AA audio lags video noticeably; raise if dropouts persist). It is the consumer
 // (the PWM IRQ via BtMixSink::render); nothing else drains g_aaRing.
-constexpr unsigned kAaPrimeMs = 200;
+constexpr unsigned kAaPrimeMs = 320;
 carsh::audio::JitterBuffer g_aaJitter(
     g_aaRing, std::size_t(kRate) * kChannels * kAaPrimeMs / 1000);
 
@@ -564,6 +564,10 @@ CStdlibApp::TShutdownMode CKernel::Run(void) {
     // ticks lining up with rising AA underruns is the signature of the prime
     // hypothesis (decode starving the audio refill) — see AA_AUDIO_INVESTIGATION.
     unsigned aaTickMaxUs = 0, aaTickSumUs = 0, aaTickCount = 0;
+    // render() time window (us). render() is the one stretch with NO audio refill, so
+    // its peak ~= the worst gap g_aaRing faces — the suspected source of the remaining
+    // AA stutter (the 720p video blit on core 0, + memory contention with core 3).
+    unsigned renderMaxUs = 0, renderSumUs = 0, renderCount = 0;
     // Diagnostic software audio sink: no I2S DAC is wired yet, so nothing pulls
     // the engine — playback position would never advance. Each UI tick we consume
     // ~30 ms of audio here (decode -> ring -> engine DSP), which advances the
@@ -698,7 +702,14 @@ CStdlibApp::TShutdownMode CKernel::Run(void) {
             devices.setDevices(rows, connIdx);
         }
 
-        mgr.render(canvas);
+        {
+            const unsigned t0 = CTimer::GetClockTicks();
+            mgr.render(canvas);
+            const unsigned dt = CTimer::GetClockTicks() - t0;
+            if (dt > renderMaxUs) renderMaxUs = dt;
+            renderSumUs += dt;
+            ++renderCount;
+        }
 
         // Storage/USB diagnostics panel (toggle: tap the top-right corner).
         // Mirrors the boot/scan log (SD/USB mount, indexed file/track counts)
@@ -777,13 +788,15 @@ CStdlibApp::TShutdownMode CKernel::Run(void) {
         // (Reads counters from the UI task — never logs from the PWM IRQ context.)
         if (frame % 33 == 0) {
             const unsigned tickAvg = aaTickCount ? aaTickSumUs / aaTickCount : 0;
+            const unsigned renderAvg = renderCount ? renderSumUs / renderCount : 0;
             mLogger.Write(FROM, LogNotice,
                           "aa-audio: ring=%u/%u prime=%u eng=%d under=%lu primes=%lu "
-                          "tick(us) max=%u avg=%u",
+                          "tick(us) max=%u avg=%u render(us) max=%u avg=%u",
                           unsigned(g_aaJitter.occupancy()), unsigned(g_aaRing.capacity()),
                           unsigned(g_aaJitter.primeElements()), g_aaJitter.engaged() ? 1 : 0,
                           (unsigned long)g_aaJitter.underruns(),
-                          (unsigned long)g_aaJitter.primeEvents(), aaTickMaxUs, tickAvg);
+                          (unsigned long)g_aaJitter.primeEvents(), aaTickMaxUs, tickAvg,
+                          renderMaxUs, renderAvg);
 #ifdef CARSH_HAVE_OPENH264
             unsigned decMax = 0, decAvg = 0, decN = 0;
             aaDecodeStats.snapshot(decMax, decAvg, decN);
@@ -795,6 +808,7 @@ CStdlibApp::TShutdownMode CKernel::Run(void) {
                           (unsigned long)aaAsync.queue().dropped());
 #endif
             aaTickMaxUs = aaTickSumUs = aaTickCount = 0;
+            renderMaxUs = renderSumUs = renderCount = 0;
         }
 
         // (The ~30 ms inter-frame sleep is now spread across the aaTick() refills
