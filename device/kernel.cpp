@@ -46,6 +46,7 @@
 #include "library/Database.h"
 #include "library/Indexer.h"
 #include "library/LibraryBrowser.h"
+#include "library/LibraryCache.h"
 #include "library/ArtSource.h"
 #include "player/PlayerController.h"
 #include "player/MediaSession.h"
@@ -287,7 +288,26 @@ CStdlibApp::TShutdownMode CKernel::Run(void) {
     carsh::player::PlayerController player(media.vfs(), g_ring, g_engine,
                                            kChannels);
 
-    scanLibrary(media);
+    // Library: load the cached DB if the media tree is unchanged (fast boot), else
+    // scan and write the cache to the SD card for next time. The signature is over
+    // the MEDIA source; the cache lives on the writable SD boot card.
+    {
+        const char* kDbPath = "/carsh/library.db";
+        const char* kSigPath = "/carsh/library.sig";
+        const uint64_t sig =
+            carsh::library::librarySignature(media.vfs(), media.root());
+        const bool loaded =
+            mSdMounted && carsh::library::tryLoadLibrary(g_sdSource.vfs(), kDbPath,
+                                                         kSigPath, sig, g_db);
+        if (loaded) {
+            diag("library: %u tracks (cache hit)", unsigned(g_db.trackCount()));
+        } else {
+            scanLibrary(media);
+            if (mSdMounted && carsh::library::saveLibrary(g_sdSource.vfs(), kDbPath,
+                                                          kSigPath, sig, g_db))
+                diag("library: cache saved");
+        }
+    }
     checkOta();
 
     // Framebuffer + UI.
