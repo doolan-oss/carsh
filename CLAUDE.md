@@ -58,9 +58,11 @@ entropy via Circle's hardware RNG).
 `third_party/circle-stdlib/` is git-ignored, so local edits to it are tracked as
 patches under `scripts/patches/` and **must be re-applied after a fresh checkout**
 (see `scripts/patches/README.md`). Current patches: a USB Bluetooth ACL path, an
-Android-Auto USB factory hook, and a USB hub reconfigure fix. After patching, rebuild
-the affected lib (e.g. `cd third_party/circle-stdlib/libs/circle/lib/usb && make`)
-then relink the image.
+Android-Auto USB factory hook, a USB hub reconfigure fix, and **`sysconfig-multicore`
+(enables `ARM_ALLOW_MULTI_CORE`)**. After patching, rebuild the affected lib (e.g.
+`cd third_party/circle-stdlib/libs/circle/lib/usb && make`) then relink the image —
+**except the multicore patch, which needs a full `libcircle` rebuild** (see the bench
+loop above).
 
 ## The bench loop (hardware iteration)
 
@@ -71,12 +73,24 @@ loop, with the card in a USB reader as `/dev/sda1` (label `CARSHBOOT`):
 udisksctl mount -b /dev/sda1
 cp device/kernel8-rpi4.img /run/media/$USER/CARSHBOOT/ && sync
 udisksctl unmount -b /dev/sda1
-# move card to the Pi, power on; capture the console (run in background, it survives
-# power-cycles): a loop that `cat`s /dev/ttyACM0 (115200 raw) to a log file.
+# move card to the Pi, power on; capture the console (survives power-cycles):
+python3 scripts/bench_capture.py bench.log &   # run in background, re-attaches on reboot
 ```
 Bare metal has no remote shell — **route diagnostics to the serial log and iterate**.
 The USB-C console is brought up before the USB host in `kernel.cpp` so enumeration
 logs are captured. Batch your logging up-front; each flash is a manual card swap.
+
+> **Serial-capture gotcha:** a plain `cat`/`stty` on `/dev/ttyACM0` *blocks on open* —
+> the Circle CDC-ACM gadget doesn't assert carrier (DCD), so the open waits forever and
+> the capture silently hangs. Use **`scripts/bench_capture.py`** (opens non-blocking
+> with `CLOCAL`, re-attaches across power-cycles) — start it once and leave it running.
+
+> **Multi-core (since 2026-06-29):** AA H.264 decode runs on a dedicated A72 core, so
+> circle is now built with **`ARM_ALLOW_MULTI_CORE`** (`scripts/patches/sysconfig-multicore.patch`).
+> After a fresh `scripts/fetch_circle.sh` you MUST re-apply that patch and **rebuild all
+> of libcircle** (`cd third_party/circle-stdlib/libs/circle && ./makeall clean && ./makeall -j`),
+> not just one dir — it changes the MMU (inner-shareable cacheable, which makes the
+> cross-core SPSC handoffs coherent) + the secondary-core spin-up.
 
 ## Current focus: wireless Android Auto via a USB dongle
 
@@ -86,18 +100,25 @@ a **wired-AA phone over USB**. carsh is the **USB-host wired-AA head unit**. The
 protocol core (`src/aa/`: framing, protobuf, connection state machine, H.264 NAL
 parse) is host-tested and merged. Bring-up status (full log in `AA_PLAN.md`):
 
-- **Done on hardware (rungs 1–4a):** dongle enumerates (`ven2717-ff40`, Android PTP)
-  → AOA mode-switch → re-enumerates in accessory mode (`ven18d1-2d00`) → bulk
-  endpoints bound + registered as `uaa1` (`device/CircleAoaTransport.cpp` =
-  `CAndroidAutoDevice`, a `CUSBFunction` + `IAaTransport`) → `CircleAaDriver` drives
-  `AaConnection` over it and the **plaintext VERSION_REQUEST/RESPONSE exchange with
-  the phone succeeds** (bidirectional bulk proven). A logging stub crypto stops at TLS.
-- **Next (rung 4b — TLS):** fully scoped + de-risked in `AA_PLAN.md`. mbedTLS builds
-  for Circle; port `dylant9/head_unit:main/aa_crypto.c` → `device/AaCryptoMbedTls`
-  (implements `IAaCrypto`; HU = SSL client, `VERIFY_NONE`, in-memory BIO, the embedded
-  aasdk head-unit cert — note the x509 date-parse bypass gotcha), link the mbedTLS
-  `.a`s, swap out `LoggingCrypto`. Then service discovery → channels → H.264 decode
-  (rung 5, software/openh264 on a dedicated A72 core) → the `AndroidAuto` UI tab
-  (already built: aspect-fit video blit + touch remap in `src/ui/AndroidAutoScreen.h`).
+- **Working end-to-end on hardware:** dongle enumerates (`ven2717-ff40` PTP) → AOA
+  switch → accessory mode (`ven18d1-2d00`) → bulk endpoints bound as `uaa1` →
+  version → **live TLS** (real aasdk cert in `AaHuCert.h`) → service discovery →
+  channels → **H.264 video + media audio both play.** AA media is also wired into the
+  player UI (Now Playing source badge + transport keys; see `player::MediaSession`).
+- **Choppy audio: fixed (2026-06-29, "good enough" on the bench; PR #24 branch
+  `claude/aa-decode-core`).** Decode moved to a **dedicated A72 core**
+  (`CircleAaDecodeCore` + `ARM_ALLOW_MULTI_CORE`), frames cross to the UI core via a
+  lock-free triple buffer (`src/aa/FrameRelay.h`), audio refilled several times per UI
+  loop, **video dropped to 480p (800×480, native panel)** so software decode is
+  real-time (~15 ms, was ~37 ms at 720p → it had been overflowing the queue, dropping
+  keyframes, and freezing the screen), and the `JitterBuffer` got a 480 ms prebuffer +
+  quick-resume for the dongle's bursty WiFi audio delivery. Full story in
+  `AA_AUDIO_INVESTIGATION.md`.
+- **Open / next:** the **intermittent xHCI `Transfer error 4` on the bulk-IN during
+  the TLS handshake** — non-deterministic; sometimes hard-hangs the board at startup
+  ("AA doesn't start up stable"), recovers on a power-cycle + dongle re-plug. This is
+  the top AA bug to chase (see `HARDWARE_TODO.md` H8). Also: video can lag under heavy
+  motion (no frame-drop policy; audio was prioritised).
 
-When picking up: read `AA_PLAN.md` (plan + bench log) and `STATUS.md` (module state).
+When picking up: read `AA_PLAN.md` (plan + bench log), `AA_AUDIO_INVESTIGATION.md`
+(the audio fix), and `STATUS.md` (module state).
