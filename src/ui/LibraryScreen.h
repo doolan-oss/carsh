@@ -20,15 +20,18 @@ public:
     explicit LibraryScreen(Rect c)
         : Screen(c),
           header_({c.x + 8, c.y + 10, c.w - 16, kCellH * 2}, "Artists", 2),
-          list_({c.x + 8, c.y + 44, c.w - 16, c.h - 44 - 72}),
+          // List leaves room on the right for the A–Z jump strip.
+          list_({c.x + 8, c.y + 44, c.w - 16 - 28, c.h - 44 - 72}),
+          az_({c.x + c.w - 28, c.y + 44, 22, c.h - 44 - 72}),
           back_({c.x + 8, c.y + c.h - 64, 110, 56}, "BACK",
                 [this] { if (onBack) onBack(); }),
           play_({c.x + 126, c.y + c.h - 64, 180, 56}, "PLAY ALL",
                 [this] { if (onPlay) onPlay(); }),
           shuffle_({c.x + 314, c.y + c.h - 64, 230, 56}, "SHUFFLE ALL",
                    [this] { if (onShuffle) onShuffle(); }) {
-        widgets_ = {&header_, &list_, &back_, &play_, &shuffle_};
+        widgets_ = {&header_, &list_, &az_, &back_, &play_, &shuffle_};
         list_.setOnSelect([this](int i) { if (onSelectRow) onSelectRow(i); });
+        az_.setOnPick([this](char ch) { if (onJump) onJump(ch); });
     }
     const char* name() const override { return "Lib"; }
 
@@ -43,6 +46,9 @@ public:
         shuffle_.setLabel(shuffle);
     }
 
+    // Scroll the list so row `i` is at the top (driven by the jump bar).
+    void scrollTo(int i) { list_.scrollTo(i); }
+
     ListView& list() { return list_; }
     const std::string& playLabel() const { return play_.label(); }
     const std::string& shuffleLabel() const { return shuffle_.label(); }
@@ -51,10 +57,12 @@ public:
     // Intents.
     std::function<void(int)> onSelectRow;
     std::function<void()> onBack, onPlay, onShuffle;
+    std::function<void(char)> onJump;  // A–Z strip tapped (letter)
 
 private:
     Label header_;
     ListView list_;
+    AzIndexBar az_;
     Button back_, play_, shuffle_;
 };
 

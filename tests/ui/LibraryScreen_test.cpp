@@ -59,6 +59,26 @@ TEST(LibraryScreen, BackHiddenAtRootIsNotTappable) {
     CHECK_EQ(backs, 1);
 }
 
+TEST(LibraryScreen, AzBarFiresJumpAndScrollTo) {
+    LibraryScreen s({0, 0, 748, 432});
+    char picked = 0;
+    s.onJump = [&](char ch) { picked = ch; };
+    // A–Z strip spans x∈[720,742], y∈[44,360]. Top slot -> 'A'.
+    CHECK(s.handle(tap(725, 46)));
+    CHECK_EQ(picked, 'A');
+    // Near the bottom -> '#'.
+    CHECK(s.handle(tap(725, 358)));
+    CHECK_EQ(picked, '#');
+
+    // scrollTo moves the list view + selects the row.
+    std::vector<std::string> items;
+    for (int i = 0; i < 60; ++i) items.push_back("row");
+    s.setItems(items);
+    s.scrollTo(30);
+    CHECK(s.list().scrollOffset() > 0);
+    CHECK_EQ(s.list().selectedIndex(), 30);
+}
+
 TEST(LibraryScreen, ScopeLabelsUpdate) {
     LibraryScreen s({0, 0, 748, 432});
     CHECK_EQ(s.playLabel(), std::string("PLAY ALL"));        // default

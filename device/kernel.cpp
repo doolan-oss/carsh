@@ -381,6 +381,10 @@ CStdlibApp::TShutdownMode CKernel::Run(void) {
     library.onBack = [&] { browser.back(); refreshLibrary(); };
     library.onPlay = [&] { startQueue(browser.playAll(false)); };
     library.onShuffle = [&] { startQueue(browser.playAll(true)); };
+    library.onJump = [&](char ch) {
+        const int i = browser.firstRowForLetter(ch);
+        if (i >= 0) library.scrollTo(i);  // jump the list to that letter
+    };
     refreshLibrary();
 
     // Queue tab: tap a row to jump within the current queue; CLEAR stops + empties it.
