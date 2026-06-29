@@ -68,6 +68,13 @@ public:
                                 static_cast<uint32_t>(sy), timestamp);
     }
 
+    // From the player UI: drive AA media playback (play/pause/next/prev) by sending a
+    // media key over the input channel. False if not projecting.
+    bool sendMediaKey(MediaKey key, uint64_t timestamp = 0) {
+        if (conn_ == nullptr) return false;
+        return conn_->sendMediaKey(key, timestamp);
+    }
+
     // From the AA screen: the AA tab gained/lost focus -> VIDEO_FOCUS_INDICATION, so
     // the phone only streams while we're showing it. False if not projecting.
     bool setFocus(bool focused) {

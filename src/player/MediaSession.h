@@ -8,11 +8,14 @@
 // streaming) and reads back the view + source. No player/BTstack types leak in —
 // only plain values and bt::AvrcpMetadata — so it sits cleanly between the two.
 //
-// Source rule: Bluetooth owns now-playing when the phone is actually streaming audio
-// (A2DP PCM flowing or AVRCP says PLAYING), or when it's connected and there is no
-// local track to show; otherwise the local player owns it. This mirrors the audio
-// mix priority (BT over the local engine when BT has PCM) so the screen matches what
-// you hear.
+// Source rule (priority Android Auto > Bluetooth > Local, mirroring the audio mix in
+// BtMixSink so the screen matches what you hear):
+//   * Android Auto owns now-playing while its audio is streaming;
+//   * else Bluetooth owns it when the phone is streaming (A2DP PCM / AVRCP PLAYING)
+//     or it's connected and there's no local track to show;
+//   * else the local file player owns it.
+// Transport (play/pause/next/prev) routes to whichever owns it: AA media keys over
+// the input channel, AVRCP to the BT phone, or the local player.
 #pragma once
 
 #include <cstdint>
@@ -22,7 +25,7 @@
 
 namespace carsh::player {
 
-enum class Source : uint8_t { Local, Bluetooth };
+enum class Source : uint8_t { Local, Bluetooth, AndroidAuto };
 
 class MediaSession {
 public:
@@ -51,9 +54,13 @@ public:
         btStreaming_ = streaming;
         btMeta_ = md;
     }
+    // active: Android Auto audio is currently streaming out the jack (the AA jitter
+    // buffer is engaged). AA has no metadata channel yet, so only its activity matters.
+    void setAndroidAuto(bool active) { aaActive_ = active; }
 
     // --- Outputs ------------------------------------------------------------
     Source source() const {
+        if (aaActive_) return Source::AndroidAuto;
         if (btConnected_ && (btStreaming_ || !local_.hasTrack)) return Source::Bluetooth;
         return Source::Local;
     }
@@ -61,7 +68,13 @@ public:
     NowPlayingView view() const {
         NowPlayingView v;
         v.source = source();
-        if (v.source == Source::Bluetooth) {
+        if (v.source == Source::AndroidAuto) {
+            // No AA metadata channel yet — the projection tab shows the rich UI; here
+            // we just label the source and let the transport buttons drive it.
+            v.title = "Android Auto";
+            v.artist = "Projecting";
+            v.playing = true;
+        } else if (v.source == Source::Bluetooth) {
             // Before the first AVRCP attribute arrives, show a neutral label so the
             // screen isn't blank while connected.
             v.title = btMeta_.title.empty() ? "Bluetooth" : btMeta_.title;
@@ -98,6 +111,7 @@ private:
     LocalState local_;
     bool btConnected_ = false;
     bool btStreaming_ = false;
+    bool aaActive_ = false;
     carsh::bt::AvrcpMetadata btMeta_;
 };
 

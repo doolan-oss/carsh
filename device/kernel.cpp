@@ -460,27 +460,8 @@ CStdlibApp::TShutdownMode CKernel::Run(void) {
     // (A2DP+AVRCP), and tells the transport buttons which backend to drive. Fed a
     // fresh snapshot each frame in the UI loop below.
     carsh::player::MediaSession session;
-    now.onPlayPause = [&] {
-        if (session.transportTarget() == carsh::player::Source::Bluetooth) {
-            bt.sendAvrcpCommand(session.playPauseCommand());
-        } else if (player.state().transport == carsh::player::Transport::Playing) {
-            player.pause();
-        } else {
-            player.resume();
-        }
-    };
-    now.onNext = [&] {
-        if (session.transportTarget() == carsh::player::Source::Bluetooth)
-            bt.sendAvrcpCommand(carsh::bt::AvrcpCommand::Next);
-        else
-            player.next();
-    };
-    now.onPrev = [&] {
-        if (session.transportTarget() == carsh::player::Source::Bluetooth)
-            bt.sendAvrcpCommand(carsh::bt::AvrcpCommand::Prev);
-        else
-            player.prev();
-    };
+    // (Now Playing transport buttons are wired after the AA projection is set up
+    // below, so they can also route play/pause/next/prev to Android Auto.)
 
     // Spawn the cooperative decode task (sole ring producer). The scheduler owns
     // it; it runs whenever this (UI) task yields via MsSleep below.
@@ -584,6 +565,46 @@ CStdlibApp::TShutdownMode CKernel::Run(void) {
         aaProjection.forwardTouch(sx, sy, carsh::aa::TouchAction::Release, ts);
     };
     androidAuto.onFocusChanged = [&](bool focused) { aaProjection.setFocus(focused); };
+
+    // Now Playing transport buttons -> the active source (chosen by MediaSession each
+    // frame). Android Auto: media keys over the AA input channel; Bluetooth: AVRCP;
+    // local: the file player. Wired here so the lambdas can reach aaProjection + bt.
+    now.onPlayPause = [&] {
+        switch (session.transportTarget()) {
+            case carsh::player::Source::AndroidAuto:
+                aaProjection.sendMediaKey(carsh::aa::MediaKey::PlayPause);
+                break;
+            case carsh::player::Source::Bluetooth:
+                bt.sendAvrcpCommand(session.playPauseCommand());
+                break;
+            case carsh::player::Source::Local:
+                if (player.state().transport == carsh::player::Transport::Playing)
+                    player.pause();
+                else
+                    player.resume();
+                break;
+        }
+    };
+    now.onNext = [&] {
+        switch (session.transportTarget()) {
+            case carsh::player::Source::AndroidAuto:
+                aaProjection.sendMediaKey(carsh::aa::MediaKey::Next); break;
+            case carsh::player::Source::Bluetooth:
+                bt.sendAvrcpCommand(carsh::bt::AvrcpCommand::Next); break;
+            case carsh::player::Source::Local:
+                player.next(); break;
+        }
+    };
+    now.onPrev = [&] {
+        switch (session.transportTarget()) {
+            case carsh::player::Source::AndroidAuto:
+                aaProjection.sendMediaKey(carsh::aa::MediaKey::Previous); break;
+            case carsh::player::Source::Bluetooth:
+                bt.sendAvrcpCommand(carsh::bt::AvrcpCommand::Prev); break;
+            case carsh::player::Source::Local:
+                player.prev(); break;
+        }
+    };
 
     mLogger.Write(FROM, LogNotice, "entering UI loop");
     unsigned frame = 0;
@@ -699,6 +720,9 @@ CStdlibApp::TShutdownMode CKernel::Run(void) {
         // PLAYING; that (plus connected) is what hands Now Playing to the phone.
         session.setBluetooth(bt.connected(),
                              g_btRing.readable() > 0 || g_btMeta.playing, g_btMeta);
+        // Android Auto owns Now Playing while its audio is actually streaming (the AA
+        // jitter buffer is engaged), matching the audio mix priority AA > BT > local.
+        session.setAndroidAuto(g_aaJitter.engaged());
 
         const carsh::player::MediaSession::NowPlayingView v = session.view();
         carsh::ui::NowPlayingScreen::State st;
@@ -708,7 +732,9 @@ CStdlibApp::TShutdownMode CKernel::Run(void) {
         st.positionMs = v.positionMs;
         st.durationMs = v.durationMs;
         st.playing = v.playing;
-        st.source = v.source == carsh::player::Source::Bluetooth ? "BLUETOOTH" : "";
+        st.source = v.source == carsh::player::Source::AndroidAuto ? "ANDROID AUTO"
+                  : v.source == carsh::player::Source::Bluetooth   ? "BLUETOOTH"
+                                                                   : "";
         now.setState(st);
 
         // BT tab: reflect scan state + the discovered/connected device list. The

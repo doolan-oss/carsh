@@ -86,6 +86,20 @@ TEST(MediaSession, BluetoothNeutralLabelBeforeMetadata) {
     CHECK_EQ(s.view().title, std::string("Bluetooth"));
 }
 
+TEST(MediaSession, AndroidAutoOutranksEverything) {
+    MediaSession s;
+    s.setLocal(localTrack("Song A", true));
+    s.setBluetooth(true, true, btMeta("Phone Song", true));  // BT streaming too
+    s.setAndroidAuto(true);                                   // ...but AA is active
+    CHECK(s.source() == Source::AndroidAuto);
+    auto v = s.view();
+    CHECK_EQ(v.title, std::string("Android Auto"));
+    CHECK(v.playing);
+    // When AA stops, it falls back to the next-highest active source (BT here).
+    s.setAndroidAuto(false);
+    CHECK(s.source() == Source::Bluetooth);
+}
+
 TEST(MediaSession, TransportTargetAndPlayPauseCommand) {
     MediaSession s;
     s.setLocal(localTrack("Song A", false));
