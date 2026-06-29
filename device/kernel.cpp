@@ -94,16 +94,16 @@ carsh::audio::PcmRing<float> g_aaRing(kRate * kChannels);  // ~1 s stereo
 carsh::aa::FrameRelay g_aaFrames;
 
 // AA media-audio prebuffer / underrun handler over g_aaRing (the choppy-audio fix).
-// The ring is fed in real time and drained in real time, so without a prebuffer it
-// hovers near empty and any refill stall (a long H.264 decode) instantly underruns.
-// The JitterBuffer waits until ~kAaPrimeMs is buffered before playing, rides out
-// short reads as silence (no source-switch click), and re-primes before resuming.
-// kAaPrimeMs trades startup latency for stall tolerance — tune on the bench (lower
-// if AA audio lags video noticeably; raise if dropouts persist). It is the consumer
-// (the PWM IRQ via BtMixSink::render); nothing else drains g_aaRing.
-constexpr unsigned kAaPrimeMs = 320;
+// AA audio arrives over the dongle's wireless link in BURSTS (bench-measured: clumps
+// of frames then 200-600 ms gaps), so g_aaRing needs a big cushion. kAaPrimeMs is the
+// startup cushion; kAaResumeMs is the much smaller threshold to resume after a
+// transient gap (so a 300 ms gap costs ~300 ms, not 300 ms + a full re-prime). Raise
+// kAaPrimeMs if dropouts persist; lower it if AA audio lags video too much.
+constexpr unsigned kAaPrimeMs = 480;
+constexpr unsigned kAaResumeMs = 60;
 carsh::audio::JitterBuffer g_aaJitter(
-    g_aaRing, std::size_t(kRate) * kChannels * kAaPrimeMs / 1000);
+    g_aaRing, std::size_t(kRate) * kChannels * kAaPrimeMs / 1000,
+    std::size_t(kRate) * kChannels * kAaResumeMs / 1000);
 
 carsh::audio::AudioEngine g_engine(&g_ring, kChannels);
 carsh::dsp::EqProcessor g_eq(kRate);
