@@ -45,11 +45,13 @@
 #include "dsp/Eq.h"
 #include "library/Database.h"
 #include "library/Indexer.h"
+#include "library/LibraryBrowser.h"
 #include "player/PlayerController.h"
 #include "profile/ProfileManager.h"
 #include "ui/Canvas.h"
 #include "ui/Screen.h"
 #include "ui/AndroidAutoScreen.h"
+#include "ui/LibraryScreen.h"
 #include "ui/Screens.h"
 
 #define FROM "carsh"
@@ -81,6 +83,11 @@ constexpr unsigned kRate = 48000;
 constexpr uint8_t kChannels = 2;
 
 carsh::library::Database g_db;
+// Track ids of the CURRENT player queue, in queue order. The library browser builds
+// queues from arbitrary scopes (album / artist / shuffled / whole library), so the
+// now-playing display must resolve metadata via this — NOT via a fixed allTracks()
+// list, whose order no longer matches the queue.
+std::vector<uint64_t> g_queueIds;
 carsh::audio::PcmRing<float> g_ring(kRate * kChannels);  // ~1 s stereo (local)
 carsh::audio::PcmRing<float> g_btRing(kRate * kChannels);  // A2DP jitter+decode
 // Android Auto media audio (ch=4, 48 kHz stereo PCM from the phone). Filled by the
@@ -292,7 +299,7 @@ CStdlibApp::TShutdownMode CKernel::Run(void) {
     carsh::ui::ScreenManager mgr(rt.width(), rt.height());
 
     carsh::ui::NowPlayingScreen now(mgr.contentRect());
-    carsh::ui::ListScreen library(mgr.contentRect(), "Lib");
+    carsh::ui::LibraryScreen library(mgr.contentRect());
     carsh::ui::SearchScreen search(mgr.contentRect());
     carsh::ui::ListScreen queue(mgr.contentRect(), "Q");
     carsh::ui::EqScreen eq(mgr.contentRect());
@@ -325,24 +332,49 @@ CStdlibApp::TShutdownMode CKernel::Run(void) {
     g_masterGain = mgr.volumeGain();
     g_engine.setMasterVolume(g_masterGain);
 
-    // Library list -> tap queues + plays that track.
-    std::vector<uint64_t> ids = g_db.allTracks();
-    std::vector<std::string> rows;
-    std::vector<std::string> paths;
-    for (uint64_t id : ids) {
-        const carsh::library::Track* t = g_db.get(id);
-        if (!t) continue;
-        rows.push_back(g_db.artist(*t) + " - " + g_db.title(*t));
-        paths.push_back(g_db.path(*t));
-    }
-    if (rows.empty()) rows.push_back("(insert FAT32 media with music)");
-    library.setItems(rows);
-    library.setOnSelect([&](int i) {
-        if (i >= 0 && i < int(paths.size())) {
-            player.setQueue(paths);
-            player.play(i);  // starts decode; audio device opened on hardware
+    // Library tab: hierarchical browse (Artists -> Albums -> Songs) with play /
+    // shuffle scoped to the current level (whole library / one artist / one album).
+    // The browser is the platform-independent model (host-tested); the screen just
+    // renders its rows + forwards intents back into it.
+    carsh::library::LibraryBrowser browser(g_db);
+    browser.setSeed(CTimer::GetClockTicks() | 1u);  // vary the shuffle per boot
+
+    // Build a player queue from a set of track ids and start playing. Keeps
+    // g_queueIds in lockstep with the queue so now-playing can resolve metadata.
+    auto startQueue = [&](const carsh::library::LibraryBrowser::PlayRequest& req) {
+        if (!req.valid()) return;
+        std::vector<std::string> paths;
+        paths.reserve(req.trackIds.size());
+        for (uint64_t id : req.trackIds) {
+            const carsh::library::Track* t = g_db.get(id);
+            paths.push_back(t ? g_db.path(*t) : std::string());
         }
-    });
+        g_queueIds = req.trackIds;
+        player.setQueue(std::move(paths));
+        player.play(req.startIndex);  // starts decode; audio device opened on hardware
+    };
+
+    // Push the browser's current level into the screen (title, rows, BACK visibility,
+    // scope-aware PLAY/SHUFFLE captions).
+    auto refreshLibrary = [&]() {
+        library.setTitle(browser.title());
+        if (browser.rows().empty())
+            library.setItems({"(insert FAT32 media with music)"});
+        else
+            library.setItems(browser.rows());
+        library.setCanGoBack(browser.canGoBack());
+        const std::string sc = browser.scope();
+        library.setPlayLabels("PLAY " + sc, "SHUFFLE " + sc);
+    };
+
+    library.onSelectRow = [&](int i) {
+        if (auto req = browser.select(i)) startQueue(*req);  // a song -> play it
+        else refreshLibrary();                              // drilled a level
+    };
+    library.onBack = [&] { browser.back(); refreshLibrary(); };
+    library.onPlay = [&] { startQueue(browser.playAll(false)); };
+    library.onShuffle = [&] { startQueue(browser.playAll(true)); };
+    refreshLibrary();
 
     // EQ screen edits feed the live engine EQ.
     eq.onBandChange = [&](int, double) { g_eq.setConfig(eq.config()); };
@@ -593,9 +625,9 @@ CStdlibApp::TShutdownMode CKernel::Run(void) {
             uint32_t r = carsh::device::btGlueA2dpSampleRate();
             wantRate = r ? r : 44100;
             wantOpen = true;
-        } else if (ps.queueIndex >= 0 && ps.queueIndex < int(ids.size())) {
+        } else if (ps.queueIndex >= 0 && ps.queueIndex < int(g_queueIds.size())) {
             const carsh::library::Track* t =
-                g_db.get(ids[std::size_t(ps.queueIndex)]);
+                g_db.get(g_queueIds[std::size_t(ps.queueIndex)]);
             wantRate = (t && t->sampleRate) ? t->sampleRate : kRate;
             wantOpen = true;
         }
@@ -629,8 +661,9 @@ CStdlibApp::TShutdownMode CKernel::Run(void) {
         }
 
         carsh::ui::NowPlayingScreen::State st;
-        if (ps.queueIndex >= 0 && ps.queueIndex < int(ids.size())) {
-            const carsh::library::Track* t = g_db.get(ids[std::size_t(ps.queueIndex)]);
+        if (ps.queueIndex >= 0 && ps.queueIndex < int(g_queueIds.size())) {
+            const carsh::library::Track* t =
+                g_db.get(g_queueIds[std::size_t(ps.queueIndex)]);
             if (t) { st.title = g_db.title(*t); st.artist = g_db.artist(*t);
                      st.album = g_db.album(*t); }
         } else {
