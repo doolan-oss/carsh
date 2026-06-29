@@ -46,6 +46,7 @@
 #include "library/Database.h"
 #include "library/Indexer.h"
 #include "library/LibraryBrowser.h"
+#include "library/ArtSource.h"
 #include "player/PlayerController.h"
 #include "player/MediaSession.h"
 #include "profile/ProfileManager.h"
@@ -627,6 +628,10 @@ CStdlibApp::TShutdownMode CKernel::Run(void) {
     // hypothesis (decode starving the audio refill) — see AA_AUDIO_INVESTIGATION.
     unsigned aaTickMaxUs = 0, aaTickSumUs = 0, aaTickCount = 0;
     unsigned lastQueueVersion = ~0u;  // forces the Queue tab to build its rows once
+    // Album art (local source): sidecar covers rendered to ASCII, cached by albumKey
+    // and refreshed only when the now-playing album changes (decode is not free).
+    std::unordered_map<uint64_t, carsh::library::AsciiArt> artCache;
+    uint64_t lastArtAlbumKey = ~0ull;
     // Diagnostic software audio sink: no I2S DAC is wired yet, so nothing pulls
     // the engine — playback position would never advance. Each UI tick we consume
     // ~30 ms of audio here (decode -> ring -> engine DSP), which advances the
@@ -766,6 +771,28 @@ CStdlibApp::TShutdownMode CKernel::Run(void) {
             queue.setItems(std::move(qrows));
         }
         queue.setCurrent(v.source == carsh::player::Source::Local ? ps.queueIndex : -1);
+
+        // Now Playing album art (local source only): update on album change, cached.
+        if (v.source == carsh::player::Source::Local && ps.queueIndex >= 0 &&
+            ps.queueIndex < int(g_queueIds.size())) {
+            const carsh::library::Track* t =
+                g_db.get(g_queueIds[std::size_t(ps.queueIndex)]);
+            const uint64_t ak = t ? t->albumKey : 0;
+            if (ak != lastArtAlbumKey) {
+                lastArtAlbumKey = ak;
+                auto it = artCache.find(ak);
+                if (it == artCache.end()) {
+                    carsh::library::AsciiArt a;  // rows==0 => looked, none found
+                    if (t) carsh::library::loadSidecarArt(media.vfs(), g_db.path(*t), a);
+                    it = artCache.emplace(ak, a).first;
+                }
+                if (it->second.rows > 0) now.setArt(it->second);
+                else now.clearArt();
+            }
+        } else if (lastArtAlbumKey != ~0ull) {
+            now.clearArt();        // BT/AA (or stopped): no local art
+            lastArtAlbumKey = ~0ull;  // re-evaluate when local playback resumes
+        }
 
         // BT tab: reflect scan state + the discovered/connected device list. The
         // connected device is upserted into the cache so it always shows, even on

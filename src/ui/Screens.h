@@ -42,6 +42,7 @@ public:
         play_.setLabel(s.playing ? "||" : ">");
     }
     void setArt(const library::AsciiArt& a) { art_ = a; hasArt_ = true; }
+    void clearArt() { hasArt_ = false; }  // no art for this track/source -> empty panel
 
     std::function<void()> onPrev, onPlayPause, onNext;
 
