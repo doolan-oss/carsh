@@ -34,6 +34,7 @@ HARDWARE_TODO.md for what the bench session must confirm.
 | UI: Widgets | host-done | Button, Label, ListView (select+scroll), TabBar. |
 | UI: ScreenManager + tabs | host-done | Tab routing, gesture dispatch, render. |
 | UI: 7 screens | host-done | Now/Lib/Find/Queue/EQ/Src/Set; PNG + touch tested. |
+| UI: LibraryScreen | host-done | "Lib" tab: hierarchical browse (header + list + BACK/PLAY/SHUFFLE), scope-aware captions; drives `LibraryBrowser`. 4 host tests (`LibraryScreen_test`). |
 | AA H.264 decode (`CircleH264Decoder`+`Yuv420`) | host-done / `[hw]` FPS | openh264-backed `IH264Decoder`; I420→RGB888 (BT.601) pure converter. Host build links **system openh264 2.4.1** (same line vendored for the Pi) and runs a real encode→decode→pixel-compare round trip (`H264Decode_test`, MAE-checked) + converter anchors. Device links the cross-built decoder via `make CARSH_HAVE_OPENH264=1`. **The aarch64 bare-metal decoder lib now builds + links into the image** (`scripts/build_openh264_baremetal.sh`: decoder+common+NEON at Circle's ABI, newlib pthread/sem shim headers in `scripts/openh264_baremetal_include/` + a no-op threading shim `scripts/openh264_baremetal_shim.c`; single-threaded `DecodeFrameNoDelay`, `HAVE_NEON_AARCH64` constant CPU-detect). `[hw]`: on-target decode correctness + FPS, dedicated-core run. |
 | Decoders (WAV/FLAC/MP3) | host-done | dr_libs; WAV bit-exact, FLAC lossless, MP3 tone. |
 | Decoder: Opus | host-done | libopusfile; real .opus fixture, tone-correlated. |
@@ -47,8 +48,9 @@ HARDWARE_TODO.md for what the bench session must confirm.
 | DSP: ReplayGain apply | host-done | dB<->lin, R128 ref gain, peak-clamped resolve. |
 | DSP: loudness measure (BS.1770) | host-done | K-weighting + gating; rate-correct coeffs; verified. |
 | Library: TextNorm | host-done | UTF-8 casefold + accent strip + tokenize. |
-| Library: Database | host-done | Upsert, token search (AND+prefix), browse, persist. |
+| Library: Database | host-done | Upsert, token search (AND+prefix), browse, persist. `byArtist`/`albumsByArtist` browse helpers (normalized album-artist match). |
 | Library: SmartPlaylist | host-done | Rule engine; All/Any, sort, limit. |
+| Library: LibraryBrowser | host-done | Hierarchical Artists→Albums→Songs nav + play/shuffle scoped to the current level (whole library / artist / album), seedable Fisher-Yates shuffle. 8 host tests (`LibraryBrowser_test`). |
 | Tag parsers (ID3v2/Vorbis/FLAC/Opus) | host-done | Real-encoder fixtures; lame UTF-16 quirk handled. |
 | Tag parsers (MP4/M4A) | deferred | Needs MP4 demux (with AAC-MP4/ALAC). |
 | Library: Indexer | host-done | Interruptible scan, tags+props, RG track+album scan. |

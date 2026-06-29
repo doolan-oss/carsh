@@ -59,6 +59,11 @@ public:
     struct AlbumEntry { uint64_t albumKey; std::string album; std::string artist; };
     std::vector<AlbumEntry> albums() const;
     std::vector<std::string> artists() const;
+    // All tracks by one album-artist (normalized match), in browse order — the
+    // hierarchical-browse "play/shuffle this artist" scope (LibraryBrowser).
+    std::vector<uint64_t> byArtist(const std::string& albumArtist) const;
+    // Distinct albums of one album-artist (normalized match), in browse order.
+    std::vector<AlbumEntry> albumsByArtist(const std::string& albumArtist) const;
 
     // Visit every track (for smart-playlist evaluation).
     template <typename Fn>
