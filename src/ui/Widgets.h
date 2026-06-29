@@ -148,6 +148,11 @@ public:
     int scrollOffset() const { return scroll_; }
     void setOnSelect(std::function<void(int)> cb) { onSelect_ = std::move(cb); }
 
+    // A persistent "current" row (e.g. the now-playing queue item), drawn with an
+    // accent marker independent of the tap selection. -1 = none.
+    void setCurrent(int i) { current_ = i; }
+    int current() const { return current_; }
+
     int visibleRows() const { return bounds.h / rowH_; }
 
     void draw(Canvas& c, const Theme& th) override {
@@ -158,8 +163,12 @@ public:
             if (ry >= bounds.y + bounds.h) break;
             if (i == selected_)
                 c.fillRect(bounds.x, ry, bounds.w, rowH_, th.accentBg);
-            uint32_t fg = (i == selected_) ? th.accent : th.bright;
-            c.drawText(bounds.x + 4, ry + (rowH_ - kCellH) / 2, items_[i], fg);
+            // Now-playing marker: a left accent bar so the current row reads at a
+            // glance even when a different row is tap-selected.
+            if (i == current_)
+                c.fillRect(bounds.x, ry, 4, rowH_, th.accent);
+            uint32_t fg = (i == selected_ || i == current_) ? th.accent : th.bright;
+            c.drawText(bounds.x + 8, ry + (rowH_ - kCellH) / 2, items_[i], fg);
         }
     }
     bool onTap(int px, int py) override {
@@ -186,6 +195,7 @@ private:
     std::vector<std::string> items_;
     int rowH_;
     int selected_ = -1;
+    int current_ = -1;
     int scroll_ = 0;
     std::function<void(int)> onSelect_;
 };

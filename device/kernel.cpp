@@ -302,7 +302,7 @@ CStdlibApp::TShutdownMode CKernel::Run(void) {
     carsh::ui::NowPlayingScreen now(mgr.contentRect());
     carsh::ui::LibraryScreen library(mgr.contentRect());
     carsh::ui::SearchScreen search(mgr.contentRect());
-    carsh::ui::ListScreen queue(mgr.contentRect(), "Q");
+    carsh::ui::QueueScreen queue(mgr.contentRect());
     carsh::ui::EqScreen eq(mgr.contentRect());
     carsh::ui::ListScreen sources(mgr.contentRect(), "Src");
     carsh::ui::SettingsScreen settings(mgr.contentRect());
@@ -340,6 +340,10 @@ CStdlibApp::TShutdownMode CKernel::Run(void) {
     carsh::library::LibraryBrowser browser(g_db);
     browser.setSeed(CTimer::GetClockTicks() | 1u);  // vary the shuffle per boot
 
+    // Bumped whenever the queue CONTENTS change (not on a within-queue jump), so the
+    // Queue tab only rebuilds its rows when needed rather than every frame.
+    unsigned queueVersion = 0;
+
     // Build a player queue from a set of track ids and start playing. Keeps
     // g_queueIds in lockstep with the queue so now-playing can resolve metadata.
     auto startQueue = [&](const carsh::library::LibraryBrowser::PlayRequest& req) {
@@ -351,6 +355,7 @@ CStdlibApp::TShutdownMode CKernel::Run(void) {
             paths.push_back(t ? g_db.path(*t) : std::string());
         }
         g_queueIds = req.trackIds;
+        ++queueVersion;
         player.setQueue(std::move(paths));
         player.play(req.startIndex);  // starts decode; audio device opened on hardware
     };
@@ -376,6 +381,15 @@ CStdlibApp::TShutdownMode CKernel::Run(void) {
     library.onPlay = [&] { startQueue(browser.playAll(false)); };
     library.onShuffle = [&] { startQueue(browser.playAll(true)); };
     refreshLibrary();
+
+    // Queue tab: tap a row to jump within the current queue; CLEAR stops + empties it.
+    queue.onSelect = [&](int i) { player.play(i); };
+    queue.onClear = [&] {
+        player.stop();
+        player.clearQueue();
+        g_queueIds.clear();
+        ++queueVersion;
+    };
 
     // EQ screen edits feed the live engine EQ.
     eq.onBandChange = [&](int, double) { g_eq.setConfig(eq.config()); };
@@ -612,6 +626,7 @@ CStdlibApp::TShutdownMode CKernel::Run(void) {
     // ticks lining up with rising AA underruns is the signature of the prime
     // hypothesis (decode starving the audio refill) — see AA_AUDIO_INVESTIGATION.
     unsigned aaTickMaxUs = 0, aaTickSumUs = 0, aaTickCount = 0;
+    unsigned lastQueueVersion = ~0u;  // forces the Queue tab to build its rows once
     // Diagnostic software audio sink: no I2S DAC is wired yet, so nothing pulls
     // the engine — playback position would never advance. Each UI tick we consume
     // ~30 ms of audio here (decode -> ring -> engine DSP), which advances the
@@ -736,6 +751,21 @@ CStdlibApp::TShutdownMode CKernel::Run(void) {
                   : v.source == carsh::player::Source::Bluetooth   ? "BLUETOOTH"
                                                                    : "";
         now.setState(st);
+
+        // Queue tab: rebuild rows only when the queue contents change; mark the
+        // now-playing row every frame (cheap). Only meaningful for the local source.
+        if (queueVersion != lastQueueVersion) {
+            lastQueueVersion = queueVersion;
+            std::vector<std::string> qrows;
+            qrows.reserve(g_queueIds.size());
+            for (uint64_t id : g_queueIds) {
+                const carsh::library::Track* t = g_db.get(id);
+                qrows.push_back(t ? g_db.artist(*t) + " - " + g_db.title(*t)
+                                  : std::string("?"));
+            }
+            queue.setItems(std::move(qrows));
+        }
+        queue.setCurrent(v.source == carsh::player::Source::Local ? ps.queueIndex : -1);
 
         // BT tab: reflect scan state + the discovered/connected device list. The
         // connected device is upserted into the cache so it always shows, even on
