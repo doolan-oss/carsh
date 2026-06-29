@@ -25,6 +25,7 @@ public:
         std::string title, artist, album;
         uint64_t positionMs = 0, durationMs = 0;
         bool playing = false;
+        std::string source;  // active-source badge ("BLUETOOTH"); empty = local/hidden
     };
 
     explicit NowPlayingScreen(Rect c)
@@ -54,6 +55,13 @@ public:
                 for (int col = 0; col < art_.cols; ++col)
                     c.drawChar(ax + col * 8 * scale, ay + r * 8 * scale,
                                art_.at(r, col), tint, 0, scale);
+        }
+        // Active-source badge (top-right), e.g. "BLUETOOTH" when the phone owns the
+        // output; empty for the local player.
+        if (!state_.source.empty()) {
+            int sw = int(state_.source.size()) * kCellW;
+            c.drawText(content_.x + content_.w - sw - 8, content_.y + 8, state_.source,
+                       th.accent);
         }
         // Metadata.
         int tx = content_.x + 400, ty = content_.y + 24;

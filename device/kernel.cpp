@@ -47,6 +47,7 @@
 #include "library/Indexer.h"
 #include "library/LibraryBrowser.h"
 #include "player/PlayerController.h"
+#include "player/MediaSession.h"
 #include "profile/ProfileManager.h"
 #include "ui/Canvas.h"
 #include "ui/Screen.h"
@@ -378,14 +379,8 @@ CStdlibApp::TShutdownMode CKernel::Run(void) {
 
     // EQ screen edits feed the live engine EQ.
     eq.onBandChange = [&](int, double) { g_eq.setConfig(eq.config()); };
-    now.onPlayPause = [&] {
-        if (player.state().transport == carsh::player::Transport::Playing)
-            player.pause();
-        else
-            player.resume();
-    };
-    now.onNext = [&] { player.next(); };
-    now.onPrev = [&] { player.prev(); };
+    // (Now Playing transport buttons are wired after Bluetooth is set up below, so
+    // they can route play/pause/next/prev to AVRCP when the phone is the source.)
 
     // Touch (real hardware only; QEMU has no digitizer).
     carsh::device::CircleTouch touch;
@@ -460,6 +455,32 @@ CStdlibApp::TShutdownMode CKernel::Run(void) {
         bt.connect(g_btDevices[std::size_t(i)].address);
     };
     devices.onDisconnect = [] { bt.disconnect(); };
+
+    // Media session: arbitrates Now Playing between the local player and the phone
+    // (A2DP+AVRCP), and tells the transport buttons which backend to drive. Fed a
+    // fresh snapshot each frame in the UI loop below.
+    carsh::player::MediaSession session;
+    now.onPlayPause = [&] {
+        if (session.transportTarget() == carsh::player::Source::Bluetooth) {
+            bt.sendAvrcpCommand(session.playPauseCommand());
+        } else if (player.state().transport == carsh::player::Transport::Playing) {
+            player.pause();
+        } else {
+            player.resume();
+        }
+    };
+    now.onNext = [&] {
+        if (session.transportTarget() == carsh::player::Source::Bluetooth)
+            bt.sendAvrcpCommand(carsh::bt::AvrcpCommand::Next);
+        else
+            player.next();
+    };
+    now.onPrev = [&] {
+        if (session.transportTarget() == carsh::player::Source::Bluetooth)
+            bt.sendAvrcpCommand(carsh::bt::AvrcpCommand::Prev);
+        else
+            player.prev();
+    };
 
     // Spawn the cooperative decode task (sole ring producer). The scheduler owns
     // it; it runs whenever this (UI) task yields via MsSleep below.
@@ -660,18 +681,34 @@ CStdlibApp::TShutdownMode CKernel::Run(void) {
             audioPeak *= 0.80f;
         }
 
-        carsh::ui::NowPlayingScreen::State st;
+        // Now Playing: arbitrate the local player vs the Bluetooth phone and show
+        // whichever currently owns the output. The local snapshot resolves metadata
+        // via the actual queue (g_queueIds); the BT side comes from AVRCP (g_btMeta).
+        carsh::player::MediaSession::LocalState ls;
         if (ps.queueIndex >= 0 && ps.queueIndex < int(g_queueIds.size())) {
             const carsh::library::Track* t =
                 g_db.get(g_queueIds[std::size_t(ps.queueIndex)]);
-            if (t) { st.title = g_db.title(*t); st.artist = g_db.artist(*t);
-                     st.album = g_db.album(*t); }
-        } else {
-            st.title = "carsh"; st.artist = "select a track"; st.album = "";
+            if (t) { ls.hasTrack = true; ls.title = g_db.title(*t);
+                     ls.artist = g_db.artist(*t); ls.album = g_db.album(*t); }
         }
-        st.positionMs = ps.positionMs;
-        st.durationMs = ps.durationMs;
-        st.playing = ps.transport == carsh::player::Transport::Playing;
+        ls.playing = ps.transport == carsh::player::Transport::Playing;
+        ls.positionMs = ps.positionMs;
+        ls.durationMs = ps.durationMs;
+        session.setLocal(ls);
+        // BT is "streaming" when A2DP PCM is flowing into its ring or AVRCP says
+        // PLAYING; that (plus connected) is what hands Now Playing to the phone.
+        session.setBluetooth(bt.connected(),
+                             g_btRing.readable() > 0 || g_btMeta.playing, g_btMeta);
+
+        const carsh::player::MediaSession::NowPlayingView v = session.view();
+        carsh::ui::NowPlayingScreen::State st;
+        st.title = v.title;
+        st.artist = v.artist;
+        st.album = v.album;
+        st.positionMs = v.positionMs;
+        st.durationMs = v.durationMs;
+        st.playing = v.playing;
+        st.source = v.source == carsh::player::Source::Bluetooth ? "BLUETOOTH" : "";
         now.setState(st);
 
         // BT tab: reflect scan state + the discovered/connected device list. The
