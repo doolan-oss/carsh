@@ -22,10 +22,12 @@
 #include "CircleBtRunLoopTask.h"
 #include "CircleDecodeTask.h"
 #include "CircleAaDecodeTask.h"
+#include "CircleAaDecodeCore.h"
 #include "CircleAaDriver.h"
 #include "CircleAoaTransport.h"
 #include "aa/AaProjection.h"
 #include "aa/AsyncH264Decoder.h"
+#include "aa/FrameRelay.h"
 #include "audio/JitterBuffer.h"
 #ifdef CARSH_HAVE_OPENH264
 #include "CircleH264Decoder.h"
@@ -86,6 +88,10 @@ carsh::audio::PcmRing<float> g_btRing(kRate * kChannels);  // A2DP jitter+decode
 // Android Auto media audio (ch=4, 48 kHz stereo PCM from the phone). Filled by the
 // AA projection's playAudio hook; consumed by the PWM sink below, same as A2DP.
 carsh::audio::PcmRing<float> g_aaRing(kRate * kChannels);  // ~1 s stereo
+// Decoded AA video frames handed from the decode core (producer) to the UI core
+// (consumer) — lock-free triple buffer, so core 3 never writes the frame core 0 is
+// blitting. (With the cooperative-task fallback it's just a same-core handoff.)
+carsh::aa::FrameRelay g_aaFrames;
 
 // AA media-audio prebuffer / underrun handler over g_aaRing (the choppy-audio fix).
 // The ring is fed in real time and drained in real time, so without a prebuffer it
@@ -454,17 +460,21 @@ CStdlibApp::TShutdownMode CKernel::Run(void) {
     // last screen). Used to auto-show projection without a touch input.
     const int aaTabIndex = 8;
     bool aaAutoShown = false;  // latched when we auto-switch to the AA tab on first frame
-    bool aaAutoShowReq = false;  // decode task requests auto-show; UI task performs it
+    // Set by the decode core, consumed by the UI core -> must be atomic.
+    std::atomic<bool> aaAutoShowReq{false};
     carsh::aa::AaProjection::Hooks aaHooks;
     aaHooks.showFrame = [&](const uint8_t* rgb, int w, int h) {
-        // Runs on the DECODE task now (decode is decoupled from the UI loop). setFrame
-        // only stores the frame pointer for the UI task to blit — safe under Circle's
-        // cooperative scheduler (the decode task runs only while the UI task is yielded,
-        // never mid-render). But the auto-show below calls mgr.setActive, which fires
-        // onFocusChanged -> sendVideoFocus over the AA transport; that write must stay
-        // on the UI task (where all other transport writes live), so just request it.
-        androidAuto.setFrame(rgb, w, h);
-        if (rgb != nullptr && w > 0 && h > 0 && !aaAutoShown) aaAutoShowReq = true;
+        if (rgb != nullptr && w > 0 && h > 0) {
+            // Decode side (dedicated core 3, or the cooperative task): hand the frame
+            // to the UI core via the lock-free triple buffer. NEVER touch the screen
+            // or the transport from here — the UI core owns AndroidAutoScreen + the
+            // framebuffer blit, and VIDEO_FOCUS writes (the auto-show) must stay on it.
+            g_aaFrames.publish(rgb, w, h);
+            aaAutoShowReq.store(true, std::memory_order_relaxed);
+        } else {
+            // reset()/clear (UI task): drop to the placeholder.
+            androidAuto.setFrame(nullptr, 0, 0);
+        }
     };
     aaHooks.setConnected = [&](bool up) {
         androidAuto.setConnected(up);
@@ -472,7 +482,7 @@ CStdlibApp::TShutdownMode CKernel::Run(void) {
         // display isn't stuck on a dead projection screen.
         if (!up) {
             aaAutoShown = false;
-            aaAutoShowReq = false;
+            aaAutoShowReq.store(false, std::memory_order_relaxed);
             mgr.setActive(0);
         }
     };
@@ -505,7 +515,6 @@ CStdlibApp::TShutdownMode CKernel::Run(void) {
     carsh::device::AaDecodeStats aaDecodeStats;
     if (aaDecoder.init()) {
         aaProjection.setDecoder(&aaAsync);
-        new carsh::device::CircleAaDecodeTask(&aaAsync, &aaDecodeStats);
 #ifdef CARSH_AA_SKIP_DECODE
         // A/B instrumentation (investigation step 3): pop AUs but skip the actual
         // openh264 decode. If audio goes smooth with this defined, decode-on-the-
@@ -513,6 +522,23 @@ CStdlibApp::TShutdownMode CKernel::Run(void) {
         //   make CARSH_HAVE_OPENH264=1 CPPFLAGS=-DCARSH_AA_SKIP_DECODE
         aaAsync.setDecodeEnabled(false);
         mLogger.Write(FROM, LogWarning, "AA: DECODE SKIPPED (A/B audio test build)");
+#endif
+#ifdef CARSH_AA_DECODE_CORE
+        // Run decode on a dedicated A72 core so it can't starve the core-0 audio
+        // refill (the bench-measured cause of choppy AA audio). Requires Circle's
+        // ARM_ALLOW_MULTI_CORE (scripts/patches/sysconfig-multicore.patch). Frames
+        // reach the UI core via g_aaFrames (FrameRelay). static: it must outlive Run.
+        static carsh::device::CircleAaDecodeCore s_decodeCore(
+            CMemorySystem::Get(), &aaAsync, &aaDecodeStats);
+        if (s_decodeCore.Initialize())
+            mLogger.Write(FROM, LogNotice, "AA: H.264 decode on dedicated core %u",
+                          carsh::device::CircleAaDecodeCore::kDecodeCore);
+        else
+            mLogger.Write(FROM, LogError, "AA: decode core init FAILED");
+#else
+        // Single-core fallback (build CARSH_NO_DECODE_CORE=1): cooperative decode task.
+        new carsh::device::CircleAaDecodeTask(&aaAsync, &aaDecodeStats);
+        mLogger.Write(FROM, LogNotice, "AA: H.264 decode on cooperative task (core 0)");
 #endif
     } else {
         mLogger.Write(FROM, LogError, "AA: openh264 decoder init failed");
@@ -560,13 +586,21 @@ CStdlibApp::TShutdownMode CKernel::Run(void) {
                 mgr.onTouch(ev);
             }
         }
-        // Perform a decode-task-requested auto-show on the UI task, so the resulting
+        // Pull the latest decoded video frame from the decode core (UI core owns the
+        // blit). Only setFrame on a new frame so AndroidAutoScreen keeps pointing at
+        // the consumer-owned triple-buffer slot (stable until the next acquire).
+        {
+            const uint8_t* frgb = nullptr;
+            int fw = 0, fh = 0;
+            if (g_aaFrames.acquire(frgb, fw, fh)) androidAuto.setFrame(frgb, fw, fh);
+        }
+        // Perform a decode-requested auto-show on the UI task, so the resulting
         // VIDEO_FOCUS goes out the AA transport from the UI thread (not the decode
-        // task). Latched so it only yanks focus once per connection.
-        if (aaAutoShowReq && !aaAutoShown) {
+        // core). Latched so it only yanks focus once per connection.
+        if (aaAutoShowReq.load(std::memory_order_relaxed) && !aaAutoShown) {
             mgr.setActive(aaTabIndex);
             aaAutoShown = true;
-            aaAutoShowReq = false;
+            aaAutoShowReq.store(false, std::memory_order_relaxed);
         }
 
         // Refresh now-playing from the player each frame.
