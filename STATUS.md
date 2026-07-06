@@ -59,6 +59,7 @@ HARDWARE_TODO.md for what the bench session must confirm.
 | OTA: Manifest/Package | host-done | Flat-JSON manifest, .carup verify (sig+image hash). |
 | OTA: BootSlots A/B SM | host-done | decide/stage/confirm/rollback + record persist. |
 | OTA: OtaManager apply | host-done | verify→version-gate→write inactive→arm trial. |
+| OTA: serial push protocol (`PushProtocol`/`PushReceiver`) | host-done | Framed CRC-32 transfer of a .carup over the USB-C console (BEGIN/DATA/END, resync, restart-on-BEGIN). 12 tests; wire format cross-checked end-to-end against the Python sender (`scripts/carsh_ota.py`) incl. OpenSSL-signed package verify. |
 | OTA: flash write + reboot | stubbed — needs hardware | IFlashTarget host stub; real SD write = H7. |
 | Bluetooth seam (IBluetooth) | host-done (stub) | Interfaces + FakeBluetooth; connect→profile, AVRCP→now-playing, A2DP→ring tested. |
 | Bluetooth real A2DP/AVRCP | hw-validated (A2DP audio) | `CARSH_HAVE_BTSTACK=1` + UB500 dongle: a phone pairs and plays music out the 3.5 mm jack. Realtek firmware load, ACL path (CUSBBluetoothDevice patch), SBC→PWM all working on hardware. Pairing UX + AVRCP = polish (H6). |
@@ -88,6 +89,8 @@ The STL-heavy core links unchanged into the bare-metal image with `aarch64-none-
 | Real-time decode/scheduler task | hw-validated | `CircleDecodeTask` under `CScheduler` feeds playback on hardware. Underrun tuning under load = H4. |
 | OTA device crypto (`DeviceCrypto`) | builds + host-validated | TweetNaCl Ed25519 + SHA-256 (mbedTLS 2.28 has no Ed25519). Cross-checked vs OpenSSL. |
 | OTA verify on device | builds | Kernel reads/verifies staged `/carsh/ota/*.carup` (no auto-flash; user-confirmed). |
+| Serial OTA push (`OtaPush` + `CircleUsbLog` RX) | written — needs cross-build + bench | Host `scripts/carsh_ota.py flash` pushes a signed image over `/dev/ttyACM0`; kernel verifies (Ed25519 pubkey from `device/OtaPushKey.h`, keygen-provisioned), writes the inactive A/B slot, arms a 3-try trial in `SD:/boot_slot.bin`, reboots. Boot reaching the UI loop auto-confirms the trial. Protocol + apply logic host-tested; the CDC RX feed, FatFs writes and reboot are `[hw]` (H7b). |
+| A/B chainloader (`device/chainloader/`) | written — needs cross-build + bench | Tiny Circle kernel installed as the card's boot image: reads `boot_slot.bin`, host-tested `decide()` (trial/rollback), loads `kernel8-{A,B}.img`, Circle chainboot warm-jump. Bootstraps slot A on a fresh card. `[hw]` H7b: jump, trial+confirm, forced rollback. |
 | Bluetooth scaffold (`CircleBluetooth`) | builds (stub) | `bt::IBluetooth` impl + run-loop `CTask` + A2DP→ring/AVRCP→profile wiring + scan/connect screen; BTstack glue gated by `CARSH_HAVE_BTSTACK`. |
 | BT scan/connect UI (`DevicesScreen`) | host-done | 8th "BT" tab: scan toggle + connect/disconnect; 11 tests via FakeBluetooth (`BtUi_test`). |
 | BTstack A2DP/AVRCP glue | hw-validated (A2DP audio) | On `device/bt-dongle-bringup`: phone→Pi A2DP audio works. Fixed USB-IRQ deadlock, HCI event reassembly, Realtek firmware download (product-id + custom-pre-init), USB ACL path (CUSBBluetoothDevice patch), SBC media-header strip + PWM routing. |
