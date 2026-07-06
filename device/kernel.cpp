@@ -40,6 +40,7 @@
 #include "CircleTouch.h"
 #include "CircleVfs.h"
 #include "DeviceCrypto.h"
+#include "OtaPush.h"
 #include "ota/OtaManager.h"
 #include "ota/Package.h"
 #include "audio/AudioEngine.h"
@@ -68,6 +69,10 @@ namespace {
 // gadget for a few seconds so the whole panic + backtrace flush to the host before
 // the halt. (We are dying anyway, so re-enabling IRQs mid-ISR is acceptable.)
 CUSBCDCGadget* g_panicGadget = nullptr;
+
+// Serial OTA push (scripts/carsh_ota.py): the CircleUsbLog task feeds inbound
+// USB-C bytes into its receiver; the UI loop polls it and reboots on apply.
+carsh::device::OtaPushService g_otaPush;
 void carshPanicFlush(void) {
     if (g_panicGadget == nullptr) return;
     EnableIRQs();
@@ -180,7 +185,8 @@ bool CKernel::Initialize(void) {
     // member, valid here in Initialize().)
     mUsbGadgetOk = mSerialCDC.Initialize();
     if (mUsbGadgetOk) {
-        new carsh::device::CircleUsbLog(&mSerialCDC, &mLogger, &mSerial);
+        new carsh::device::CircleUsbLog(&mSerialCDC, &mLogger, &mSerial,
+                                        &g_otaPush.receiver());
         // Let an assert/exception panic flush its message over USB-C before halting
         // (the normal pump task is dead by then — see carshPanicFlush).
         g_panicGadget = &mSerialCDC;
@@ -558,6 +564,10 @@ CStdlibApp::TShutdownMode CKernel::Run(void) {
     };
     androidAuto.onFocusChanged = [&](bool focused) { aaProjection.setFocus(focused); };
 
+    // A/B boot record: log the running slot; if this boot is an armed OTA
+    // trial, getting here (storage + UI init all succeeded) confirms it.
+    if (mSdMounted) g_otaPush.confirmBootHealthy(&mLogger);
+
     mLogger.Write(FROM, LogNotice, "entering UI loop");
     unsigned frame = 0;
     // AA tick() latency window (microseconds), reset each ~1 Hz health log. Long
@@ -576,6 +586,10 @@ CStdlibApp::TShutdownMode CKernel::Run(void) {
     std::vector<float> sinkBuf(std::size_t(kRate) / 20 * kChannels);  // 50 ms max
     float audioPeak = 0.0f;  // 0..1, peak-hold with per-frame decay
     for (;;) {
+        // Serial OTA push: when a signed image has been received + staged to the
+        // inactive slot, reboot into the chainloader trial. (Cheap state poll.)
+        if (mSdMounted && g_otaPush.poll(&mLogger)) return ShutdownReboot;
+
         if (haveTouch) {
             carsh::hal::TouchEvent ev;
             while (touch.poll(ev)) {

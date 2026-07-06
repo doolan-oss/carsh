@@ -9,7 +9,18 @@ device/*.img
 device/*.elf
 device/*.lst
 device/*.map
+device/chainloader/*.img
+device/chainloader/*.elf
+device/chainloader/*.lst
+device/chainloader/*.map
 *.d
+__pycache__/
+
+# serial OTA dev key (scripts/carsh_ota.py keygen) + packages
+/ota_dev_key.pem
+*.carup
+
+third_party/circle/
 third_party/circle-stdlib/
 third_party/circle-stdlib/
 third_party/btstack/
