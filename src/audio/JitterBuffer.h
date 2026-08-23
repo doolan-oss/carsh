@@ -35,10 +35,18 @@ namespace carsh::audio {
 class JitterBuffer {
 public:
     // ring: the SPSC ring this drains (its producer writes from elsewhere).
-    // primeElements: ring occupancy (in elements, i.e. samples, not frames) that
-    //   must accumulate before (re)starting playback. ~100-200 ms is typical.
-    JitterBuffer(PcmRing<float>& ring, std::size_t primeElements)
-        : ring_(ring), prime_(primeElements ? primeElements : 1) {}
+    // primeElements: occupancy (elements/samples, not frames) to buffer before the
+    //   FIRST start (and a restart after a real pause) — the cushion against jitter.
+    // resumeElements: smaller occupancy to resume after a TRANSIENT underrun while
+    //   still engaged. Bursty wireless delivery (AA over a dongle) gaps for 200-600ms
+    //   then clumps; requiring a full re-prime after each gap would add a prime-long
+    //   silence on top of the gap. Resuming at a small threshold bounds the audible
+    //   hit to ~the gap itself. 0 => same as primeElements (the original behaviour).
+    JitterBuffer(PcmRing<float>& ring, std::size_t primeElements,
+                 std::size_t resumeElements = 0)
+        : ring_(ring),
+          prime_(primeElements ? primeElements : 1),
+          resume_(resumeElements ? resumeElements : prime_) {}
 
     // Consumer (PWM DMA/IRQ): try to fill `want` elements of `out` from the ring,
     // scaled by `gain`. Returns:
@@ -60,13 +68,14 @@ public:
             primeEvents_.fetch_add(1, std::memory_order_relaxed);
         }
 
-        // Re-priming after an underrun: hold silence until the ring refills, so we
-        // don't dribble out tiny reads (which would just underrun again -> chop).
-        // Count every silence block; if we can't re-prime within the window the
-        // stream has stalled/stopped (a sub-`want` leftover would otherwise sit in
-        // the ring forever and never empty), so disengage and hand the output back.
+        // Re-priming after a transient underrun: hold silence only until the ring
+        // refills to the (small) resume threshold, then resume — so a brief delivery
+        // gap costs ~the gap, not gap + a full re-prime. If it can't even reach
+        // resume_ within the window the stream really stopped (a sub-`want` leftover
+        // would otherwise sit forever), so disengage and hand the output back; the
+        // next start then rebuilds the full prime_ cushion.
         if (!primed_) {
-            if (avail >= prime_) {
+            if (avail >= resume_) {
                 primed_ = true;
                 idle_ = 0;
             } else {
@@ -103,6 +112,7 @@ public:
     bool engaged() const { return engaged_.load(std::memory_order_relaxed); }
     std::size_t occupancy() const { return ring_.readable(); }
     std::size_t primeElements() const { return prime_; }
+    std::size_t resumeElements() const { return resume_; }
 
 private:
     static void zeroFill(float* out, std::size_t n) {
@@ -120,6 +130,7 @@ private:
 
     PcmRing<float>& ring_;
     const std::size_t prime_;
+    const std::size_t resume_;
 
     // Consumer-private state machine. primed_/idle_ are touched only by the consumer
     // (pull); engaged_ is atomic only so the meter/heartbeat can read it.
