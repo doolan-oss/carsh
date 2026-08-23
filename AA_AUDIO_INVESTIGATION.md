@@ -1,5 +1,27 @@
 # Investigation: choppy Android Auto audio
 
+> **RESOLVED on the bench 2026-06-29 — "good enough":** fixed by a chain of changes,
+> each bench-confirmed via the serial `aa-audio`/`aa-decode` instrumentation:
+> 1. **Decode on a dedicated A72 core** (`device/CircleAaDecodeCore.h` via
+>    `CMultiCoreSupport`; enabled `ARM_ALLOW_MULTI_CORE`, rebuilt libcircle). Frames
+>    cross to the UI core through a lock-free triple buffer (`src/aa/FrameRelay.h`).
+>    This took the ~37 ms/frame decode off core 0 — necessary but not sufficient.
+> 2. **Refill `g_aaRing` several times per UI loop** (not once per ~74 ms render).
+> 3. **Request 480p (800×480, the panel's native size) instead of 720p.** 720p
+>    software decode was *slower than real-time* (~37 ms > 33 ms) → AU queue backed
+>    up → dropped keyframes → **screen froze** until the next IDR. 480p decodes in
+>    ~15 ms (real-time, `dropped=0`) so the freeze is gone, with less memory-bus
+>    contention.
+> 4. **Jitter buffer: quick-resume + 480 ms prebuffer.** The residual stutter is the
+>    **dongle delivering audio in bursts** over its WiFi link (measured: most gaps
+>    161–600 ms, in runs) — not an HU bug. A big cushion + resuming after a transient
+>    gap without a full re-prime makes it smooth-enough.
+>
+> Final bench run: `under` ≈ 1 per 4 s as brief blips (`primes=1` — never collapses
+> into a re-prime), `dropped=0` (no freeze), `dec` ~15–29 ms (real-time). Residual
+> imperfection = dongle WiFi burstiness; the only further HU lever is more buffer =
+> more latency. Branch: `claude/aa-decode-core`.
+
 > **Update 2026-06-28 (host work, NOT yet bench-validated):** the mechanism was
 > confirmed by code-reading (see "Root cause" below), instrumentation was added
 > (steps 1–3), and the two low-risk fixes — a **prebuffer/jitter buffer on

@@ -95,6 +95,25 @@ TEST(JitterBuffer, RePrimesAfterUnderrunBeforeResuming) {
     CHECK(allEqual(out, 256, 0.9f));  // continuity: real audio, not silence
 }
 
+TEST(JitterBuffer, QuickResumeAfterTransientUnderrun) {
+    // With a small resume threshold, a brief gap resumes as soon as ~a chunk is back
+    // — it does NOT wait for the full prime cushion (the bursty-wireless fix).
+    PcmRing<float> ring(8192);
+    JitterBuffer jb(ring, /*prime*/ 1000, /*resume*/ 256);
+    float out[256];
+    fill(ring, 1024, 0.5f);
+    for (int i = 0; i < 4; ++i) CHECK(jb.pull(out, 256, 1.0f));  // drain to empty
+    CHECK(jb.pull(out, 256, 1.0f));                              // underrun -> silence
+    CHECK_EQ(jb.underruns(), std::uint64_t(1));
+    CHECK(jb.engaged());
+
+    // Refill past resume(256) but well under prime(1000): must resume immediately.
+    fill(ring, 300, 0.9f);
+    CHECK(jb.pull(out, 256, 1.0f));
+    CHECK(jb.engaged());
+    CHECK(allEqual(out, 256, 0.9f));  // playing again, not still re-priming
+}
+
 TEST(JitterBuffer, DisengagesAfterSustainedEmptyAndDiscardsTail) {
     PcmRing<float> ring(8192);
     JitterBuffer jb(ring, 512);
