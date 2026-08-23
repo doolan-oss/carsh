@@ -52,3 +52,21 @@ Apply + rebuild:
 patch -p1 -d third_party/circle-stdlib/libs/circle < scripts/patches/usbstandardhub-reconfigure.patch
 ( cd third_party/circle-stdlib/libs/circle/lib/usb && make )
 ```
+
+## sysconfig-multicore.patch
+Enables `ARM_ALLOW_MULTI_CORE` in Circle's `sysconfig.h`. Needed so the Android Auto
+H.264 decode can run on a **dedicated A72 core** (`device/CircleAaDecodeCore.h`,
+`CMultiCoreSupport`) instead of starving the core-0 audio refill — the bench-measured
+cause of choppy AA audio (decode ~37 ms/frame > the 33 ms real-time budget). Enabling
+it also maps RAM **inner-shareable cacheable**, which makes the lock-free cross-core
+handoffs (`src/aa/AuQueue.h` AU input, `src/aa/FrameRelay.h` decoded-frame output)
+coherent without explicit cache maintenance. The whole `libcircle` must be rebuilt
+(the define changes the MMU setup + secondary-core spin-up), not just one dir.
+
+Apply + rebuild:
+```sh
+patch -p1 -d third_party/circle-stdlib/libs/circle < scripts/patches/sysconfig-multicore.patch
+( cd third_party/circle-stdlib/libs/circle && ./makeall clean && ./makeall -j$(nproc) )
+```
+The device image gets the dedicated core by default with `make CARSH_HAVE_OPENH264=1`;
+build `CARSH_NO_DECODE_CORE=1` to fall back to the single-core cooperative decode task.
