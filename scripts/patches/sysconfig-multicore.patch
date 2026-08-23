@@ -1,0 +1,15 @@
+--- a/include/circle/sysconfig.h
++++ b/include/circle/sysconfig.h
+@@ -155,7 +155,11 @@
+ // single core applications, because this may slow down the system
+ // because multiple cores may compete for bus time without use.
+ 
+-//#define ARM_ALLOW_MULTI_CORE
++// carsh: enabled so the AA H.264 decode runs on a dedicated A72 core
++// (device/CircleAaDecodeCore.h) instead of starving audio on core 0. This also
++// maps RAM inner-shareable cacheable, making the cross-core SPSC handoffs
++// (aa/AuQueue.h, aa/FrameRelay.h) coherent. Tracked: scripts/patches/sysconfig-multicore.patch
++#define ARM_ALLOW_MULTI_CORE
+ 
+ #endif
+ 

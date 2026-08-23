@@ -117,6 +117,13 @@ endif
 ifdef CARSH_HAVE_OPENH264
 INCLUDE += -I$(OPENH264)/codec/api    # resolves <wels/codec_api.h>
 CPPFLAGS += -DCARSH_HAVE_OPENH264
+# Run H.264 decode on a dedicated A72 core (device/CircleAaDecodeCore.h) by default —
+# the bench-confirmed fix for choppy AA audio. Needs Circle's ARM_ALLOW_MULTI_CORE
+# (scripts/patches/sysconfig-multicore.patch). Fall back to the single-core
+# cooperative task with:  make CARSH_HAVE_OPENH264=1 CARSH_NO_DECODE_CORE=1
+ifndef CARSH_NO_DECODE_CORE
+CPPFLAGS += -DCARSH_AA_DECODE_CORE
+endif
 endif
 INCLUDE := $(CIRCLE_STDLIB_INCLUDES) $(INCLUDE)
 # Circle's sound + USB-gadget libraries are not part of the default circle-stdlib
