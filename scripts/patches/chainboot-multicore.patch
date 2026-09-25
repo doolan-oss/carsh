@@ -1,0 +1,76 @@
+--- a/include/circle/chainboot.h
++++ b/include/circle/chainboot.h
+@@ -29,6 +29,16 @@
+ 
+ void EnableChainBoot (const void *pKernelImage, size_t nKernelSize);
+ 
++// carsh (scripts/patches/chainboot-multicore.patch): TRUE if EnableChainBoot()
++// may be called now. Upstream refuses chain boot in any ARM_ALLOW_MULTI_CORE
++// build, but it is safe as long as no CMultiCoreSupport instance exists: the
++// secondary cores are then still parked in the armstub spin table, and the
++// chained kernel releases them itself. Always TRUE in a single-core build.
++// CHAINBOOT_MULTICORE_SAFE marks the patched header for compile-time checks.
++#define CHAINBOOT_MULTICORE_SAFE	1
++
++boolean IsChainBootAllowed (void);
++
+ boolean IsChainBootEnabled (void);
+ 
+ void DoChainBoot (void) MAXOPT;
+--- a/include/circle/multicore.h
++++ b/include/circle/multicore.h
+@@ -53,6 +53,14 @@
+ 	static void SendIPI (unsigned nCore, unsigned nIPI);		// send IPI to core
+ 	static void HaltAll (void);					// halt all cores
+ 
++	// carsh (scripts/patches/chainboot-multicore.patch): TRUE while an instance
++	// exists, i.e. the secondary cores may have left the armstub spin table.
++	// EnableChainBoot() is only safe while this is FALSE.
++	static boolean IsActive (void)
++	{
++		return s_pThis != 0;
++	}
++
+ #if RASPPI <= 3
+ 	static boolean LocalInterruptHandler (void);	// returns TRUE if local interrupt was handled
+ #else
+--- a/lib/chainboot.cpp
++++ b/lib/chainboot.cpp
+@@ -18,6 +18,7 @@
+ // along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ //
+ #include <circle/chainboot.h>
++#include <circle/multicore.h>
+ #include <circle/synchronize.h>
+ #include <circle/sysconfig.h>
+ #include <circle/util.h>
+@@ -60,9 +61,10 @@
+ 
+ void EnableChainBoot (const void *pKernelImage, size_t nKernelSize)
+ {
+-#ifdef ARM_ALLOW_MULTI_CORE
+-	assert (0);		// not supported with multi-core
+-#endif
++	// carsh: upstream asserts here in every multi-core build; only secondary
++	// cores that were released are a problem (they would run the overwritten
++	// image), see IsChainBootAllowed()
++	assert (IsChainBootAllowed ());
+ 
+ 	s_pKernelImage = pKernelImage;
+ 	s_nKernelSize = nKernelSize;
+@@ -80,6 +82,15 @@
+ 	InstructionSyncBarrier ();
+ }
+ 
++boolean IsChainBootAllowed (void)
++{
++#ifdef ARM_ALLOW_MULTI_CORE
++	return !CMultiCoreSupport::IsActive ();
++#else
++	return TRUE;
++#endif
++}
++
+ boolean IsChainBootEnabled (void)
+ {
+ 	return s_pKernelImage != 0 ? TRUE : FALSE;

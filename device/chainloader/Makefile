@@ -14,7 +14,10 @@ CARSHTOP      := $(realpath $(CURDIR)/../..)
 
 include $(CIRCLE_STDLIB)/Config.mk
 
-OBJS = main.o kernel.o
+# circlehooks.o: link-time hooks the carsh-patched circle-stdlib expects (see
+# the file). The chainloader must also be built against a libcircle carrying
+# scripts/patches/chainboot-multicore.patch (kernel.cpp #errors otherwise).
+OBJS = main.o kernel.o circlehooks.o
 
 include $(CIRCLEHOME)/Rules.mk
 
