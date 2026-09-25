@@ -368,6 +368,30 @@ TEST(MediaSession, ChimeFromAPhoneWithoutAvrcpLeavesTheLocalTrackPlaying) {
     CHECK(s.shouldPauseLocal());
 }
 
+// A phone whose AVRCP said PAUSED keeps an A2DP stream up (a long prompt, or a
+// stream that never goes to standby) past the takeover window, then AVRCP alone is
+// released. Only audio heard without a status report may count toward the
+// status-less takeover, so local must keep playing until the window elapses anew.
+TEST(MediaSession, AvrcpReleaseMidStreamRestartsTheTakeoverWindow) {
+    MediaSession s;
+    uint64_t t = 0;
+    s.setLocal(localTrack("Song A", true));
+    const auto paused = btMeta("Podcast", false);
+    const uint64_t end = t + kTakeoverUs + 1000000;  // 7 s of audio while PAUSED
+    do btFrame(s, t, true, paused, true);
+    while (t < end);
+    CHECK(s.source() == Source::Local);
+    CHECK(!s.shouldPauseLocal());
+
+    btFrame(s, t, true, carsh::bt::AvrcpMetadata{}, false);  // AVRCP released
+    CHECK(s.source() == Source::Local);
+    CHECK(!s.shouldPauseLocal());
+
+    btStreamsWithoutAvrcp(s, t, kTakeoverUs + kFrameUs);  // a real, status-less stream
+    CHECK(s.source() == Source::Bluetooth);
+    CHECK(s.shouldPauseLocal());
+}
+
 // --- Latched ownership (review A2 / P4) --------------------------------------
 
 // Pausing AA from the head unit stops its PCM; the session must still be AA (so '>'

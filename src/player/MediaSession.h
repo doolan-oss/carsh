@@ -261,10 +261,14 @@ private:
         void update(bool conn, bool aud, bool status, bool statusPlay, uint64_t nowUs) {
             connected = conn;
             const bool wasAudible = audible;
+            const bool hadStatus = hasStatus;
             audible = conn && aud;
             hasStatus = conn && status;
             statusPlaying = hasStatus && statusPlay;
-            if (audible && !wasAudible) audibleSinceUs = nowUs;
+            // A run starts when audio starts, or when the status channel goes away
+            // mid-run: audio heard while the phone still reported (e.g. PAUSED) must
+            // not count toward the status-less takeover window.
+            if (audible && (!wasAudible || (hadStatus && !hasStatus))) audibleSinceUs = nowUs;
             sustained = audible && nowUs >= audibleSinceUs &&
                         nowUs - audibleSinceUs >= uint64_t(kTakeoverMs) * 1000u;
             if (!playing()) suppressed = false;  // it stopped (or unplugged)
