@@ -150,3 +150,148 @@ TEST(AaMessenger, CoalescedAndSplitFrames) {
     CHECK_EQ(int(m2.messageId), 0x0011);
     CHECK(m2.payload == std::vector<uint8_t>(b, b + sizeof(b)));
 }
+
+namespace {
+
+using carsh::aa::FrameType;
+using carsh::aa::MessageType;
+
+// Hand-build one raw frame: [ch][flags][size BE]([total BE] on FIRST)[payload].
+std::vector<uint8_t> rawFrame(uint8_t ch, FrameType ft, EncryptionType enc,
+                              const std::vector<uint8_t>& payload, uint32_t total = 0) {
+    std::vector<uint8_t> f = {ch, carsh::aa::frameFlags(ft, MessageType::Specific, enc),
+                              static_cast<uint8_t>(payload.size() >> 8),
+                              static_cast<uint8_t>(payload.size() & 0xFF)};
+    if (ft == FrameType::First) {
+        f.push_back(static_cast<uint8_t>(total >> 24));
+        f.push_back(static_cast<uint8_t>(total >> 16));
+        f.push_back(static_cast<uint8_t>(total >> 8));
+        f.push_back(static_cast<uint8_t>(total));
+    }
+    f.insert(f.end(), payload.begin(), payload.end());
+    return f;
+}
+
+void append(std::vector<uint8_t>& dst, const std::vector<uint8_t>& src) {
+    dst.insert(dst.end(), src.begin(), src.end());
+}
+
+}  // namespace
+
+// TLS records are sequence-numbered, so EVERY encrypted frame must reach the
+// decryptor, in order — including frames reassembly then throws away (unknown
+// channel, orphan MIDDLE/LAST, the rest of an oversized message). Skipping one used
+// to desync TLS and silently wedge the session. Only the plaintext is discarded.
+TEST(AaMessenger, EveryEncryptedFrameIsDecryptedInOrder) {
+    const auto E = EncryptionType::Encrypted;
+    std::vector<uint8_t> wire;
+    append(wire, rawFrame(12, FrameType::Bulk, E, {0x01, 0x00, 0x05}));   // unknown ch
+    append(wire, rawFrame(3, FrameType::Middle, E, {0x02, 0xAA}));        // orphan MIDDLE
+    append(wire, rawFrame(3, FrameType::Last, E, {0x03, 0xBB}));          // orphan LAST
+    append(wire, rawFrame(3, FrameType::First, E, {0x04, 0x80, 0x01},     // oversized FIRST
+                          static_cast<uint32_t>(carsh::aa::kMaxMessageSize) + 1));
+    append(wire, rawFrame(3, FrameType::Middle, E, {0x05, 0xCC}));        // ...its MIDDLE
+    append(wire, rawFrame(3, FrameType::Last, E, {0x06, 0xDD}));          // ...its LAST
+    append(wire, rawFrame(1, FrameType::Bulk, E, {0x07, 0x80, 0x01, 0x42}));  // valid
+
+    FakeAaTransport tp;
+    tp.pushRx(wire);
+    tp.setReadChunk(5);
+    AaMessenger m(tp);
+    std::vector<uint8_t> order;  // first byte of each record the decryptor saw
+    m.setDecryptor([&](const uint8_t* p, size_t n) {
+        order.push_back(p[0]);
+        return std::vector<uint8_t>(p + 1, p + n);  // strip the "sequence" byte
+    });
+
+    AaMessage msg;
+    REQUIRE(m.receive(msg, 0));  // only the valid message comes out...
+    CHECK(msg.channel == ChannelId::Input);
+    CHECK(msg.decrypted);
+    CHECK_EQ(int(msg.messageId), 0x8001);
+    CHECK(msg.payload == std::vector<uint8_t>{0x42});
+    CHECK(!m.receive(msg, 0));
+    // ...but all seven records were decrypted, in arrival order.
+    CHECK(order == (std::vector<uint8_t>{1, 2, 3, 4, 5, 6, 7}));
+    CHECK_EQ(m.droppedFrames(), 6u);
+}
+
+// A decrypt that yields nothing (failed record) must not surface as a message with
+// id 0 — on an AV channel that used to read as a malformed MEDIA_WITH_TIMESTAMP and
+// draw a spurious ack.
+TEST(AaMessenger, EmptyPlaintextIsDropped) {
+    const auto E = EncryptionType::Encrypted;
+    std::vector<uint8_t> wire;
+    append(wire, rawFrame(3, FrameType::Bulk, E, {0x00, 0x11}));        // decrypts to {}
+    append(wire, rawFrame(3, FrameType::Bulk, E, {0x01, 0x80, 0x01}));  // valid
+    FakeAaTransport tp;
+    tp.pushRx(wire);
+    AaMessenger m(tp);
+    m.setDecryptor([](const uint8_t* p, size_t n) {
+        if (p[0] == 0x00) return std::vector<uint8_t>{};
+        return std::vector<uint8_t>(p + 1, p + n);
+    });
+    AaMessage msg;
+    REQUIRE(m.receive(msg, 0));
+    CHECK_EQ(int(msg.messageId), 0x8001);
+    CHECK(!m.receive(msg, 0));
+    CHECK_EQ(m.droppedFrames(), 1u);
+}
+
+// kMaxMessageSize bounds the ACCUMULATED reassembly, not just FIRST's declared total:
+// a peer that declares 4 KB and then keeps sending 64 KB MIDDLE frames used to grow
+// the buffer without limit (4x the cap in the review probe). The message is dropped
+// once it would pass the cap, its remaining frames are orphans, and the channel then
+// reassembles the next message normally.
+TEST(AaMessenger, ReassemblyIsCappedAtMaxMessageSize) {
+    const auto P = EncryptionType::Plain;
+    const std::vector<uint8_t> big(0xFFFF, 0x5A);
+    const size_t middles = carsh::aa::kMaxMessageSize / big.size() + 2;  // > the cap
+    std::vector<uint8_t> wire;
+    append(wire, rawFrame(3, FrameType::First, P, {0x00, 0x01, 0x00}, 4096));
+    for (size_t i = 0; i < middles; ++i) append(wire, rawFrame(3, FrameType::Middle, P, big));
+    append(wire, rawFrame(3, FrameType::Last, P, {0x01}));
+    append(wire, rawFrame(3, FrameType::Bulk, P, {0x00, 0x01, 0x77}));  // next message
+
+    FakeAaTransport tp;
+    tp.pushRx(wire);
+    AaMessenger m(tp);
+    AaMessage msg;
+    size_t messages = 0, largest = 0;
+    while (m.receive(msg, 0)) {
+        ++messages;
+        if (msg.payload.size() > largest) largest = msg.payload.size();
+    }
+    CHECK_EQ(messages, size_t(1));  // only the trailing BULK survives
+    CHECK(largest <= carsh::aa::kMaxMessageSize);
+    CHECK_EQ(int(msg.messageId), 0x0001);
+    CHECK(msg.payload == std::vector<uint8_t>{0x77});
+    CHECK(m.droppedFrames() >= 2u);  // the capped message + the orphan tail
+}
+
+// Same bound on the encrypted path, and the cap never skips the decryptor.
+TEST(AaMessenger, EncryptedReassemblyCapStillDecryptsEveryFrame) {
+    const auto E = EncryptionType::Encrypted;
+    const std::vector<uint8_t> big(0xFFFF, 0x5A);
+    const size_t middles = carsh::aa::kMaxMessageSize / big.size() + 2;
+    std::vector<uint8_t> wire;
+    append(wire, rawFrame(3, FrameType::First, E, {0x00, 0x01, 0x00}, 4096));
+    for (size_t i = 0; i < middles; ++i) append(wire, rawFrame(3, FrameType::Middle, E, big));
+    append(wire, rawFrame(3, FrameType::Last, E, {0x01}));
+    append(wire, rawFrame(3, FrameType::Bulk, E, {0x80, 0x01, 0x66}));
+
+    FakeAaTransport tp;
+    tp.pushRx(wire);
+    AaMessenger m(tp);
+    size_t records = 0;
+    m.setDecryptor([&](const uint8_t* p, size_t n) {
+        ++records;
+        return std::vector<uint8_t>(p, p + n);
+    });
+    AaMessage msg;
+    size_t messages = 0;
+    while (m.receive(msg, 0)) ++messages;
+    CHECK_EQ(messages, size_t(1));
+    CHECK_EQ(int(msg.messageId), 0x8001);
+    CHECK_EQ(records, middles + 3);  // FIRST + every MIDDLE + LAST + the BULK
+}

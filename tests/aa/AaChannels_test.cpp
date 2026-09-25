@@ -235,11 +235,60 @@ TEST(AaChannels, MediaIndicationNoTimestamp) {
     CHECK(huSent(hu, ChannelId::MediaAudio, static_cast<uint16_t>(AvMsgId::MediaAck)));
 }
 
+// ---- INPUT_EVENT_INDICATION golden bytes -------------------------------------------
+// Derived by hand from aasdk's aasdk_proto/InputEventIndicationMessage.proto (and the
+// TouchEvent / TouchLocation / ButtonEvents / ButtonEvent protos it imports) — NOT
+// produced by carsh's pb::Writer — and cross-checked by parsing them with protobuf
+// against both the aasdk (proto3) schema and headunit's proto2 hu.proto, where they
+// are IsInitialized() (pointer_id, touch_action, meta, long_press are REQUIRED there):
+//   InputEventIndication { timestamp = 1 (uint64), disp_channel = 2 (int32),
+//                          touch_event = 3 (TouchEvent), button_event = 4 (ButtonEvents) }
+//   TouchEvent    { touch_location = 1 (repeated TouchLocation), action_index = 2,
+//                   touch_action = 3 (PRESS = 0, RELEASE = 1, DRAG = 2) }
+//   TouchLocation { x = 1, y = 2, pointer_id = 3 }
+//   ButtonEvents  { button_events = 1 (repeated ButtonEvent) }
+//   ButtonEvent   { scan_code = 1, is_pressed = 2, meta = 3, long_press = 4 }
+// Tag bytes: 08 = field 1 varint, 10 = field 2 varint, 18 = field 3 varint,
+// 20 = field 4 varint, 0a = field 1 length-delimited, 1a = field 3 LD, 22 = field 4 LD.
+
+namespace {
+
+// touch at (696,200), ts = 12345 (varint b9 60), action byte last.
+//   08 b9 60                  timestamp = 12345
+//   1a 0e                     touch_event, 14 bytes:
+//     0a 08                     touch_location, 8 bytes:
+//       08 b8 05                  x = 696
+//       10 c8 01                  y = 200
+//       18 00                     pointer_id = 0
+//     10 00                     action_index = 0
+//     18 aa                     touch_action = aa
+std::vector<uint8_t> goldenTouch696x200(uint8_t action) {
+    return {0x08, 0xb9, 0x60, 0x1a, 0x0e, 0x0a, 0x08, 0x08, 0xb8, 0x05, 0x10,
+            0xc8, 0x01, 0x18, 0x00, 0x10, 0x00, 0x18, action};
+}
+
+// All INPUT_EVENT_INDICATION bodies the HU sent, in order.
+std::vector<std::vector<uint8_t>> inputEvents(const FakeAaTransport& hu) {
+    std::vector<std::vector<uint8_t>> out;
+    for (const auto& m : parseHuSends(hu)) {
+        if (m.channel == ChannelId::Input &&
+            m.messageId == static_cast<uint16_t>(InputMsgId::InputEventIndication))
+            out.push_back(m.payload);
+    }
+    return out;
+}
+
+}  // namespace
+
 TEST(AaChannels, InputBindingAndOutboundTouch) {
     FakeAaTransport hu;
     AaMessenger msger(hu);
     FakeAaCrypto crypto(2);
     AaConnection conn(msger, crypto, {});
+
+    // Touch before the input channel is open must no-op (false) and send nothing.
+    CHECK(!conn.sendTouch(TouchAction::Press, 1, 1, 1));
+
     driveToRunning(conn, hu);
     openChannel(conn, hu, ChannelId::Input);
 
@@ -249,62 +298,20 @@ TEST(AaChannels, InputBindingAndOutboundTouch) {
     REQUIRE(conn.poll(0));
     CHECK(huSent(hu, ChannelId::Input, static_cast<uint16_t>(InputMsgId::BindingResponse)));
 
-    // Outbound touch -> INPUT_EVENT_INDICATION whose touch_location decodes to x/y.
+    // PRESS / RELEASE: touch_event in field 3, touch_action in TouchEvent field 3 —
+    // byte-exact against the aasdk-derived golden.
     hu.clearSent();
     REQUIRE(conn.sendTouch(TouchAction::Press, 696, 200, 12345));
-    std::vector<uint8_t> body =
-        lastHuBody(hu, ChannelId::Input,
-                   static_cast<uint16_t>(InputMsgId::InputEventIndication));
-    REQUIRE(!body.empty());
-    // Walk to touch_event[2] -> touch_location[1] -> {x[1], y[2]}.
-    pb::Reader r(body);
-    uint32_t field;
-    uint8_t wire;
-    uint32_t gotX = 0, gotY = 0;
-    bool foundLoc = false;
-    while (!r.eof()) {
-        REQUIRE(r.tag(field, wire));
-        if (field == 2 && wire == 2) {  // touch_event
-            pb::Reader te(nullptr, 0);
-            REQUIRE(r.submessage(te));
-            uint32_t f2;
-            uint8_t w2;
-            while (!te.eof()) {
-                REQUIRE(te.tag(f2, w2));
-                if (f2 == 1 && w2 == 2) {  // touch_location
-                    pb::Reader loc(nullptr, 0);
-                    REQUIRE(te.submessage(loc));
-                    uint32_t f3;
-                    uint8_t w3;
-                    while (!loc.eof()) {
-                        REQUIRE(loc.tag(f3, w3));
-                        if (f3 == 1) {
-                            REQUIRE(loc.u32(gotX));
-                        } else if (f3 == 2) {
-                            REQUIRE(loc.u32(gotY));
-                        } else {
-                            REQUIRE(loc.skip(w3));
-                        }
-                    }
-                    foundLoc = true;
-                } else {
-                    REQUIRE(te.skip(w2));
-                }
-            }
-        } else {
-            REQUIRE(r.skip(wire));
-        }
-    }
-    CHECK(foundLoc);
-    CHECK_EQ(gotX, 696u);
-    CHECK_EQ(gotY, 200u);
-
-    // Touch before the input channel is open must no-op (false).
-    AaConnection fresh(msger, crypto, {});
-    CHECK(!fresh.sendTouch(TouchAction::Press, 1, 1, 1));
+    REQUIRE(conn.sendTouch(TouchAction::Release, 696, 200, 12345));
+    auto ev = inputEvents(hu);
+    REQUIRE(ev.size() == 2);
+    CHECK(ev[0] == goldenTouch696x200(0x00));  // PRESS
+    CHECK(ev[1] == goldenTouch696x200(0x01));  // RELEASE
 }
 
-TEST(AaChannels, MediaKeySendsPressThenReleaseButtonEvent) {
+// DRAG at (400,240) with a 64-bit µs timestamp above 2^32 (0x0123456789ab): it must
+// go out whole — no 32-bit truncation — and carry touch_action = DRAG (2).
+TEST(AaChannels, TouchDragWith64BitTimestamp) {
     FakeAaTransport hu;
     AaMessenger msger(hu);
     FakeAaCrypto crypto(2);
@@ -313,59 +320,198 @@ TEST(AaChannels, MediaKeySendsPressThenReleaseButtonEvent) {
     openChannel(conn, hu, ChannelId::Input);
 
     hu.clearSent();
-    REQUIRE(conn.sendMediaKey(MediaKey::PlayPause, 7));
-
-    // A media key = two INPUT_EVENT_INDICATION frames: button down, then up.
-    std::vector<std::vector<uint8_t>> buttons;
-    for (const auto& m : parseHuSends(hu)) {
-        if (m.channel == ChannelId::Input &&
-            m.messageId == static_cast<uint16_t>(InputMsgId::InputEventIndication))
-            buttons.push_back(m.payload);
-    }
-    REQUIRE(buttons.size() == 2);
-
-    // Decode button_event[3] -> button_events[1] -> {scan_code[1], is_pressed[2]}.
-    auto decode = [](const std::vector<uint8_t>& body, uint32_t& scan, bool& pressed) {
-        pb::Reader r(body);
-        uint32_t f; uint8_t w;
-        bool found = false;
-        while (!r.eof()) {
-            REQUIRE(r.tag(f, w));
-            if (f == 3 && w == 2) {  // button_event (ButtonEvents)
-                pb::Reader be(nullptr, 0);
-                REQUIRE(r.submessage(be));
-                uint32_t f2; uint8_t w2;
-                while (!be.eof()) {
-                    REQUIRE(be.tag(f2, w2));
-                    if (f2 == 1 && w2 == 2) {  // button_events[0] (ButtonEvent)
-                        pb::Reader b(nullptr, 0);
-                        REQUIRE(be.submessage(b));
-                        uint32_t f3; uint8_t w3;
-                        while (!b.eof()) {
-                            REQUIRE(b.tag(f3, w3));
-                            if (f3 == 1) { REQUIRE(b.u32(scan)); }
-                            else if (f3 == 2) { uint32_t v; REQUIRE(b.u32(v)); pressed = v != 0; }
-                            else { REQUIRE(b.skip(w3)); }
-                        }
-                        found = true;
-                    } else { REQUIRE(be.skip(w2)); }
-                }
-            } else { REQUIRE(r.skip(w)); }
-        }
-        CHECK(found);
+    REQUIRE(conn.sendTouch(TouchAction::Drag, 400, 240, 0x0123456789abull));
+    const std::vector<uint8_t> golden = {
+        0x08, 0xab, 0x93, 0x9e, 0xab, 0xb4, 0x24,  // timestamp = 0x0123456789ab
+        0x1a, 0x0e,                                // touch_event, 14 bytes
+        0x0a, 0x08,                                //   touch_location, 8 bytes
+        0x08, 0x90, 0x03,                          //     x = 400
+        0x10, 0xf0, 0x01,                          //     y = 240
+        0x18, 0x00,                                //     pointer_id = 0
+        0x10, 0x00,                                //   action_index = 0
+        0x18, 0x02,                                //   touch_action = DRAG
     };
+    auto ev = inputEvents(hu);
+    REQUIRE(ev.size() == 1);
+    CHECK(ev[0] == golden);
+}
 
-    uint32_t scan0 = 0, scan1 = 0; bool p0 = false, p1 = true;
-    decode(buttons[0], scan0, p0);
-    decode(buttons[1], scan1, p1);
-    CHECK_EQ(scan0, static_cast<uint32_t>(MediaKey::PlayPause));  // 0x55
-    CHECK_EQ(scan1, static_cast<uint32_t>(MediaKey::PlayPause));
-    CHECK(p0);    // down
-    CHECK(!p1);   // up
+TEST(AaChannels, MediaKeySendsPressThenReleaseButtonEvent) {
+    FakeAaTransport hu;
+    AaMessenger msger(hu);
+    FakeAaCrypto crypto(2);
+    AaConnection conn(msger, crypto, {});
 
     // Media key before the input channel is open must no-op (false).
-    AaConnection fresh(msger, crypto, {});
-    CHECK(!fresh.sendMediaKey(MediaKey::Next, 1));
+    CHECK(!conn.sendMediaKey(MediaKey::Next, 1));
+
+    driveToRunning(conn, hu);
+    openChannel(conn, hu, ChannelId::Input);
+
+    hu.clearSent();
+    REQUIRE(conn.sendMediaKey(MediaKey::PlayPause, 7));
+
+    // A media key = two INPUT_EVENT_INDICATION frames, button down then up, with
+    // button_event in field 4 (NOT 3, which is touch_event on the phone):
+    //   08 07                 timestamp = 7
+    //   22 0a                 button_event (ButtonEvents), 10 bytes:
+    //     0a 08                 button_events[0] (ButtonEvent), 8 bytes:
+    //       08 55                 scan_code = 0x55 KEYCODE_MEDIA_PLAY_PAUSE
+    //       10 01 / 10 00         is_pressed = true / false
+    //       18 00                 meta = 0
+    //       20 00                 long_press = false
+    const std::vector<uint8_t> down = {0x08, 0x07, 0x22, 0x0a, 0x0a, 0x08, 0x08,
+                                       0x55, 0x10, 0x01, 0x18, 0x00, 0x20, 0x00};
+    const std::vector<uint8_t> up = {0x08, 0x07, 0x22, 0x0a, 0x0a, 0x08, 0x08,
+                                     0x55, 0x10, 0x00, 0x18, 0x00, 0x20, 0x00};
+    auto ev = inputEvents(hu);
+    REQUIRE(ev.size() == 2);
+    CHECK(ev[0] == down);
+    CHECK(ev[1] == up);
+}
+
+// The advertised AV-input (microphone) channel must answer the phone's
+// SETUP_REQUEST and AV_INPUT_OPEN_REQUEST (aasdk AVInputServiceChannel), or a voice
+// session hangs waiting on the open. Both replies are encrypted SPECIFIC on channel 7.
+TEST(AaChannels, AvInputSetupAndOpenAnswered) {
+    FakeAaTransport hu;
+    AaMessenger msger(hu);
+    FakeAaCrypto crypto(2);
+    std::vector<int> micEvents;  // 1 = open, 0 = close
+    carsh::aa::AaConnectionCallbacks cbs;
+    cbs.onMicRequest = [&](bool open) { micEvents.push_back(open ? 1 : 0); };
+    AaConnection conn(msger, crypto, cbs);
+    driveToRunning(conn, hu);
+    openChannel(conn, hu, ChannelId::AvInput);
+
+    // SETUP_REQUEST{config_index = 0} -> AVChannelSetupResponse{media_status = OK(2),
+    // max_unacked = 1, configs = [0]} = 08 02 10 01 18 00 (aasdk
+    // AVChannelSetupResponseMessage.proto; OK = 2 per AVChannelSetupStatusEnum).
+    hu.clearSent();
+    std::vector<uint8_t> setup;
+    pb::Writer(setup).uint32(1, 0);
+    phoneSend(hu, ChannelId::AvInput, EncryptionType::Encrypted,
+              static_cast<uint16_t>(AvMsgId::SetupRequest), setup);
+    REQUIRE(conn.poll(0));
+    const std::vector<uint8_t> setupGolden = {0x08, 0x02, 0x10, 0x01, 0x18, 0x00};
+    CHECK(lastHuBody(hu, ChannelId::AvInput,
+                     static_cast<uint16_t>(AvMsgId::SetupResponse)) == setupGolden);
+
+    // AV_INPUT_OPEN_REQUEST{open = true} -> AVInputOpenResponse{session = 0,
+    // value = 0 (OK)} = 08 00 10 00 (both fields required in aasdk's proto2 message).
+    hu.clearSent();
+    std::vector<uint8_t> openReq;
+    pb::Writer(openReq).boolean(1, true);
+    phoneSend(hu, ChannelId::AvInput, EncryptionType::Encrypted,
+              static_cast<uint16_t>(AvMsgId::AvInputOpenRequest), openReq);
+    REQUIRE(conn.poll(0));
+    const std::vector<uint8_t> openGolden = {0x08, 0x00, 0x10, 0x00};
+    CHECK(lastHuBody(hu, ChannelId::AvInput,
+                     static_cast<uint16_t>(AvMsgId::AvInputOpenResponse)) == openGolden);
+    bool specificEncrypted = false;
+    for (const auto& m : parseHuSends(hu)) {
+        if (m.channel == ChannelId::AvInput &&
+            m.messageId == static_cast<uint16_t>(AvMsgId::AvInputOpenResponse))
+            specificEncrypted = m.encryption == EncryptionType::Encrypted &&
+                                m.msgType == MessageType::Specific;
+    }
+    CHECK(specificEncrypted);
+
+    // ...and the close is answered too.
+    hu.clearSent();
+    std::vector<uint8_t> closeReq;
+    pb::Writer(closeReq).boolean(1, false);
+    phoneSend(hu, ChannelId::AvInput, EncryptionType::Encrypted,
+              static_cast<uint16_t>(AvMsgId::AvInputOpenRequest), closeReq);
+    REQUIRE(conn.poll(0));
+    CHECK(huSent(hu, ChannelId::AvInput, static_cast<uint16_t>(AvMsgId::AvInputOpenResponse)));
+    REQUIRE(micEvents.size() == 2);
+    CHECK_EQ(micEvents[0], 1);
+    CHECK_EQ(micEvents[1], 0);
+}
+
+// PingRequest/PingResponse are { int64 timestamp = 1 }: the HU must echo the phone's
+// timestamp unchanged — including values above 2^31 and negative int64s (10-byte
+// varints) — with no extra fields.
+TEST(AaChannels, PingEchoesInt64Timestamp) {
+    using carsh::aa::ControlMsgId;
+    const uint16_t kPingReq = static_cast<uint16_t>(ControlMsgId::PingRequest);
+    const uint16_t kPingResp = static_cast<uint16_t>(ControlMsgId::PingResponse);
+
+    FakeAaTransport hu;
+    AaMessenger msger(hu);
+    FakeAaCrypto crypto(2);
+    AaConnection conn(msger, crypto, {});
+    driveToRunning(conn, hu);
+
+    // timestamp = 5,000,000,000 -> 08 80 e4 97 d0 12 (it used to come back as
+    // int32 705,032,704 plus a bogus field 2).
+    const std::vector<uint8_t> big = {0x08, 0x80, 0xe4, 0x97, 0xd0, 0x12};
+    hu.clearSent();
+    phoneSend(hu, ChannelId::Control, EncryptionType::Encrypted, kPingReq, big);
+    REQUIRE(conn.poll(0));
+    CHECK(lastHuBody(hu, ChannelId::Control, kPingResp) == big);
+
+    // timestamp = -1 (int64) -> 08 ff ff ff ff ff ff ff ff ff 01. A trailing unknown
+    // request field (aap_protobuf's bool bug_report = 2) is not echoed.
+    const std::vector<uint8_t> neg = {0x08, 0xff, 0xff, 0xff, 0xff, 0xff,
+                                      0xff, 0xff, 0xff, 0xff, 0x01};
+    std::vector<uint8_t> negReq = neg;
+    negReq.push_back(0x10);  // bug_report = false
+    negReq.push_back(0x00);
+    hu.clearSent();
+    phoneSend(hu, ChannelId::Control, EncryptionType::Encrypted, kPingReq, negReq);
+    REQUIRE(conn.poll(0));
+    CHECK(lastHuBody(hu, ChannelId::Control, kPingResp) == neg);
+}
+
+// SHUTDOWN_REQUEST: the HU acknowledges with an (empty) encrypted SPECIFIC
+// SHUTDOWN_RESPONSE on the control channel FIRST, then goes to Shutdown for good —
+// onShutdown fires once, poll() stops, and app-driven sends (touch, keys, focus) no
+// longer reach the dead session.
+TEST(AaChannels, ShutdownRequestAcknowledgedThenShutdown) {
+    using carsh::aa::AaShutdownReason;
+    using carsh::aa::ControlMsgId;
+    FakeAaTransport hu;
+    AaMessenger msger(hu);
+    FakeAaCrypto crypto(2);
+    int shutdowns = 0;
+    carsh::aa::AaConnectionCallbacks cbs;
+    cbs.onShutdown = [&] { ++shutdowns; };
+    AaConnection conn(msger, crypto, cbs);
+    driveToRunning(conn, hu);
+    openChannel(conn, hu, ChannelId::Input);
+    openChannel(conn, hu, ChannelId::Video);
+
+    hu.clearSent();
+    std::vector<uint8_t> req;
+    pb::Writer(req).uint32(1, 1);  // reason = QUIT
+    phoneSend(hu, ChannelId::Control, EncryptionType::Encrypted,
+              static_cast<uint16_t>(ControlMsgId::ShutdownRequest), req);
+    REQUIRE(conn.poll(0));
+    CHECK(conn.state() == AaState::Shutdown);
+    CHECK(conn.shutdownReason() == AaShutdownReason::PhoneRequest);
+    CHECK_EQ(shutdowns, 1);
+
+    const auto sent = parseHuSends(hu);
+    REQUIRE(sent.size() == 1);
+    CHECK(sent[0].channel == ChannelId::Control);
+    CHECK_EQ(int(sent[0].messageId), int(ControlMsgId::ShutdownResponse));
+    CHECK(sent[0].encryption == EncryptionType::Encrypted);
+    CHECK(sent[0].msgType == MessageType::Specific);
+    CHECK(sent[0].payload.empty());  // ShutdownResponse has no fields
+
+    // Terminal: nothing further is received or sent.
+    hu.clearSent();
+    phoneSend(hu, ChannelId::Control, EncryptionType::Encrypted,
+              static_cast<uint16_t>(ControlMsgId::ShutdownRequest), req);
+    CHECK(!conn.poll(0));
+    CHECK(!conn.sendTouch(TouchAction::Press, 10, 10, 1));
+    CHECK(!conn.sendMediaKey(MediaKey::PlayPause, 1));
+    CHECK(!conn.sendVideoFocus(VideoFocusMode::Unfocused));
+    CHECK(!conn.channelOpen(ChannelId::Input));
+    CHECK(hu.sent().empty());
+    CHECK_EQ(shutdowns, 1);
 }
 
 TEST(AaChannels, SensorStartGetsResponseAndEvent) {
@@ -430,8 +576,7 @@ TEST(AaChannels, VideoFocusRequestAndOutboundIndication) {
     CHECK(sawRequest);
     CHECK(requested == VideoFocusMode::Focused);
 
-    // HU drives projection -> VIDEO_FOCUS_REQUEST on the video channel (0x8004), the
-    // message the reference HU (Google DHU) sends to make the phone start the stream.
+    // HU-driven focus change -> VIDEO_FOCUS_INDICATION (0x8008) on the video channel.
     hu.clearSent();
     REQUIRE(conn.sendVideoFocus(VideoFocusMode::Focused));
     CHECK(huSent(hu, ChannelId::Video,

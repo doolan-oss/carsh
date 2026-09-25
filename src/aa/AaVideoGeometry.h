@@ -3,8 +3,9 @@
 // coordinates. Pure integer math, platform-independent, host-tested. This is the
 // geometry half of AA_PLAN's "UI integration" (AA as a tab, chrome stays visible):
 // AA video is a fixed standard size (480p = 800x480) that we scale-blit into the
-// 696x432-ish content rect, so touches in that rect must be remapped to 800x480
-// for the AA input channel.
+// 748x432 content rect (800x480 panel minus the 52 px volume rail and the 48 px tab
+// bar), where it fits height-bound to 720x432 at (66,0) — a 0.9x downscale — so
+// touches in that rect must be remapped to 800x480 for the AA input channel.
 #pragma once
 
 namespace carsh::aa {

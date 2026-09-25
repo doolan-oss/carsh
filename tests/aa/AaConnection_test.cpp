@@ -11,18 +11,22 @@
 #include "Test.h"
 #include "aa/FakeAaCrypto.h"
 #include "aa/FakeAaTransport.h"
+#include "aa/FakeSequencedAaCrypto.h"
 #include "aa/Pb.h"
 
 using namespace carsh;
 using carsh::aa::AaConnection;
 using carsh::aa::AaMessage;
 using carsh::aa::AaMessenger;
+using carsh::aa::AaShutdownReason;
 using carsh::aa::AaState;
+using carsh::aa::AvMsgId;
 using carsh::aa::ChannelId;
 using carsh::aa::EncryptionType;
 using carsh::aa::MessageType;
 using carsh::host::FakeAaCrypto;
 using carsh::host::FakeAaTransport;
+using carsh::host::FakeSequencedAaCrypto;
 namespace pb = carsh::aa::pb;
 
 namespace {
@@ -181,4 +185,168 @@ TEST(AaConnection, ServiceDiscoveryResponseIsValidProtobuf) {
     }
     CHECK(channelDescriptors == 5);  // media-audio, av-input, sensor, input, video
     CHECK_EQ(huName, std::string("carsh"));
+}
+
+namespace {
+
+// version -> handshake -> auth -> service discovery, so state == Running. With a
+// FakeAaCrypto(2) the phone's encrypted frames are identity-"encrypted".
+void driveToRunning(AaConnection& conn, FakeAaTransport& hu) {
+    conn.start();
+    phoneSend(hu, ChannelId::Control, EncryptionType::Plain, MessageType::Specific,
+              kVersionResponse, {0x00, 0x01, 0x00, 0x07, 0x00, 0x00});
+    REQUIRE(conn.poll(0));
+    phoneSend(hu, ChannelId::Control, EncryptionType::Plain, MessageType::Specific,
+              kSslHandshake, {0x01});
+    REQUIRE(conn.poll(0));
+    std::vector<uint8_t> sdReq;
+    pb::Writer(sdReq).string(4, "Pixel");
+    phoneSend(hu, ChannelId::Control, EncryptionType::Encrypted, MessageType::Specific,
+              kSvcDiscoveryReq, sdReq);
+    REQUIRE(conn.poll(0));
+    REQUIRE(conn.state() == AaState::Running);
+}
+
+}  // namespace
+
+// A record that fails to decrypt (lost/corrupted bytes -> bad MAC) is unrecoverable:
+// the connection must go to Shutdown(CryptoFailure) and tell its owner, instead of
+// dispatching the empty plaintext as msgId 0 (a spurious MediaAck on an AV channel)
+// and staying "Running" on a dead link forever.
+TEST(AaConnection, DecryptFailureShutsDown) {
+    FakeAaTransport hu;
+    AaMessenger msger(hu);
+    FakeAaCrypto crypto(2);
+    int shutdowns = 0;
+    carsh::aa::AaConnectionCallbacks cbs;
+    cbs.onShutdown = [&] { ++shutdowns; };
+    AaConnection conn(msger, crypto, cbs);
+    driveToRunning(conn, hu);
+
+    std::vector<uint8_t> openReq;
+    pb::Writer(openReq).uint32(2, 3);
+    phoneSend(hu, ChannelId::Video, EncryptionType::Encrypted, MessageType::Control,
+              kChannelOpenReq, openReq);
+    REQUIRE(conn.poll(0));
+    REQUIRE(conn.channelOpen(ChannelId::Video));
+
+    // The next record fails to decrypt.
+    crypto.failDecryptAt(crypto.decryptCalls() + 1);
+    hu.clearSent();
+    const std::vector<uint8_t> media = {0, 0, 0, 1, 0x65};
+    phoneSend(hu, ChannelId::Video, EncryptionType::Encrypted, MessageType::Specific,
+              static_cast<uint16_t>(AvMsgId::MediaIndication), media);
+    CHECK(!conn.poll(0));
+    CHECK(conn.state() == AaState::Shutdown);
+    CHECK(conn.shutdownReason() == AaShutdownReason::CryptoFailure);
+    CHECK_EQ(shutdowns, 1);
+    CHECK(hu.sent().empty());  // no spurious MEDIA_ACK for the garbage
+    CHECK(!conn.channelOpen(ChannelId::Video));
+    CHECK(!conn.poll(0));  // terminal
+    CHECK_EQ(shutdowns, 1);
+}
+
+// A fatal TLS handshake error (IAaCrypto::failed() during the handshake) also ends
+// the session rather than leaving it parked in SslHandshake forever.
+TEST(AaConnection, HandshakeFailureShutsDown) {
+    FakeAaTransport hu;
+    AaMessenger msger(hu);
+    FakeAaCrypto crypto(3);
+    int shutdowns = 0;
+    carsh::aa::AaConnectionCallbacks cbs;
+    cbs.onShutdown = [&] { ++shutdowns; };
+    AaConnection conn(msger, crypto, cbs);
+    conn.start();
+    phoneSend(hu, ChannelId::Control, EncryptionType::Plain, MessageType::Specific,
+              kVersionResponse, {0x00, 0x01, 0x00, 0x07, 0x00, 0x00});
+    REQUIRE(conn.poll(0));
+    CHECK(conn.state() == AaState::SslHandshake);
+
+    crypto.failHandshake();
+    phoneSend(hu, ChannelId::Control, EncryptionType::Plain, MessageType::Specific,
+              kSslHandshake, {0x16, 0x03, 0x03});
+    conn.poll(0);
+    CHECK(conn.state() == AaState::Shutdown);
+    CHECK(conn.shutdownReason() == AaShutdownReason::CryptoFailure);
+    CHECK_EQ(shutdowns, 1);
+}
+
+// A version reject is a Shutdown too, reported through the same callback.
+TEST(AaConnection, VersionRejectShutsDown) {
+    FakeAaTransport hu;
+    AaMessenger msger(hu);
+    FakeAaCrypto crypto(2);
+    int shutdowns = 0;
+    carsh::aa::AaConnectionCallbacks cbs;
+    cbs.onShutdown = [&] { ++shutdowns; };
+    AaConnection conn(msger, crypto, cbs);
+    conn.start();
+    phoneSend(hu, ChannelId::Control, EncryptionType::Plain, MessageType::Specific,
+              kVersionResponse, {0x00, 0x01, 0x00, 0x07, 0xFF, 0xFF});  // status != OK
+    REQUIRE(conn.poll(0));
+    CHECK(conn.state() == AaState::Shutdown);
+    CHECK(conn.shutdownReason() == AaShutdownReason::VersionRejected);
+    CHECK_EQ(shutdowns, 1);
+}
+
+// End to end with sequence-numbered "TLS" (FakeSequencedAaCrypto): encrypted frames
+// that reassembly discards — an unknown channel, an orphan MIDDLE — are still
+// decrypted in order, so the session survives them and the next real message is
+// handled. A record that is genuinely LOST in transit, though, breaks the sequence:
+// the connection detects it and shuts down.
+TEST(AaConnection, DroppedFramesKeepTlsInSyncButLostRecordShutsDown) {
+    FakeAaTransport hu;
+    AaMessenger msger(hu);
+    FakeSequencedAaCrypto huCrypto(2);   // head unit: handshake after the kick + 1
+    FakeSequencedAaCrypto phone(0);      // phone side: session already up
+    AaConnection conn(msger, huCrypto, {});
+
+    // Phone frame helpers: encrypt [msgId][body] with the phone's sequence counter.
+    auto encFrame = [&](uint8_t ch, carsh::aa::FrameType ft, uint16_t msgId,
+                        const std::vector<uint8_t>& body) {
+        std::vector<uint8_t> plain = {static_cast<uint8_t>(msgId >> 8),
+                                      static_cast<uint8_t>(msgId & 0xFF)};
+        plain.insert(plain.end(), body.begin(), body.end());
+        std::vector<uint8_t> c = phone.encrypt(plain.data(), plain.size());
+        std::vector<uint8_t> f = {ch,
+                                  carsh::aa::frameFlags(ft, MessageType::Specific,
+                                                        EncryptionType::Encrypted),
+                                  static_cast<uint8_t>(c.size() >> 8),
+                                  static_cast<uint8_t>(c.size() & 0xFF)};
+        f.insert(f.end(), c.begin(), c.end());
+        return f;
+    };
+    const auto Bulk = carsh::aa::FrameType::Bulk;
+
+    conn.start();
+    phoneSend(hu, ChannelId::Control, EncryptionType::Plain, MessageType::Specific,
+              kVersionResponse, {0x00, 0x01, 0x00, 0x07, 0x00, 0x00});
+    REQUIRE(conn.poll(0));
+    phoneSend(hu, ChannelId::Control, EncryptionType::Plain, MessageType::Specific,
+              kSslHandshake, {0x01});
+    REQUIRE(conn.poll(0));
+    std::vector<uint8_t> sdReq;
+    pb::Writer(sdReq).string(4, "Pixel");
+    hu.pushRx(encFrame(0, Bulk, kSvcDiscoveryReq, sdReq));
+    REQUIRE(conn.poll(0));
+    REQUIRE(conn.state() == AaState::Running);
+
+    // Unknown channel 12 + an orphan MIDDLE on channel 3: dropped, but decrypted.
+    hu.pushRx(encFrame(12, Bulk, 0x8001, {0x01}));
+    hu.pushRx(encFrame(3, carsh::aa::FrameType::Middle, 0x0001, {0x02, 0x03}));
+    // ...then a real CHANNEL_OPEN_REQUEST on the video channel.
+    std::vector<uint8_t> openReq;
+    pb::Writer(openReq).uint32(2, 3);
+    hu.pushRx(encFrame(3, Bulk, kChannelOpenReq, openReq));
+    REQUIRE(conn.poll(0));
+    CHECK(conn.channelOpen(ChannelId::Video));
+    CHECK(conn.state() == AaState::Running);
+    CHECK_EQ(huCrypto.recordsDecrypted(), 4u);  // SD request + 2 dropped + the open
+
+    // A record lost in transit: the phone encrypted it, the HU never got it.
+    (void)encFrame(4, Bulk, 0x0001, {0x09});
+    hu.pushRx(encFrame(1, Bulk, 0x8002, {0x08, 0x03}));
+    CHECK(!conn.poll(0));
+    CHECK(conn.state() == AaState::Shutdown);
+    CHECK(conn.shutdownReason() == AaShutdownReason::CryptoFailure);
 }
