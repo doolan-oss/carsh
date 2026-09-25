@@ -4,10 +4,17 @@
 // tag art (APIC / FLAC PICTURE / MP4 covr) is a later enhancement — the tag reader
 // only sets a hasEmbeddedArt flag today, it doesn't extract the bytes.
 //
-// Pure logic over the Vfs + the existing Art pipeline (decodeImage -> generateAscii),
-// so it's host-tested with HostVfs + a synthesized cover image.
+// Pure logic over the Vfs + the existing Art pipeline (decodeImageFitted ->
+// generateAscii), so it's host-tested with HostVfs + a synthesized cover image.
+//
+// The cover is streamed (never read into one buffer), probed before decoding, and
+// downscaled straight out of the decoder — see Art.h for why that matters on
+// Circle's heap (review L1). A candidate that is too large (> kMaxArtDim) or fails
+// to decode falls through to the next-best image, so a folder with a huge scan
+// as cover.jpg plus a small folder.jpg still shows art.
 #pragma once
 
+#include <algorithm>
 #include <cctype>
 #include <cstdint>
 #include <string>
@@ -44,10 +51,16 @@ inline int artRank(const std::string& nameLower) {
 }
 }  // namespace detail
 
+// Most candidate images tried per album before giving up (bounds the work for a
+// folder full of oversized scans).
+constexpr int kMaxArtCandidates = 4;
+
 // Find the best cover image in the folder containing `trackPath`, decode it, and
-// render AsciiArt into `out`. Returns false if the folder has no usable image.
+// render AsciiArt into `out`. Returns false if the folder has no usable image
+// (none, or every tried candidate failed to decode / exceeds maxDim).
 inline bool loadSidecarArt(carsh::hal::Vfs& vfs, const std::string& trackPath,
-                           AsciiArt& out, int cols = 22, int rows = 11) {
+                           AsciiArt& out, int cols = 22, int rows = 11,
+                           int maxDim = kMaxArtDim) {
     const auto slash = trackPath.find_last_of('/');
     std::string folder = slash == std::string::npos ? std::string()
                                                     : trackPath.substr(0, slash);
@@ -56,31 +69,29 @@ inline bool loadSidecarArt(carsh::hal::Vfs& vfs, const std::string& trackPath,
     std::vector<carsh::hal::DirEntry> entries;
     if (!vfs.readdir(folder, entries)) return false;
 
-    int bestRank = -1;
-    std::string bestName;
+    struct Candidate { int rank; std::string name; };
+    std::vector<Candidate> cands;
     for (const auto& e : entries) {
         if (e.isDir) continue;
         const int r = detail::artRank(detail::toLower(e.name));
-        if (r > bestRank) { bestRank = r; bestName = e.name; }
+        if (r >= 0) cands.push_back({r, e.name});
     }
-    if (bestRank < 0) return false;
+    // Best rank first; ties keep directory order (first listed wins, as before).
+    std::stable_sort(cands.begin(), cands.end(),
+                     [](const Candidate& a, const Candidate& b) { return a.rank > b.rank; });
 
-    const std::string path =
-        (folder == "/" ? "/" : folder + "/") + bestName;
-    auto stream = vfs.open(path);
-    if (!stream) return false;
-
-    std::vector<uint8_t> bytes(static_cast<size_t>(stream->size()));
-    if (!bytes.empty()) {
-        size_t got = stream->read(bytes.data(), bytes.size());
-        bytes.resize(got);
+    int tried = 0;
+    for (const Candidate& c : cands) {
+        if (tried++ >= kMaxArtCandidates) break;
+        const std::string path = (folder == "/" ? "/" : folder + "/") + c.name;
+        auto stream = vfs.open(path);
+        if (!stream || stream->size() == 0) continue;
+        Image img;
+        if (!decodeImageFitted(*stream, img, kArtWorkDim, maxDim)) continue;
+        out = generateAscii(img, cols, rows);
+        return true;
     }
-    if (bytes.empty()) return false;
-
-    Image img;
-    if (!decodeImage(bytes.data(), bytes.size(), img) || !img.valid()) return false;
-    out = generateAscii(img, cols, rows);
-    return true;
+    return false;
 }
 
 }  // namespace carsh::library
