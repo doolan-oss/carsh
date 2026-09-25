@@ -5,7 +5,9 @@
 // in a CountingStream (bytes actually read) and runs the parser inside an
 // AllocScope (largest operator-new allocation). Also covers the ID3 features the
 // frame walker handles: v2.2 ids, extended headers, unsynchronisation, v2.4
-// data-length indicators and iTunes-style non-syncsafe frame sizes.
+// data-length indicators, invalid frame ids skipped by size, v2.2 names in v2.3
+// tags, and iTunes-style big-endian (non-syncsafe) v2.4 frame sizes.
+#include <algorithm>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -285,15 +287,186 @@ TEST(TagsStream, Id3v24FrameFlags) {
     CHECK_EQ(r.meta.genre, std::string("Synth"));
 }
 
-// Old iTunes wrote v2.4 frame sizes as plain big-endian; a set high bit in the
-// size bytes can only mean that, so the frame is skipped by its real length.
-TEST(TagsStream, Id3v24NonSyncsafeFrameSize) {
+// Old iTunes wrote v2.4 frame sizes as plain big-endian. Size 200 is
+// 00 00 00 C8: a set high bit can only mean big-endian, so the frame is skipped
+// by its real length.
+TEST(TagsStream, Id3v24BigEndianFrameSizeWithHighBit) {
     Bytes body = frame(4, "APIC", artPayload(200), 0, /*plainBe32Size=*/true);
     append(body, frame(4, "TPE1", latin1("iTunes")));
     Parsed r = runId3(tag(4, 0, body));
     REQUIRE(r.ok);
     CHECK(r.meta.hasEmbeddedArt);
     CHECK_EQ(r.meta.artist, std::string("iTunes"));
+}
+
+// Size 256 written big-endian is 00 00 01 00, which is also a valid syncsafe
+// 128. The syncsafe reading lands mid-frame, the big-endian one on the next
+// header, so the frame is walked by 256 and the frames after it survive (the
+// high-bit check alone read 128 and lost both).
+TEST(TagsStream, Id3v24BigEndianFrameSize256) {
+    Bytes body = frame(4, "APIC", artPayload(256), 0, /*plainBe32Size=*/true);
+    append(body, frame(4, "TIT2", latin1("After Art")));
+    append(body, frame(4, "TPE1", latin1("Still Here")));
+    append(body, Bytes(64, 0));  // padding
+    Parsed r = runId3(tag(4, 0, body));
+    REQUIRE(r.ok);
+    CHECK(r.meta.hasEmbeddedArt);
+    CHECK_EQ(r.meta.title, std::string("After Art"));
+    CHECK_EQ(r.meta.artist, std::string("Still Here"));
+    CHECK(r.io.bytesRead < 1024);  // the checks peek at headers, not the art
+}
+
+// A whole iTunes-style tag: every frame big-endian, including a 256-byte text
+// frame first (read in full, not cut at 128), a 4 KiB APIC in the middle and a
+// 300-byte text frame last before the padding.
+TEST(TagsStream, Id3v24BigEndianTextFramesAndPadding) {
+    const std::string album(255, 'A');
+    const std::string title = "T" + std::string(298, 'x');
+    const bool be = true;
+    Bytes body = frame(4, "TALB", latin1(album), 0, be);
+    append(body, frame(4, "TPE1", latin1("Band"), 0, be));
+    append(body, frame(4, "APIC", artPayload(4096), 0, be));
+    append(body, frame(4, "TRCK", latin1("4/9"), 0, be));
+    append(body, frame(4, "TIT2", latin1(title), 0, be));
+    append(body, Bytes(128, 0));  // padding
+    Parsed r = runId3(tag(4, 0, body));
+    REQUIRE(r.ok);
+    CHECK_EQ(r.meta.album, album);
+    CHECK_EQ(r.meta.artist, std::string("Band"));
+    CHECK(r.meta.hasEmbeddedArt);
+    CHECK_EQ(r.meta.trackNo, uint16_t(4));
+    CHECK_EQ(r.meta.title, title);
+
+    // Same tag with no padding: the last frame ends exactly at the tag end.
+    body.resize(body.size() - 128);
+    Parsed r2 = runId3(tag(4, 0, body));
+    REQUIRE(r2.ok);
+    CHECK_EQ(r2.meta.album, album);
+    CHECK_EQ(r2.meta.trackNo, uint16_t(4));
+    CHECK_EQ(r2.meta.title, title);
+}
+
+// A spec-conforming v2.4 tag is never misread as big-endian, even when the
+// big-endian reading also lands on a well-formed header: syncsafe 200 is
+// 00 00 01 48, big-endian 328, and here both land on a frame. Ties go to the
+// spec.
+TEST(TagsStream, Id3v24SyncsafeWinsTies) {
+    const std::string title = "S" + std::string(198, 'y');  // 200-byte payload
+    Bytes body = frame(4, "TIT2", latin1(title));
+    append(body, frame(4, "TPE1", latin1("Syncsafe" + std::string(109, '!'))));  // 128 total
+    append(body, frame(4, "TALB", latin1("Spec")));
+    REQUIRE(body.size() == 210 + 128 + 15);
+    Parsed r = runId3(tag(4, 0, body));
+    REQUIRE(r.ok);
+    CHECK_EQ(r.meta.title, title);
+    CHECK_EQ(r.meta.artist, "Syncsafe" + std::string(109, '!'));
+    CHECK_EQ(r.meta.album, std::string("Spec"));
+}
+
+// Once a frame proved the tag big-endian (high bit set), a later tie goes to
+// big-endian too: this APIC (512 = 00 00 02 00, syncsafe 256) hides a fake
+// TPE1 header at offset 256, so both readings land on a well-formed header.
+TEST(TagsStream, Id3v24BigEndianConventionBreaksTies) {
+    Bytes art(512, 0);
+    const Bytes fake = frame(4, "TPE1", latin1("Wrong"));
+    std::copy(fake.begin(), fake.end(), art.begin() + 256);
+    const bool be = true;
+    Bytes body = frame(4, "TIT2", latin1("Title" + std::string(194, '.')), 0, be);  // 200
+    append(body, frame(4, "APIC", art, 0, be));
+    append(body, frame(4, "TPE1", latin1("Right"), 0, be));
+    Parsed r = runId3(tag(4, 0, body));
+    REQUIRE(r.ok);
+    CHECK(r.meta.hasEmbeddedArt);
+    CHECK_EQ(r.meta.artist, std::string("Right"));
+}
+
+// A syncsafe v2.4 frame of 128 bytes or more followed by an invalid-id frame:
+// the syncsafe reading lands on that frame, which the walker skips by size, so
+// it counts as a boundary and a big-endian reading that only reaches the
+// padding further on does not win. TALB 200 is 00 00 01 48 (big-endian 328),
+// APIC 1000 is 00 00 07 68 (big-endian 1896); both big-endian readings land in
+// the padding. The album stays clean and the frames after the invalid id parse.
+TEST(TagsStream, Id3v24InvalidIdAfterLargeFrameKeepsSyncsafe) {
+    const std::string album(199, 'A');  // 200-byte payload
+    Bytes body = frame(4, "TALB", latin1(album));
+    append(body, frame(4, "Tit2", latin1("lower")));
+    append(body, frame(4, "TIT2", latin1("Title")));
+    append(body, frame(4, "TPE1", latin1("Artist")));
+    append(body, Bytes(1024, 0));  // padding
+    Parsed r = runId3(tag(4, 0, body));
+    REQUIRE(r.ok);
+    CHECK_EQ(r.meta.album, album);
+    CHECK_EQ(r.meta.title, std::string("Title"));
+    CHECK_EQ(r.meta.artist, std::string("Artist"));
+
+    Bytes art = frame(4, "APIC", artPayload(1000));
+    append(art, frame(4, "tit2", latin1("lower")));
+    append(art, frame(4, "TIT2", latin1("Title")));
+    append(art, frame(4, "TPE1", latin1("Artist")));
+    append(art, Bytes(2048, 0));  // padding
+    Parsed ra = runId3(tag(4, 0, art));
+    REQUIRE(ra.ok);
+    CHECK(ra.meta.hasEmbeddedArt);
+    CHECK_EQ(ra.meta.title, std::string("Title"));
+    CHECK_EQ(ra.meta.artist, std::string("Artist"));
+}
+
+// The big-endian counterpart: an invalid-id frame right after a big-endian
+// frame is where the big-endian reading lands, and the syncsafe one lands mid-
+// art, so big-endian wins. First in a tag already proved big-endian (TIT2 200 =
+// 00 00 00 C8), then with the APIC (256 = 00 00 01 00, syncsafe 128) as the
+// tag's first frame.
+TEST(TagsStream, Id3v24BigEndianTagInvalidIdAfterLargeFrame) {
+    const bool be = true;
+    const std::string title = "Title" + std::string(194, '.');  // 200-byte payload
+    Bytes body = frame(4, "TIT2", latin1(title), 0, be);
+    append(body, frame(4, "APIC", artPayload(512), 0, be));  // syncsafe 256
+    append(body, frame(4, "tpe1", latin1("lower"), 0, be));
+    append(body, frame(4, "TPE1", latin1("Right"), 0, be));
+    append(body, frame(4, "TALB", latin1("Alb"), 0, be));
+    Parsed r = runId3(tag(4, 0, body));
+    REQUIRE(r.ok);
+    CHECK_EQ(r.meta.title, title);
+    CHECK(r.meta.hasEmbeddedArt);
+    CHECK_EQ(r.meta.artist, std::string("Right"));
+    CHECK_EQ(r.meta.album, std::string("Alb"));
+
+    Bytes first = frame(4, "APIC", artPayload(256), 0, be);
+    append(first, frame(4, "tpe1", latin1("lower"), 0, be));
+    append(first, frame(4, "TPE1", latin1("Right"), 0, be));
+    append(first, Bytes(64, 0));  // padding
+    Parsed rf = runId3(tag(4, 0, first));
+    REQUIRE(rf.ok);
+    CHECK(rf.meta.hasEmbeddedArt);
+    CHECK_EQ(rf.meta.artist, std::string("Right"));
+    CHECK(rf.meta.title.empty());
+}
+
+// When neither reading lands anywhere (here: the last frame, followed by junk
+// padding that is not zeros), a tag already proved big-endian stays
+// big-endian. TPE1 300 is 00 00 01 2C (syncsafe 172, mid-text); read as
+// syncsafe it would come back cut at 171 characters.
+TEST(TagsStream, Id3v24BigEndianConventionBreaksNowhereTie) {
+    const bool be = true;
+    const std::string artist = "R" + std::string(298, 'r');  // 300-byte payload
+    Bytes body = frame(4, "TIT2", latin1("Title" + std::string(194, '.')), 0, be);  // 200
+    append(body, frame(4, "TPE1", latin1(artist), 0, be));
+    append(body, Bytes(64, 0x55));  // junk padding
+    Parsed r = runId3(tag(4, 0, body));
+    REQUIRE(r.ok);
+    CHECK_EQ(r.meta.artist, artist);
+}
+
+// v2.4 frame-level unsync covers the grouping byte too: a 0xFF group id gains a
+// stuffed 0x00 that must be removed before the prefix is stripped.
+TEST(TagsStream, Id3v24UnsyncCoversGroupingByte) {
+    Bytes grouped = {0xFF};
+    append(grouped, latin1("Grp"));
+    const Bytes stored = unsync(grouped);
+    REQUIRE(stored.size() == grouped.size() + 1);
+    Parsed r = runId3(tag(4, 0, frame(4, "TPE1", stored, 0x40 | 0x02)));
+    REQUIRE(r.ok);
+    CHECK_EQ(r.meta.artist, std::string("Grp"));
 }
 
 TEST(TagsStream, Id3ExtendedHeaderIsSkipped) {
@@ -346,15 +519,69 @@ TEST(TagsStream, Id3RejectsInvalidHeaders) {
     CHECK(!tags::parseId3v2(&ss, m));
 }
 
-// Garbage after the real frames (bad id chars) ends the walk cleanly.
-TEST(TagsStream, Id3StopsAtGarbageFrameId) {
+// A frame with an invalid id (lowercase, punctuation) mid-tag is skipped by its
+// size like any unknown frame; the frames after it still parse, and it is not
+// mistaken for the frame it resembles.
+TEST(TagsStream, Id3SkipsInvalidFrameIdBySize) {
     Bytes body = frame(3, "TIT2", latin1("Good"));
+    append(body, frame(3, "Tit2", latin1("Lowercase")));
     append(body, Bytes{'t', 'i', '#', '2', 0, 0, 0, 2, 0, 0, 0, 'x'});
-    append(body, frame(3, "TPE1", latin1("Unreached")));
+    append(body, frame(3, "TPE1", latin1("Reached")));
+    append(body, frame(3, "TALB", latin1("Also")));
     Parsed r = runId3(tag(3, 0, body));
     REQUIRE(r.ok);
     CHECK_EQ(r.meta.title, std::string("Good"));
+    CHECK_EQ(r.meta.artist, std::string("Reached"));
+    CHECK_EQ(r.meta.album, std::string("Also"));
+
+    Bytes b4 = frame(4, "Tit2", latin1("Lowercase"));
+    append(b4, frame(4, "TPE1", latin1("v2.4")));
+    Parsed r4 = runId3(tag(4, 0, b4));
+    REQUIRE(r4.ok);
+    CHECK(r4.meta.title.empty());
+    CHECK_EQ(r4.meta.artist, std::string("v2.4"));
+
+    Bytes b2 = frame22("tt2", latin1("Lowercase"));
+    append(b2, frame22("TP1", latin1("v2.2")));
+    Parsed r2 = runId3(tag(2, 0, b2));
+    REQUIRE(r2.ok);
+    CHECK(r2.meta.title.empty());
+    CHECK_EQ(r2.meta.artist, std::string("v2.2"));
+}
+
+// Some writers put v2.2 names in v2.3 frames ("TT2\0"); they map like mutagen
+// maps them, and no longer end the walk.
+TEST(TagsStream, Id3v22NamesInV23Tag) {
+    Bytes body = frame(3, "TT2", latin1("Short Id"));  // "TT2\0"
+    append(body, frame(3, "PIC", artPayload(300)));
+    append(body, frame(3, "TP1", latin1("Old Names")));
+    append(body, frame(3, "TALB", latin1("New Names")));
+    Parsed r = runId3(tag(3, 0, body));
+    REQUIRE(r.ok);
+    CHECK_EQ(r.meta.title, std::string("Short Id"));
+    CHECK(r.meta.hasEmbeddedArt);
+    CHECK_EQ(r.meta.artist, std::string("Old Names"));
+    CHECK_EQ(r.meta.album, std::string("New Names"));
+}
+
+// The walk still stops at padding and at a frame (valid id or not) whose size
+// runs past the tag, keeping what came before.
+TEST(TagsStream, Id3StopsAtPaddingOrOverrun) {
+    Bytes body = frame(3, "TIT2", latin1("Kept"));
+    append(body, Bytes{'t', 'i', '#', '2', 0x7F, 0xFF, 0xFF, 0xFF, 0, 0, 0, 'x'});
+    append(body, frame(3, "TPE1", latin1("Unreached")));
+    Parsed r = runId3(tag(3, 0, body));
+    REQUIRE(r.ok);
+    CHECK_EQ(r.meta.title, std::string("Kept"));
     CHECK(r.meta.artist.empty());
+
+    Bytes padded = frame(4, "TIT2", latin1("Kept"));
+    append(padded, Bytes(16, 0));
+    append(padded, frame(4, "TPE1", latin1("After padding")));
+    Parsed rp = runId3(tag(4, 0, padded));
+    REQUIRE(rp.ok);
+    CHECK_EQ(rp.meta.title, std::string("Kept"));
+    CHECK(rp.meta.artist.empty());
 }
 
 // ---- FLAC ----
