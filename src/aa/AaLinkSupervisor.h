@@ -31,6 +31,11 @@
 //    (same log line): the dongle did not re-enumerate.
 // The budget refills when a session reaches Running, or when a transport comes up
 // that we did not force (the dongle re-cycled by itself, or the user replugged it).
+//
+// Every transport removal is reported, not only one that cuts a live session:
+// goneKind() says what a removal means from the phase it arrives in, so the bench log
+// shows whether the dongle re-cycled by itself after an Exit or a fault (the [hw]
+// premise of the Exit policy) rather than staying silent once the session is freed.
 #pragma once
 
 #include <cstdint>
@@ -76,6 +81,20 @@ public:
         PhoneExit,  // the phone's SHUTDOWN_REQUEST: the user chose Exit
     };
 
+    // What the bound transport's removal means (goneKind(), asked before
+    // onTransportGone()). Circle does not log hub connects/disconnects, so the
+    // driver's "uaa1 gone" line is the only trace of the dongle re-cycling.
+    enum class GoneKind {
+        LiveSession,  // cut a live session: unplugged, or the dongle re-cycled mid-session
+        AfterExit,    // after the phone's Exit: the dongle re-cycled by itself (or was
+                      // unplugged) — nothing had been forced
+        AfterFault,   // after a fault ended the session, before any forced
+                      // re-enumeration: the dongle re-cycled by itself (or was unplugged)
+        Forced,       // the removal a ForceReenumerate performed
+        AfterGiveUp,  // after GiveUp: the dongle re-cycled by itself, or was unplugged
+        NotBound,     // nothing was bound (not expected; reported, not acted on)
+    };
+
     AaLinkSupervisor() = default;
     explicit AaLinkSupervisor(const Config& cfg) : cfg_(cfg) {}
 
@@ -91,10 +110,11 @@ public:
     // removal a ForceReenumerate performed).
     void onTransportGone() { phase_ = Phase::NoTransport; }
 
-    // Once per driver tick. linkDead / shutdown / running describe the bound
-    // transport and its connection (false / AaShutdownReason::None / false when
-    // nothing is bound or the session already ended). shutdown is the connection's
-    // shutdownReason() — None while it is not in AaState::Shutdown.
+    // Once per driver tick. linkDead is the bound transport's latch (false only when
+    // nothing is bound — it stays true on a bound transport after its session ended,
+    // which Ended/Exited/GaveUp ignore). shutdown / running describe the live
+    // connection (AaShutdownReason::None / false once it has been freed); shutdown is
+    // its shutdownReason() — None while it is not in AaState::Shutdown.
     Action update(uint64_t nowMs, bool linkDead, AaShutdownReason shutdown, bool running) {
         switch (phase_) {
             case Phase::NoTransport:
@@ -108,6 +128,7 @@ public:
                 if (shutdown == AaShutdownReason::PhoneRequest) {
                     cause_ = EndCause::PhoneExit;  // wins over a link dying alongside
                     phase_ = Phase::Exited;
+                    endedAtMs_ = nowMs;  // only for msSinceEnd(): Exited never times out
                     return Action::EndSession;
                 }
                 if (linkDead || shutdown != AaShutdownReason::None) {
@@ -133,6 +154,27 @@ public:
                 return Action::None;
         }
         return Action::None;
+    }
+
+    // What a removal of the bound transport means right now. Ask it when the removal
+    // is noticed, BEFORE onTransportGone() (which resets the phase).
+    GoneKind goneKind() const {
+        switch (phase_) {
+            case Phase::Session: return GoneKind::LiveSession;
+            case Phase::Exited: return GoneKind::AfterExit;
+            case Phase::Ended: return GoneKind::AfterFault;
+            case Phase::GaveUp: return GoneKind::AfterGiveUp;
+            case Phase::NoTransport:
+                return awaitingReturn_ ? GoneKind::Forced : GoneKind::NotBound;
+        }
+        return GoneKind::NotBound;
+    }
+
+    // ms from the last session's end (EndSession) to nowMs — for the removal log after
+    // an Exit or a fault. 0 when no session has ended since the last bind.
+    uint64_t msSinceEnd(uint64_t nowMs) const {
+        if (cause_ == EndCause::None || nowMs < endedAtMs_) return 0;
+        return nowMs - endedAtMs_;
     }
 
     Phase phase() const { return phase_; }

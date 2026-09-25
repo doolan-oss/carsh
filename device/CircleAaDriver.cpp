@@ -113,10 +113,6 @@ void CircleAaDriver::bind(CAndroidAutoDevice* aa) {
     removedHandle_ = aa->RegisterRemovedHandler(&CircleAaDriver::transportRemoved, this);
     faultLogged_ = false;
     sup_.onTransportBound();
-    // Before the new messenger reads anything or the VERSION_REQUEST goes out: on a
-    // transport that already carried a session (forceReenumerate's fallback re-binds
-    // one Circle could not remove), drop the old session's bytes still in the RX ring.
-    const unsigned stale = aa->beginSession();
 
     // circle-mbedtls is built MBEDTLS_THREADING_C + MBEDTLS_THREADING_ALT, so
     // mbedTLS's mutex callbacks MUST be installed (mbedtls_threading_set_alt)
@@ -174,6 +170,12 @@ void CircleAaDriver::bind(CAndroidAutoDevice* aa) {
     };
     conn_ = new carsh::aa::AaConnection(*msger_, *crypto_, cbs);
     if (projection_ != nullptr) projection_->setConnection(conn_);
+    // Immediately before the VERSION_REQUEST goes out (nothing above reads the
+    // transport; crypto init and the allocations take time, and anything that arrives
+    // until start() is old-session data): on a transport that already carried a
+    // session (forceReenumerate's fallback re-binds one Circle could not remove), drop
+    // the old session's bytes still in the RX ring.
+    const unsigned stale = aa->beginSession();
     if (aa->sessions() > 1) {
         CLogger::Get()->Write(From, LogWarning,
                               "uaa1 re-bound (same transport, session %u; discarded %u "
@@ -205,6 +207,52 @@ void CircleAaDriver::logLinkFault() {
                               "link dead: %s — inFlight=%u ring=%u rx=%u tx=%u",
                               carsh::aa::aaLinkFaultName(fault), bound_->inFlight(),
                               bound_->ringUsed(), bound_->rxBytes(), bound_->txBytes());
+    }
+}
+
+// Every consumed removal gets one line starting "uaa1 gone", so a grep for it finds
+// them all. Circle's hub code logs no connect/disconnect, and after an Exit or a fault
+// the session is already freed — without this the dongle re-cycling by itself (the
+// [hw] premise of the Exit policy) would leave no trace. The removal is noticed only
+// when the kernel pumps USB plug-and-play (every 33 UI frames), so the ms figures are
+// upper bounds, coarse by about a second.
+void CircleAaDriver::logTransportGone(uint64_t nowMs) {
+    using Gone = carsh::aa::AaLinkSupervisor::GoneKind;
+    const unsigned sinceEnd = static_cast<unsigned>(sup_.msSinceEnd(nowMs));
+    switch (sup_.goneKind()) {
+        case Gone::LiveSession:
+            CLogger::Get()->Write(From, LogNotice,
+                                  "uaa1 gone — session ended (unplugged, or the dongle "
+                                  "re-cycled mid-session)");
+            break;
+        case Gone::AfterExit:
+            CLogger::Get()->Write(From, LogNotice,
+                                  "uaa1 gone ~%u ms after the phone exit — the dongle "
+                                  "re-cycled by itself (or was unplugged); nothing forced",
+                                  sinceEnd);
+            break;
+        case Gone::AfterFault:
+            CLogger::Get()->Write(From, LogNotice,
+                                  "uaa1 gone ~%u ms after the session ended — the dongle "
+                                  "re-cycled by itself (or was unplugged); no forced "
+                                  "re-enumeration needed",
+                                  sinceEnd);
+            break;
+        case Gone::Forced:
+            CLogger::Get()->Write(From, LogNotice,
+                                  "uaa1 gone — removed by the forced re-enumeration (%u/%u); "
+                                  "waiting for the dongle to come back",
+                                  sup_.forcedAttempts(), sup_.config().maxForced);
+            break;
+        case Gone::AfterGiveUp:
+            CLogger::Get()->Write(From, LogNotice,
+                                  "uaa1 gone — after giving up: the dongle re-cycled by "
+                                  "itself or was unplugged");
+            break;
+        case Gone::NotBound:
+            CLogger::Get()->Write(From, LogWarning,
+                                  "uaa1 gone — but no transport was being supervised");
+            break;
     }
 }
 
@@ -243,12 +291,12 @@ void CircleAaDriver::tick() {
     const uint64_t nowMs = CTimer::GetClockTicks64() / 1000;
 
     // 1. The bound transport was destroyed (unplug, the dongle's own re-cycle, or our
-    //    forced re-enumeration): the session it carried is over.
+    //    forced re-enumeration): the session it carried, if any, is over. Logged every
+    //    time, also when no session was live (after an Exit or a fault the session is
+    //    already freed): it is the only trace of the dongle re-cycling by itself.
     if (transportGone_) {
         transportGone_ = false;
-        if (conn_ != nullptr) {
-            CLogger::Get()->Write(From, LogNotice, "uaa1 gone — session ended");
-        }
+        logTransportGone(nowMs);  // before onTransportGone(): the phase says what it means
         endSession(true);
         sup_.onTransportGone();
     }

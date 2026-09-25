@@ -57,6 +57,8 @@ private:
     void unwatchTransport();
     void forceReenumerate();
     void logLinkFault();
+    // The "uaa1 gone ..." line for a consumed removal, whatever phase it arrives in.
+    void logTransportGone(uint64_t nowMs);
 
     // CDevice removed-handler on the bound transport: runs inside Circle's device
     // teardown (UpdatePlugAndPlay, or our own forced removal) — task context.

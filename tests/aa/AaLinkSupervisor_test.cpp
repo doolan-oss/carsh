@@ -14,6 +14,7 @@ using carsh::aa::AaShutdownReason;
 using Action = AaLinkSupervisor::Action;
 using Phase = AaLinkSupervisor::Phase;
 using Cause = AaLinkSupervisor::EndCause;
+using Gone = AaLinkSupervisor::GoneKind;
 
 namespace {
 
@@ -255,6 +256,7 @@ TEST(AaLinkSupervisor, H8RecoveryScenario) {
         if (a == Action::ForceReenumerate) {
             ++forced;
             bound = false;
+            CHECK(s.goneKind() == Gone::Forced);  // the driver's "uaa1 gone" line
             s.onTransportGone();
         }
         CHECK(a != Action::GiveUp && a != Action::DongleLost);
@@ -287,6 +289,8 @@ TEST(AaLinkSupervisor, PhoneExitScenario) {
         }
         if (tick == 400) {  // the dongle re-cycled (PnP): transport gone ...
             bound = false;
+            CHECK(s.goneKind() == Gone::AfterExit);  // reported, though no session is live
+            CHECK_EQ(s.msSinceEnd(t), (400u - 100u) * 33u);
             s.onTransportGone();
         }
         if (tick == 600) {  // ... and back as a new uaa1 when the phone reconnects
@@ -301,4 +305,92 @@ TEST(AaLinkSupervisor, PhoneExitScenario) {
     CHECK_EQ(forced, 0);
     CHECK_EQ(bound2, 1);
     CHECK(s.phase() == Phase::Session);
+}
+
+// Every removal is reported (review of the fu-aa follow-up): the driver's "uaa1 gone"
+// line used to be printed only while a session was live, so after an Exit or a fault
+// (the session already freed) the dongle re-cycling by itself left no trace — the
+// very [hw] question the Exit policy depends on. goneKind() classifies a removal by
+// the phase it arrives in, asked before onTransportGone().
+TEST(AaLinkSupervisor, GoneKindNamesEveryRemoval) {
+    // Cut a live session (hot-unplug, or the dongle re-cycling mid-session).
+    {
+        AaLinkSupervisor s(cfg());
+        s.onTransportBound();
+        CHECK(s.update(10, false, kUp, true) == Action::None);
+        CHECK(s.goneKind() == Gone::LiveSession);
+        CHECK_EQ(s.msSinceEnd(10), 0u);  // nothing ended yet
+    }
+    // After the phone's Exit: nothing forced, so the removal is the dongle's own.
+    {
+        AaLinkSupervisor s(cfg());
+        s.onTransportBound();
+        CHECK(s.update(20, false, kExit, false) == Action::EndSession);
+        for (uint64_t t = 20; t < 9000; t += 33) CHECK(idle(s, t) == Action::None);
+        CHECK(s.goneKind() == Gone::AfterExit);
+        CHECK_EQ(s.msSinceEnd(9020), 9000u);
+    }
+    // After a fault, inside the grace period: the dongle re-cycled by itself.
+    {
+        AaLinkSupervisor s(cfg());
+        s.onTransportBound();
+        CHECK(s.update(100, true, kUp, false) == Action::EndSession);
+        CHECK(s.update(900, true, kUp, false) == Action::None);
+        CHECK(s.goneKind() == Gone::AfterFault);
+        CHECK_EQ(s.msSinceEnd(900), 800u);
+    }
+    // A fault shutdown on a live link is a fault too.
+    {
+        AaLinkSupervisor s(cfg());
+        s.onTransportBound();
+        CHECK(s.update(100, false, kTls, false) == Action::EndSession);
+        CHECK(s.goneKind() == Gone::AfterFault);
+    }
+    // The removal our ForceReenumerate performed.
+    {
+        AaLinkSupervisor s(cfg());
+        uint64_t t = 0;
+        s.onTransportBound();
+        CHECK(deadThenGrace(s, t) == Action::ForceReenumerate);
+        CHECK(s.goneKind() == Gone::Forced);
+    }
+    // After giving up: the dongle came back by itself, or the user pulled it.
+    {
+        auto c = cfg();
+        c.maxForced = 0;
+        AaLinkSupervisor s(c);
+        uint64_t t = 0;
+        s.onTransportBound();
+        CHECK(deadThenGrace(s, t) == Action::GiveUp);
+        CHECK(s.goneKind() == Gone::AfterGiveUp);
+    }
+    // Nothing bound at all (and after a removal that we did not force).
+    {
+        AaLinkSupervisor s(cfg());
+        CHECK(s.goneKind() == Gone::NotBound);
+        s.onTransportBound();
+        s.onTransportGone();
+        CHECK(s.goneKind() == Gone::NotBound);
+    }
+}
+
+// The bench's H8 check (c) in driver order: Exit -> EndSession frees the connection ->
+// seconds later the dongle's re-cycle arrives through plug-and-play. That removal is
+// classified (and so logged) as the dongle's own, not as ours and not dropped; a new
+// bind then clears the end time for the next session.
+TEST(AaLinkSupervisor, RemovalAfterExitIsTheDonglesOwnAndIsReported) {
+    AaLinkSupervisor s;  // production defaults
+    uint64_t t = 0;
+    s.onTransportBound();
+    CHECK(s.update(t += 33, false, kUp, true) == Action::None);
+    CHECK(s.update(t += 33, true, kExit, false) == Action::EndSession);  // dies alongside
+    const uint64_t endedAt = t;
+    for (int i = 0; i < 100; ++i) CHECK(s.update(t += 33, true, kUp, false) == Action::None);
+    CHECK(s.goneKind() == Gone::AfterExit);
+    CHECK(!s.awaitingReturn());  // not a removal we forced
+    CHECK_EQ(s.msSinceEnd(t), t - endedAt);
+    s.onTransportGone();
+    s.onTransportBound();  // the dongle re-cycled into a new uaa1
+    CHECK(s.goneKind() == Gone::LiveSession);
+    CHECK_EQ(s.msSinceEnd(t + 5000), 0u);
 }
