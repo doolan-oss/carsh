@@ -5,6 +5,7 @@
 // build server against a PngRenderTarget.
 #include "ui/AndroidAutoScreen.h"
 
+#include <functional>
 #include <vector>
 
 #include "Test.h"
@@ -30,6 +31,15 @@ public:
     explicit DummyScreen(Rect c) : Screen(c) {}
     const char* name() const override { return "X"; }
 };
+
+// One recorded AA touch action (source-frame coords).
+struct Act {
+    aa::TouchAction a;
+    int x, y;
+};
+std::function<void(aa::TouchAction, int, int)> recorder(std::vector<Act>& v) {
+    return [&v](aa::TouchAction a, int x, int y) { v.push_back({a, x, y}); };
+}
 
 std::vector<std::uint8_t> solidRgb(int w, int h, std::uint8_t r, std::uint8_t g,
                                    std::uint8_t b) {
@@ -77,37 +87,98 @@ TEST(AndroidAutoScreen, TouchInsideVideoRemapsToSource) {
     aa.setFrame(frame.data(), 800, 480);
     auto f = aa.fit();
 
-    int gotX = -1, gotY = -1;
-    GestureType gotType = GestureType::None;
-    aa.onTouch = [&](int sx, int sy, GestureType t) {
-        gotX = sx;
-        gotY = sy;
-        gotType = t;
-    };
+    std::vector<Act> acts;
+    aa.onTouchAction = recorder(acts);
 
-    Gesture g;
-    g.type = GestureType::Tap;
-    g.x = f.dx + f.dw / 2;
-    g.y = f.dy + f.dh / 2;
-    CHECK(aa.handle(g));
-    CHECK(gotType == GestureType::Tap);
-    CHECK(gotX >= 395 && gotX <= 405);
-    CHECK(gotY >= 235 && gotY <= 245);
+    CHECK(aa.wantsRawTouch());
+    const int px = f.dx + f.dw / 2, py = f.dy + f.dh / 2;
+    CHECK(aa.onRawTouch({hal::TouchPhase::Down, 0, px, py, 0}));
+    REQUIRE(acts.size() == 1u);
+    CHECK(acts[0].a == aa::TouchAction::Press);
+    CHECK(acts[0].x >= 395 && acts[0].x <= 405);
+    CHECK(acts[0].y >= 235 && acts[0].y <= 245);
+    // Up carries (0,0) on the Pi: the Release reuses the last mapped point.
+    CHECK(aa.onRawTouch({hal::TouchPhase::Up, 0, 0, 0, 30}));
+    REQUIRE(acts.size() == 2u);
+    CHECK(acts[1].a == aa::TouchAction::Release);
+    CHECK_EQ(acts[1].x, acts[0].x);
+    CHECK_EQ(acts[1].y, acts[0].y);
+    CHECK(!aa.pressed());
 }
 
 TEST(AndroidAutoScreen, TouchInLetterboxIsNotForwarded) {
     AndroidAutoScreen aa(kContent);
     auto frame = solidRgb(800, 480, 0, 0, 0);
     aa.setFrame(frame.data(), 800, 480);
-    bool called = false;
-    aa.onTouch = [&](int, int, GestureType) { called = true; };
+    std::vector<Act> acts;
+    aa.onTouchAction = recorder(acts);
 
+    // Left pillarbox: not claimed, so its Move/Up aren't ours either.
+    CHECK(!aa.onRawTouch({hal::TouchPhase::Down, 0, kContent.x + 1, kContent.h / 2, 0}));
+    CHECK(!aa.onRawTouch({hal::TouchPhase::Move, 0, 400, 200, 10}));
+    CHECK(!aa.onRawTouch({hal::TouchPhase::Up, 0, 0, 0, 20}));
+    CHECK(acts.empty());
+    // A completed gesture (the letterbox fallback path) is dropped, too.
     Gesture g;
     g.type = GestureType::Tap;
-    g.x = kContent.x + 1;  // left pillarbox
+    g.x = kContent.x + 1;
     g.y = kContent.h / 2;
     CHECK(!aa.handle(g));
-    CHECK(!called);
+    CHECK(acts.empty());
+}
+
+TEST(AndroidAutoScreen, NoVideoMeansNoTouch) {
+    AndroidAutoScreen aa(kContent);  // placeholder: nothing projected yet
+    std::vector<Act> acts;
+    aa.onTouchAction = recorder(acts);
+    CHECK(!aa.onRawTouch({hal::TouchPhase::Down, 0, 400, 200, 0}));
+    CHECK(acts.empty());
+}
+
+TEST(AndroidAutoScreen, DragIsClampedToTheVideoRect) {
+    AndroidAutoScreen aa(kContent);
+    auto frame = solidRgb(800, 480, 0, 0, 0);
+    aa.setFrame(frame.data(), 800, 480);
+    auto f = aa.fit();
+    std::vector<Act> acts;
+    aa.onTouchAction = recorder(acts);
+
+    CHECK(aa.onRawTouch({hal::TouchPhase::Down, 0, f.dx + 100, f.dy + 100, 0}));
+    // Slide off the left of the picture (into the pillarbox + rail) and below it
+    // (into the tab bar): the drag pins to the video's bottom-left corner instead
+    // of being dropped.
+    int cornerX = -1, cornerY = -1;  // the picture's bottom-left pixel, in source
+    REQUIRE(aa::mapToSource(f, 800, 480, f.dx, f.dy + f.dh - 1, cornerX, cornerY));
+    CHECK_EQ(cornerX, 0);
+    CHECK(cornerY >= 470);
+    CHECK(aa.onRawTouch({hal::TouchPhase::Move, 0, 5, 470, 10}));
+    REQUIRE(acts.size() == 2u);
+    CHECK(acts[1].a == aa::TouchAction::Drag);
+    CHECK_EQ(acts[1].x, cornerX);
+    CHECK_EQ(acts[1].y, cornerY);
+    // Still off-picture at the same clamped point: no duplicate Drag.
+    CHECK(aa.onRawTouch({hal::TouchPhase::Move, 0, 2, 475, 20}));
+    CHECK_EQ(acts.size(), 2u);
+    CHECK(aa.onRawTouch({hal::TouchPhase::Up, 0, 0, 0, 30}));
+    REQUIRE(acts.size() == 3u);
+    CHECK(acts[2].a == aa::TouchAction::Release);
+    CHECK_EQ(acts[2].x, cornerX);
+    CHECK_EQ(acts[2].y, cornerY);
+}
+
+TEST(AndroidAutoScreen, DeactivateMidPressReleasesOnce) {
+    AndroidAutoScreen aa(kContent);
+    auto frame = solidRgb(800, 480, 0, 0, 0);
+    aa.setFrame(frame.data(), 800, 480);
+    auto f = aa.fit();
+    std::vector<Act> acts;
+    aa.onTouchAction = recorder(acts);
+    CHECK(aa.onRawTouch({hal::TouchPhase::Down, 0, f.dx + 10, f.dy + 10, 0}));
+    aa.onRawTouchCancel();
+    aa.onDeactivate();  // already released: nothing more
+    REQUIRE(acts.size() == 2u);
+    CHECK(acts[1].a == aa::TouchAction::Release);
+    CHECK(!aa.pressed());
 }
 
 TEST(AndroidAutoScreen, TabFocusDrivesVideoFocusCallback) {
