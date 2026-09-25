@@ -24,6 +24,7 @@ using carsh::aa::AvMsgId;
 using carsh::aa::ChannelId;
 using carsh::aa::EncryptionType;
 using carsh::aa::InputMsgId;
+using carsh::aa::MediaKey;
 using carsh::aa::MessageType;
 using carsh::aa::SensorMsgId;
 using carsh::aa::TouchAction;
@@ -301,6 +302,70 @@ TEST(AaChannels, InputBindingAndOutboundTouch) {
     // Touch before the input channel is open must no-op (false).
     AaConnection fresh(msger, crypto, {});
     CHECK(!fresh.sendTouch(TouchAction::Press, 1, 1, 1));
+}
+
+TEST(AaChannels, MediaKeySendsPressThenReleaseButtonEvent) {
+    FakeAaTransport hu;
+    AaMessenger msger(hu);
+    FakeAaCrypto crypto(2);
+    AaConnection conn(msger, crypto, {});
+    driveToRunning(conn, hu);
+    openChannel(conn, hu, ChannelId::Input);
+
+    hu.clearSent();
+    REQUIRE(conn.sendMediaKey(MediaKey::PlayPause, 7));
+
+    // A media key = two INPUT_EVENT_INDICATION frames: button down, then up.
+    std::vector<std::vector<uint8_t>> buttons;
+    for (const auto& m : parseHuSends(hu)) {
+        if (m.channel == ChannelId::Input &&
+            m.messageId == static_cast<uint16_t>(InputMsgId::InputEventIndication))
+            buttons.push_back(m.payload);
+    }
+    REQUIRE(buttons.size() == 2);
+
+    // Decode button_event[3] -> button_events[1] -> {scan_code[1], is_pressed[2]}.
+    auto decode = [](const std::vector<uint8_t>& body, uint32_t& scan, bool& pressed) {
+        pb::Reader r(body);
+        uint32_t f; uint8_t w;
+        bool found = false;
+        while (!r.eof()) {
+            REQUIRE(r.tag(f, w));
+            if (f == 3 && w == 2) {  // button_event (ButtonEvents)
+                pb::Reader be(nullptr, 0);
+                REQUIRE(r.submessage(be));
+                uint32_t f2; uint8_t w2;
+                while (!be.eof()) {
+                    REQUIRE(be.tag(f2, w2));
+                    if (f2 == 1 && w2 == 2) {  // button_events[0] (ButtonEvent)
+                        pb::Reader b(nullptr, 0);
+                        REQUIRE(be.submessage(b));
+                        uint32_t f3; uint8_t w3;
+                        while (!b.eof()) {
+                            REQUIRE(b.tag(f3, w3));
+                            if (f3 == 1) { REQUIRE(b.u32(scan)); }
+                            else if (f3 == 2) { uint32_t v; REQUIRE(b.u32(v)); pressed = v != 0; }
+                            else { REQUIRE(b.skip(w3)); }
+                        }
+                        found = true;
+                    } else { REQUIRE(be.skip(w2)); }
+                }
+            } else { REQUIRE(r.skip(w)); }
+        }
+        CHECK(found);
+    };
+
+    uint32_t scan0 = 0, scan1 = 0; bool p0 = false, p1 = true;
+    decode(buttons[0], scan0, p0);
+    decode(buttons[1], scan1, p1);
+    CHECK_EQ(scan0, static_cast<uint32_t>(MediaKey::PlayPause));  // 0x55
+    CHECK_EQ(scan1, static_cast<uint32_t>(MediaKey::PlayPause));
+    CHECK(p0);    // down
+    CHECK(!p1);   // up
+
+    // Media key before the input channel is open must no-op (false).
+    AaConnection fresh(msger, crypto, {});
+    CHECK(!fresh.sendMediaKey(MediaKey::Next, 1));
 }
 
 TEST(AaChannels, SensorStartGetsResponseAndEvent) {

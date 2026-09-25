@@ -148,6 +148,20 @@ public:
     int scrollOffset() const { return scroll_; }
     void setOnSelect(std::function<void(int)> cb) { onSelect_ = std::move(cb); }
 
+    // A persistent "current" row (e.g. the now-playing queue item), drawn with an
+    // accent marker independent of the tap selection. -1 = none.
+    void setCurrent(int i) { current_ = i; }
+    int current() const { return current_; }
+
+    // Scroll so row `index` is at the top of the view and select it (used by the
+    // alphabetical jump bar). Clamped to the scroll range.
+    void scrollTo(int index) {
+        if (index < 0) return;
+        selected_ = index;
+        scroll_ = index * rowH_;
+        clampScroll();
+    }
+
     int visibleRows() const { return bounds.h / rowH_; }
 
     void draw(Canvas& c, const Theme& th) override {
@@ -158,8 +172,12 @@ public:
             if (ry >= bounds.y + bounds.h) break;
             if (i == selected_)
                 c.fillRect(bounds.x, ry, bounds.w, rowH_, th.accentBg);
-            uint32_t fg = (i == selected_) ? th.accent : th.bright;
-            c.drawText(bounds.x + 4, ry + (rowH_ - kCellH) / 2, items_[i], fg);
+            // Now-playing marker: a left accent bar so the current row reads at a
+            // glance even when a different row is tap-selected.
+            if (i == current_)
+                c.fillRect(bounds.x, ry, 4, rowH_, th.accent);
+            uint32_t fg = (i == selected_ || i == current_) ? th.accent : th.bright;
+            c.drawText(bounds.x + 8, ry + (rowH_ - kCellH) / 2, items_[i], fg);
         }
     }
     bool onTap(int px, int py) override {
@@ -186,8 +204,41 @@ private:
     std::vector<std::string> items_;
     int rowH_;
     int selected_ = -1;
+    int current_ = -1;
     int scroll_ = 0;
     std::function<void(int)> onSelect_;
+};
+
+// AzIndexBar — a vertical A–Z (+ "#") strip for jump-to-letter on a long list.
+// A tap maps its y to a letter and fires onPick; the screen turns that into a list
+// scroll. Tap-driven (no swipe needed); the slots are deliberately compact, like a
+// phone contacts index.
+class AzIndexBar : public Widget {
+public:
+    static constexpr const char* kLetters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ#";
+    static constexpr int kCount = 27;
+
+    explicit AzIndexBar(Rect b) : Widget(b) {}
+    void setOnPick(std::function<void(char)> cb) { onPick_ = std::move(cb); }
+
+    void draw(Canvas& c, const Theme& th) override {
+        for (int i = 0; i < kCount; ++i) {
+            int y = bounds.y + i * bounds.h / kCount;
+            char s[2] = {kLetters[i], '\0'};
+            c.drawText(bounds.x, y, s, th.dim, 0, 1);
+        }
+    }
+    bool onTap(int px, int py) override {
+        if (!bounds.contains(px, py)) return false;
+        int idx = bounds.h > 0 ? (py - bounds.y) * kCount / bounds.h : 0;
+        if (idx < 0) idx = 0;
+        if (idx >= kCount) idx = kCount - 1;
+        if (onPick_) onPick_(kLetters[idx]);
+        return true;
+    }
+
+private:
+    std::function<void(char)> onPick_;
 };
 
 class TabBar : public Widget {

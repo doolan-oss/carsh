@@ -125,7 +125,7 @@ struct App {
 TEST(Ui, SevenScreensRegisteredAndRender) {
     App app;
     CHECK_EQ(app.mgr.tabBar().tabCount(), 7);
-    app.now.setState({"Money", "Pink Floyd", "Dark Side", 90000, 382000, true});
+    app.now.setState({"Money", "Pink Floyd", "Dark Side", 90000, 382000, true, ""});
     app.mgr.render(app.canvas);
     CHECK(app.rt.save(out("nowplaying.png")));
     // Accent color appears (active tab underline + progress + artist text).

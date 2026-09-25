@@ -626,6 +626,37 @@ bool AaConnection::sendTouch(TouchAction action, uint32_t x, uint32_t y,
                          body.data(), body.size());
 }
 
+bool AaConnection::sendButtonEvent(MediaKey key, bool pressed, uint64_t timestamp) {
+    if (!channelOpen(ChannelId::Input)) return false;
+    // InputEventIndication{ timestamp = 1 (int64), button_event = 3 {  // ButtonEvents
+    //   button_events[1] { scan_code[1], is_pressed[2] } } }.
+    // NOTE: button_event is field 3 (not 4) because carsh follows the older aasdk
+    // layout WITHOUT disp_channel — the same layout its hardware-validated sendTouch
+    // uses (touch_event = field 2). On aasdk master (with disp_channel = 2) these
+    // shift to touch_event = 3 / button_event = 4; keep these in lockstep with
+    // sendTouch above. [hw] confirm the phone binds + acts on the key on the bench.
+    std::vector<uint8_t> body;
+    pb::Writer w(body);
+    w.tag(0, 1);  // timestamp (varint, field 1)
+    w.varint(timestamp);
+    w.submessage(3, [&](pb::Writer& be) {            // button_event (ButtonEvents)
+        be.submessage(1, [&](pb::Writer& b) {        // button_events[0] (ButtonEvent)
+            b.uint32(1, static_cast<uint32_t>(key));  // scan_code
+            b.boolean(2, pressed);                    // is_pressed
+        });
+    });
+    return sendEncrypted(ChannelId::Input,
+                         static_cast<uint16_t>(InputMsgId::InputEventIndication),
+                         body.data(), body.size());
+}
+
+bool AaConnection::sendMediaKey(MediaKey key, uint64_t timestamp) {
+    // A key press is a down followed by an up (mirrors sendTouch's press/release).
+    const bool down = sendButtonEvent(key, true, timestamp);
+    const bool up = sendButtonEvent(key, false, timestamp);
+    return down && up;
+}
+
 bool AaConnection::poll(uint32_t timeoutMs) {
     if (state_ == AaState::Shutdown) return false;
 

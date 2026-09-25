@@ -48,7 +48,10 @@
 #include "library/Database.h"
 #include "library/Indexer.h"
 #include "library/LibraryBrowser.h"
+#include "library/LibraryCache.h"
+#include "library/ArtSource.h"
 #include "player/PlayerController.h"
+#include "player/MediaSession.h"
 #include "profile/ProfileManager.h"
 #include "ui/Canvas.h"
 #include "ui/Screen.h"
@@ -291,7 +294,26 @@ CStdlibApp::TShutdownMode CKernel::Run(void) {
     carsh::player::PlayerController player(media.vfs(), g_ring, g_engine,
                                            kChannels);
 
-    scanLibrary(media);
+    // Library: load the cached DB if the media tree is unchanged (fast boot), else
+    // scan and write the cache to the SD card for next time. The signature is over
+    // the MEDIA source; the cache lives on the writable SD boot card.
+    {
+        const char* kDbPath = "/carsh/library.db";
+        const char* kSigPath = "/carsh/library.sig";
+        const uint64_t sig =
+            carsh::library::librarySignature(media.vfs(), media.root());
+        const bool loaded =
+            mSdMounted && carsh::library::tryLoadLibrary(g_sdSource.vfs(), kDbPath,
+                                                         kSigPath, sig, g_db);
+        if (loaded) {
+            diag("library: %u tracks (cache hit)", unsigned(g_db.trackCount()));
+        } else {
+            scanLibrary(media);
+            if (mSdMounted && carsh::library::saveLibrary(g_sdSource.vfs(), kDbPath,
+                                                          kSigPath, sig, g_db))
+                diag("library: cache saved");
+        }
+    }
     checkOta();
 
     // Framebuffer + UI.
@@ -307,7 +329,7 @@ CStdlibApp::TShutdownMode CKernel::Run(void) {
     carsh::ui::NowPlayingScreen now(mgr.contentRect());
     carsh::ui::LibraryScreen library(mgr.contentRect());
     carsh::ui::SearchScreen search(mgr.contentRect());
-    carsh::ui::ListScreen queue(mgr.contentRect(), "Q");
+    carsh::ui::QueueScreen queue(mgr.contentRect());
     carsh::ui::EqScreen eq(mgr.contentRect());
     carsh::ui::ListScreen sources(mgr.contentRect(), "Src");
     carsh::ui::SettingsScreen settings(mgr.contentRect());
@@ -345,6 +367,10 @@ CStdlibApp::TShutdownMode CKernel::Run(void) {
     carsh::library::LibraryBrowser browser(g_db);
     browser.setSeed(CTimer::GetClockTicks() | 1u);  // vary the shuffle per boot
 
+    // Bumped whenever the queue CONTENTS change (not on a within-queue jump), so the
+    // Queue tab only rebuilds its rows when needed rather than every frame.
+    unsigned queueVersion = 0;
+
     // Build a player queue from a set of track ids and start playing. Keeps
     // g_queueIds in lockstep with the queue so now-playing can resolve metadata.
     auto startQueue = [&](const carsh::library::LibraryBrowser::PlayRequest& req) {
@@ -356,6 +382,7 @@ CStdlibApp::TShutdownMode CKernel::Run(void) {
             paths.push_back(t ? g_db.path(*t) : std::string());
         }
         g_queueIds = req.trackIds;
+        ++queueVersion;
         player.setQueue(std::move(paths));
         player.play(req.startIndex);  // starts decode; audio device opened on hardware
     };
@@ -380,18 +407,25 @@ CStdlibApp::TShutdownMode CKernel::Run(void) {
     library.onBack = [&] { browser.back(); refreshLibrary(); };
     library.onPlay = [&] { startQueue(browser.playAll(false)); };
     library.onShuffle = [&] { startQueue(browser.playAll(true)); };
+    library.onJump = [&](char ch) {
+        const int i = browser.firstRowForLetter(ch);
+        if (i >= 0) library.scrollTo(i);  // jump the list to that letter
+    };
     refreshLibrary();
+
+    // Queue tab: tap a row to jump within the current queue; CLEAR stops + empties it.
+    queue.onSelect = [&](int i) { player.play(i); };
+    queue.onClear = [&] {
+        player.stop();
+        player.clearQueue();
+        g_queueIds.clear();
+        ++queueVersion;
+    };
 
     // EQ screen edits feed the live engine EQ.
     eq.onBandChange = [&](int, double) { g_eq.setConfig(eq.config()); };
-    now.onPlayPause = [&] {
-        if (player.state().transport == carsh::player::Transport::Playing)
-            player.pause();
-        else
-            player.resume();
-    };
-    now.onNext = [&] { player.next(); };
-    now.onPrev = [&] { player.prev(); };
+    // (Now Playing transport buttons are wired after Bluetooth is set up below, so
+    // they can route play/pause/next/prev to AVRCP when the phone is the source.)
 
     // Touch (real hardware only; QEMU has no digitizer).
     carsh::device::CircleTouch touch;
@@ -466,6 +500,13 @@ CStdlibApp::TShutdownMode CKernel::Run(void) {
         bt.connect(g_btDevices[std::size_t(i)].address);
     };
     devices.onDisconnect = [] { bt.disconnect(); };
+
+    // Media session: arbitrates Now Playing between the local player and the phone
+    // (A2DP+AVRCP), and tells the transport buttons which backend to drive. Fed a
+    // fresh snapshot each frame in the UI loop below.
+    carsh::player::MediaSession session;
+    // (Now Playing transport buttons are wired after the AA projection is set up
+    // below, so they can also route play/pause/next/prev to Android Auto.)
 
     // Spawn the cooperative decode task (sole ring producer). The scheduler owns
     // it; it runs whenever this (UI) task yields via MsSleep below.
@@ -590,6 +631,46 @@ CStdlibApp::TShutdownMode CKernel::Run(void) {
     };
     androidAuto.onFocusChanged = [&](bool focused) { aaProjection.setFocus(focused); };
 
+    // Now Playing transport buttons -> the active source (chosen by MediaSession each
+    // frame). Android Auto: media keys over the AA input channel; Bluetooth: AVRCP;
+    // local: the file player. Wired here so the lambdas can reach aaProjection + bt.
+    now.onPlayPause = [&] {
+        switch (session.transportTarget()) {
+            case carsh::player::Source::AndroidAuto:
+                aaProjection.sendMediaKey(carsh::aa::MediaKey::PlayPause);
+                break;
+            case carsh::player::Source::Bluetooth:
+                bt.sendAvrcpCommand(session.playPauseCommand());
+                break;
+            case carsh::player::Source::Local:
+                if (player.state().transport == carsh::player::Transport::Playing)
+                    player.pause();
+                else
+                    player.resume();
+                break;
+        }
+    };
+    now.onNext = [&] {
+        switch (session.transportTarget()) {
+            case carsh::player::Source::AndroidAuto:
+                aaProjection.sendMediaKey(carsh::aa::MediaKey::Next); break;
+            case carsh::player::Source::Bluetooth:
+                bt.sendAvrcpCommand(carsh::bt::AvrcpCommand::Next); break;
+            case carsh::player::Source::Local:
+                player.next(); break;
+        }
+    };
+    now.onPrev = [&] {
+        switch (session.transportTarget()) {
+            case carsh::player::Source::AndroidAuto:
+                aaProjection.sendMediaKey(carsh::aa::MediaKey::Previous); break;
+            case carsh::player::Source::Bluetooth:
+                bt.sendAvrcpCommand(carsh::bt::AvrcpCommand::Prev); break;
+            case carsh::player::Source::Local:
+                player.prev(); break;
+        }
+    };
+
     mLogger.Write(FROM, LogNotice, "entering UI loop");
     unsigned frame = 0;
     // AA tick() latency window (microseconds), reset each ~1 Hz health log. Long
@@ -600,6 +681,11 @@ CStdlibApp::TShutdownMode CKernel::Run(void) {
     // its peak ~= the worst gap g_aaRing faces — the suspected source of the remaining
     // AA stutter (the 720p video blit on core 0, + memory contention with core 3).
     unsigned renderMaxUs = 0, renderSumUs = 0, renderCount = 0;
+    unsigned lastQueueVersion = ~0u;  // forces the Queue tab to build its rows once
+    // Album art (local source): sidecar covers rendered to ASCII, cached by albumKey
+    // and refreshed only when the now-playing album changes (decode is not free).
+    std::unordered_map<uint64_t, carsh::library::AsciiArt> artCache;
+    uint64_t lastArtAlbumKey = ~0ull;
     // Diagnostic software audio sink: no I2S DAC is wired yet, so nothing pulls
     // the engine — playback position would never advance. Each UI tick we consume
     // ~30 ms of audio here (decode -> ring -> engine DSP), which advances the
@@ -698,19 +784,77 @@ CStdlibApp::TShutdownMode CKernel::Run(void) {
             audioPeak *= 0.80f;
         }
 
-        carsh::ui::NowPlayingScreen::State st;
+        // Now Playing: arbitrate the local player vs the Bluetooth phone and show
+        // whichever currently owns the output. The local snapshot resolves metadata
+        // via the actual queue (g_queueIds); the BT side comes from AVRCP (g_btMeta).
+        carsh::player::MediaSession::LocalState ls;
         if (ps.queueIndex >= 0 && ps.queueIndex < int(g_queueIds.size())) {
             const carsh::library::Track* t =
                 g_db.get(g_queueIds[std::size_t(ps.queueIndex)]);
-            if (t) { st.title = g_db.title(*t); st.artist = g_db.artist(*t);
-                     st.album = g_db.album(*t); }
-        } else {
-            st.title = "carsh"; st.artist = "select a track"; st.album = "";
+            if (t) { ls.hasTrack = true; ls.title = g_db.title(*t);
+                     ls.artist = g_db.artist(*t); ls.album = g_db.album(*t); }
         }
-        st.positionMs = ps.positionMs;
-        st.durationMs = ps.durationMs;
-        st.playing = ps.transport == carsh::player::Transport::Playing;
+        ls.playing = ps.transport == carsh::player::Transport::Playing;
+        ls.positionMs = ps.positionMs;
+        ls.durationMs = ps.durationMs;
+        session.setLocal(ls);
+        // BT is "streaming" when A2DP PCM is flowing into its ring or AVRCP says
+        // PLAYING; that (plus connected) is what hands Now Playing to the phone.
+        session.setBluetooth(bt.connected(),
+                             g_btRing.readable() > 0 || g_btMeta.playing, g_btMeta);
+        // Android Auto owns Now Playing while its audio is actually streaming (the AA
+        // jitter buffer is engaged), matching the audio mix priority AA > BT > local.
+        session.setAndroidAuto(g_aaJitter.engaged());
+
+        const carsh::player::MediaSession::NowPlayingView v = session.view();
+        carsh::ui::NowPlayingScreen::State st;
+        st.title = v.title;
+        st.artist = v.artist;
+        st.album = v.album;
+        st.positionMs = v.positionMs;
+        st.durationMs = v.durationMs;
+        st.playing = v.playing;
+        st.source = v.source == carsh::player::Source::AndroidAuto ? "ANDROID AUTO"
+                  : v.source == carsh::player::Source::Bluetooth   ? "BLUETOOTH"
+                                                                   : "";
         now.setState(st);
+
+        // Queue tab: rebuild rows only when the queue contents change; mark the
+        // now-playing row every frame (cheap). Only meaningful for the local source.
+        if (queueVersion != lastQueueVersion) {
+            lastQueueVersion = queueVersion;
+            std::vector<std::string> qrows;
+            qrows.reserve(g_queueIds.size());
+            for (uint64_t id : g_queueIds) {
+                const carsh::library::Track* t = g_db.get(id);
+                qrows.push_back(t ? g_db.artist(*t) + " - " + g_db.title(*t)
+                                  : std::string("?"));
+            }
+            queue.setItems(std::move(qrows));
+        }
+        queue.setCurrent(v.source == carsh::player::Source::Local ? ps.queueIndex : -1);
+
+        // Now Playing album art (local source only): update on album change, cached.
+        if (v.source == carsh::player::Source::Local && ps.queueIndex >= 0 &&
+            ps.queueIndex < int(g_queueIds.size())) {
+            const carsh::library::Track* t =
+                g_db.get(g_queueIds[std::size_t(ps.queueIndex)]);
+            const uint64_t ak = t ? t->albumKey : 0;
+            if (ak != lastArtAlbumKey) {
+                lastArtAlbumKey = ak;
+                auto it = artCache.find(ak);
+                if (it == artCache.end()) {
+                    carsh::library::AsciiArt a;  // rows==0 => looked, none found
+                    if (t) carsh::library::loadSidecarArt(media.vfs(), g_db.path(*t), a);
+                    it = artCache.emplace(ak, a).first;
+                }
+                if (it->second.rows > 0) now.setArt(it->second);
+                else now.clearArt();
+            }
+        } else if (lastArtAlbumKey != ~0ull) {
+            now.clearArt();        // BT/AA (or stopped): no local art
+            lastArtAlbumKey = ~0ull;  // re-evaluate when local playback resumes
+        }
 
         // BT tab: reflect scan state + the discovered/connected device list. The
         // connected device is upserted into the cache so it always shows, even on
