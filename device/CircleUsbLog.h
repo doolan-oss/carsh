@@ -18,14 +18,19 @@
 #include <circle/usb/gadget/usbcdcgadget.h>
 #include <circle/usb/usbserial.h>
 
+#include "ota/PushProtocol.h"
+
 namespace carsh::device {
 
 class CircleUsbLog : public CTask {
 public:
     // gadget: the CDC gadget (already Initialize()d). logger: retargeted to the
     // USB serial on connect. fallback: the target restored on disconnect (UART).
-    CircleUsbLog(CUSBCDCGadget* gadget, CLogger* logger, CDevice* fallback)
-        : mGadget(gadget), mLogger(logger), mFallback(fallback) {}
+    // push: optional sink for host->device bytes (the serial OTA push channel);
+    // without it, inbound bytes are drained and discarded as before.
+    CircleUsbLog(CUSBCDCGadget* gadget, CLogger* logger, CDevice* fallback,
+                 carsh::ota::PushReceiver* push = nullptr)
+        : mGadget(gadget), mLogger(logger), mFallback(fallback), mPush(push) {}
 
     void Run(void) override {
         for (;;) {
@@ -39,10 +44,17 @@ public:
                     mLogger->Write("usblog", LogNotice, "USB-C serial log attached");
                 }
             }
-            // Drain host->device bytes so the CDC RX path never backs up.
+            // Drain host->device bytes so the CDC RX path never backs up. With a
+            // push receiver attached they carry the serial OTA transfer; loop-
+            // drain (bounded per pass) so a multi-MB push moves at USB speed,
+            // not one small buffer per scheduler round.
             if (mSerial) {
-                char buf[64];
-                mSerial->Read(buf, sizeof buf);
+                uint8_t buf[512];
+                for (unsigned pass = 0; pass < 32; ++pass) {
+                    const int n = mSerial->Read(buf, sizeof buf);
+                    if (n <= 0) break;
+                    if (mPush) mPush->feed(buf, static_cast<std::size_t>(n));
+                }
             }
             CScheduler::Get()->Yield();
         }
@@ -58,6 +70,7 @@ private:
     CUSBCDCGadget* mGadget;
     CLogger* mLogger;
     CDevice* mFallback;
+    carsh::ota::PushReceiver* mPush;
     CUSBSerialDevice* volatile mSerial = nullptr;
 };
 

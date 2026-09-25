@@ -76,6 +76,12 @@ udisksctl unmount -b /dev/sda1
 # move card to the Pi, power on; capture the console (survives power-cycles):
 python3 scripts/bench_capture.py bench.log &   # run in background, re-attaches on reboot
 ```
+**No-card-swap alternative (once the card is migrated to A/B — see
+`device/chainloader/README.md`):** `scripts/carsh_ota.py flash` pushes the freshly
+built image over the same USB-C console; the kernel verifies + stages it to the
+inactive slot and reboots through the chainloader (bad image = automatic rollback,
+3 tries). One-time setup: `carsh_ota.py keygen` then rebuild. `[hw]`-pending: H7b.
+
 Bare metal has no remote shell — **route diagnostics to the serial log and iterate**.
 The USB-C console is brought up before the USB host in `kernel.cpp` so enumeration
 logs are captured. Batch your logging up-front; each flash is a manual card swap.
