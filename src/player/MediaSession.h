@@ -1,21 +1,32 @@
 // MediaSession — arbitrates the head unit's "now playing" between the local file
-// player and a connected Bluetooth phone (A2DP audio + AVRCP metadata/transport),
-// and produces one unified view-model for the Now Playing screen plus the transport
-// target (which backend a play/pause/next/prev should drive).
+// player, a connected Bluetooth phone (A2DP audio + AVRCP metadata/transport) and
+// the Android Auto projection, and produces one unified view-model for the Now
+// Playing screen plus the transport target (which backend a play/pause/next/prev
+// should drive).
 //
 // It is platform-independent and host-tested: the app feeds it a snapshot each frame
-// (local player fields + the latest AVRCP metadata + whether BT is connected /
-// streaming) and reads back the view + source. No player/BTstack types leak in —
+// (local player fields + the latest AVRCP metadata + whether BT / AA are connected
+// and streaming) and reads back the view + source. No player/BTstack types leak in —
 // only plain values and bt::AvrcpMetadata — so it sits cleanly between the two.
 //
-// Source rule (priority Android Auto > Bluetooth > Local, mirroring the audio mix in
-// BtMixSink so the screen matches what you hear):
-//   * Android Auto owns now-playing while its audio is streaming;
-//   * else Bluetooth owns it when the phone is streaming (A2DP PCM / AVRCP PLAYING)
-//     or it's connected and there's no local track to show;
-//   * else the local file player owns it.
-// Transport (play/pause/next/prev) routes to whichever owns it: AA media keys over
-// the input channel, AVRCP to the BT phone, or the local player.
+// Ownership is LATCHED, not re-derived from audio activity every frame. A paused
+// phone produces no audio, yet it is still what the user is listening to: Now
+// Playing must keep showing it and '>' must resume it, not flip to (and start) the
+// local track underneath. So:
+//   * A remote source (Android Auto or Bluetooth) that STARTS playing takes the
+//     session: it becomes the owner and stays the owner while it is paused, until
+//     another source is explicitly started or it disconnects. If both stream at
+//     once, Android Auto wins (it outranks A2DP in the audio mix).
+//   * The user explicitly starting local playback (picking a track, PLAY/SHUFFLE,
+//     a queue row) calls selectLocal(): local owns the session again, and any
+//     remote still streaming is suppressed until its stream stops — so the tail of
+//     a stream the app just paused can't grab the session straight back. The
+//     returned PauseRequest names the remotes the app should pause.
+//   * With nothing latched: Android Auto if it's connected and there's no local
+//     track, else Bluetooth under the same rule, else the local player.
+// Transport (play/pause/next/prev) routes to the owner: AA media keys over the input
+// channel, AVRCP to the BT phone, or the local player. While a remote owns the
+// session the local player must not play underneath it (shouldPauseLocal()).
 #pragma once
 
 #include <cstdint>
@@ -26,6 +37,43 @@
 namespace carsh::player {
 
 enum class Source : uint8_t { Local, Bluetooth, AndroidAuto };
+
+// Debounces "new data arrived" into a streaming flag. The app samples a counter the
+// producer bumps per delivered PCM chunk (A2DP, AA media) once per UI frame, with a
+// monotonic clock: streaming while data arrived within the last holdMs. Unlike ring
+// occupancy it can't be pinned on by a stale sub-block tail left in a ring, and the
+// hold rides out bursty delivery (AA over the dongle's WiFi gaps 200-600 ms).
+class StreamActivity {
+public:
+    explicit StreamActivity(uint32_t holdMs) : holdUs_(uint64_t(holdMs) * 1000u) {}
+
+    // counter: the producer's running count of delivered chunks. nowUs: monotonic.
+    bool update(uint32_t counter, uint64_t nowUs) {
+        if (!primed_) {
+            // First sample only establishes the baseline (data delivered before
+            // the app started watching is not "streaming now").
+            primed_ = true;
+            last_ = counter;
+            return false;
+        }
+        if (counter != last_) {
+            last_ = counter;
+            lastArrivalUs_ = nowUs;
+            seen_ = true;
+        }
+        streaming_ = seen_ && nowUs - lastArrivalUs_ < holdUs_;
+        return streaming_;
+    }
+    bool streaming() const { return streaming_; }
+
+private:
+    uint64_t holdUs_;
+    uint32_t last_ = 0;
+    uint64_t lastArrivalUs_ = 0;
+    bool primed_ = false;
+    bool seen_ = false;
+    bool streaming_ = false;
+};
 
 class MediaSession {
 public:
@@ -45,23 +93,48 @@ public:
         bool playing = false;
     };
 
+    // The remote sources still streaming when local playback was selected: a source
+    // switch pauses the source it leaves, so the app sends these a pause.
+    struct PauseRequest {
+        bool androidAuto = false;
+        bool bluetooth = false;
+    };
+
     // --- Inputs, refreshed each frame --------------------------------------
     void setLocal(const LocalState& s) { local_ = s; }
     // connected: a phone is linked. streaming: it's actively producing audio
-    // (A2DP PCM in the ring, or AVRCP playback status == PLAYING). md: latest AVRCP.
+    // (A2DP PCM arriving, or AVRCP playback status == PLAYING). md: latest AVRCP.
     void setBluetooth(bool connected, bool streaming, const carsh::bt::AvrcpMetadata& md) {
-        btConnected_ = connected;
-        btStreaming_ = streaming;
+        bt_.update(connected, streaming);
         btMeta_ = md;
+        resolve();
     }
-    // active: Android Auto audio is currently streaming out the jack (the AA jitter
-    // buffer is engaged). AA has no metadata channel yet, so only its activity matters.
-    void setAndroidAuto(bool active) { aaActive_ = active; }
+    // connected: a projection session is up (AaProjection::connected()).
+    // streaming: AA media audio is playing (media PCM arriving / the output engaged).
+    // AA has no metadata channel yet, so only its state matters.
+    void setAndroidAuto(bool connected, bool streaming) {
+        aa_.update(connected, streaming);
+        resolve();
+    }
+
+    // The user explicitly started local playback: local owns the session until a
+    // remote source starts playing again. Returns the remotes to pause.
+    PauseRequest selectLocal() {
+        PauseRequest r;
+        r.androidAuto = aa_.suppressIfStreaming();
+        r.bluetooth = bt_.suppressIfStreaming();
+        latched_ = Source::Local;
+        return r;
+    }
 
     // --- Outputs ------------------------------------------------------------
     Source source() const {
-        if (aaActive_) return Source::AndroidAuto;
-        if (btConnected_ && (btStreaming_ || !local_.hasTrack)) return Source::Bluetooth;
+        if (latched_ == Source::AndroidAuto && aa_.connected) return Source::AndroidAuto;
+        if (latched_ == Source::Bluetooth && bt_.connected) return Source::Bluetooth;
+        if (!local_.hasTrack) {
+            if (aa_.connected) return Source::AndroidAuto;
+            if (bt_.connected) return Source::Bluetooth;
+        }
         return Source::Local;
     }
 
@@ -73,7 +146,7 @@ public:
             // we just label the source and let the transport buttons drive it.
             v.title = "Android Auto";
             v.artist = "Projecting";
-            v.playing = true;
+            v.playing = aa_.streaming;
         } else if (v.source == Source::Bluetooth) {
             // Before the first AVRCP attribute arrives, show a neutral label so the
             // screen isn't blank while connected.
@@ -100,6 +173,11 @@ public:
     // Where a transport intent should go right now.
     Source transportTarget() const { return source(); }
 
+    // A remote source owns the session but the local player is still playing
+    // underneath it (the remote just took over): the app must pause the local
+    // player. It is only ever resumed by an explicit local action.
+    bool shouldPauseLocal() const { return source() != Source::Local && local_.playing; }
+
     // Convenience for a play/pause toggle: the AVRCP command to send when BT is the
     // target (Play when currently paused/stopped, Pause when playing).
     carsh::bt::AvrcpCommand playPauseCommand() const {
@@ -108,10 +186,42 @@ public:
     }
 
 private:
+    // Per-remote input state + the suppression that follows selectLocal().
+    struct Remote {
+        bool connected = false;
+        bool streaming = false;   // as reported (connected-gated)
+        bool suppressed = false;  // streaming when local was selected; until it stops
+
+        void update(bool conn, bool str) {
+            connected = conn;
+            streaming = conn && str;
+            if (!streaming) suppressed = false;  // that stream ended (or unplugged)
+        }
+        // Playing now and not held off by an explicit local selection.
+        bool active() const { return streaming && !suppressed; }
+        bool suppressIfStreaming() {
+            if (streaming) suppressed = true;
+            return streaming;
+        }
+    };
+
+    void resolve() {
+        // A remote that is playing takes (or keeps) the session; AA outranks BT.
+        // With neither active the latch holds, so a paused remote stays the owner.
+        if (aa_.active()) {
+            latched_ = Source::AndroidAuto;
+        } else if (bt_.active()) {
+            latched_ = Source::Bluetooth;
+        } else if ((latched_ == Source::AndroidAuto && !aa_.connected) ||
+                   (latched_ == Source::Bluetooth && !bt_.connected)) {
+            latched_ = Source::Local;  // the owner went away: fall back
+        }
+    }
+
     LocalState local_;
-    bool btConnected_ = false;
-    bool btStreaming_ = false;
-    bool aaActive_ = false;
+    Remote bt_;
+    Remote aa_;
+    Source latched_ = Source::Local;  // Local = nothing latched / local selected
     carsh::bt::AvrcpMetadata btMeta_;
 };
 
