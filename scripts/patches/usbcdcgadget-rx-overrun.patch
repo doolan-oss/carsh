@@ -1,0 +1,18 @@
+--- a/lib/usb/gadget/usbcdcgadgetendpoint.cpp
++++ b/lib/usb/gadget/usbcdcgadgetendpoint.cpp
+@@ -92,7 +92,14 @@
+ 			m_nStatus = -1;		// RX overrun
+ 		}
+ 
+-		Enqueue (m_OutBuffer, nLength);
++		// carsh: a full queue (nBytesFree == 0) or a zero-length packet leaves
++		// nothing to store, and Enqueue() asserts nCount > 0 -- which halted the
++		// whole board from the USB IRQ instead of reporting the overrun to Read().
++		// Tracked: scripts/patches/usbcdcgadget-rx-overrun.patch
++		if (nLength > 0)
++		{
++			Enqueue (m_OutBuffer, nLength);
++		}
+ 
+ 		m_SpinLock.Release ();
+ 

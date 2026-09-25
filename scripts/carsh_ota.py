@@ -11,19 +11,33 @@ The serial-push dev loop (no SD card swap):
     # and reboot through the chainloader
     scripts/carsh_ota.py flash --image device/kernel8-rpi4.img
 
-Wire format: PushProtocol.h framing (magic "CPSH", BEGIN/DATA/END packets with
-CRC-32) carrying a .carup package (Package.h container: signed manifest +
-image). This script is the host-side mirror of those two headers — change them
-together. Device feedback comes back as "ota-push: ..." log lines on the same
-serial stream.
+Wire format: PushProtocol.h framing (magic "CPSH", BEGIN/DATA/END/QUERY
+packets with CRC-32) carrying a .carup package (Package.h container: signed
+manifest + image). This script is the host-side mirror of those two headers —
+change them together. Device feedback comes back as "ota-push: ..." log lines on
+the same serial stream.
+
+Flow control (PushProtocol.h): the kernel's CDC gadget buffers host->device
+bytes in an 8 KiB ring with no back-pressure and drops whatever doesn't fit, so
+this script never has more than MAX_IN_FLIGHT bytes on the wire beyond the
+device's last "ota-push: ack <seq>" line, nudges a silent device with QUERY, and
+restarts from BEGIN (--retries) when the device reports a failed receive.
+
+The acks arrive as log lines, so nothing else may read the port during a push
+(e.g. scripts/bench_capture.py — two readers split the stream and the acks go
+missing); the script refuses to start if another process has the port open.
+Use --log FILE to keep a raw capture of the console while pushing.
 
 Only the Python stdlib + the `openssl` CLI (Ed25519 sign) are required.
 """
 
 import argparse
+import collections
 import hashlib
 import json
 import os
+import re
+import select
 import struct
 import subprocess
 import sys
@@ -38,8 +52,17 @@ DEFAULT_PORT = "/dev/ttyACM0"
 KEY_HEADER = os.path.join(REPO, "device", "OtaPushKey.h")
 
 MAGIC = b"CPSH"
-TYPE_BEGIN, TYPE_DATA, TYPE_END = 1, 2, 3
-CHUNK = 4096
+TYPE_BEGIN, TYPE_DATA, TYPE_END, TYPE_QUERY = 1, 2, 3, 4
+CHUNK = 4096                       # PushProtocol.h kMaxChunk
+HEADER_LEN = 4 + 1 + 2 + 2         # kHeaderLen (magic..len); + 4-byte CRC trailer
+
+# Flow control — mirrors PushProtocol.h (kDeviceRxQueue, kMaxInFlight,
+# kAckPollMs, kAckTimeoutMs, kAckLogFormat); change them together.
+DEVICE_RX_QUEUE = 8192             # Circle's CDC gadget RX ring (usable bytes)
+MAX_IN_FLIGHT = 6144               # un-acked BEGIN/DATA/END bytes on the wire
+ACK_POLL = 1.0                     # s without an ack before a QUERY / BEGIN re-send
+ACK_TIMEOUT = 15.0                 # s without ack progress: abandon the attempt
+ACK_RE = re.compile(r"ota-push: ack (\d+)")
 
 
 # --- packet / package builders (mirror PushProtocol.h / Package.h) -----------
@@ -72,6 +95,17 @@ def build_carup(image: bytes, key_pem: str, version: str, build_id: str,
             struct.pack("<I", len(image)) + image)
 
 
+def data_packets(carup: bytes, chunk: int = CHUNK):
+    """[(seq, packet)] for the DATA packets + END, seq 1..n+1."""
+    pkts = []
+    seq = 1
+    for off in range(0, len(carup), chunk):
+        pkts.append((seq, packet(TYPE_DATA, seq, carup[off:off + chunk])))
+        seq += 1
+    pkts.append((seq, packet(TYPE_END, seq, b"")))
+    return pkts
+
+
 # --- serial helpers (raw termios; CDC ACM ignores baud) -----------------------
 
 def open_port(port: str, wait: float = 0.0):
@@ -94,33 +128,245 @@ def open_port(port: str, wait: float = 0.0):
     return fd
 
 
-def drain_log(fd, buf: bytearray, quiet: bool):
-    """Read whatever the device has logged; return completed lines."""
+def port_users(port: str):
+    """Other processes holding `port` open, as [(pid, cmdline)] (Linux /proc;
+    empty where that isn't available)."""
     try:
-        data = os.read(fd, 65536)
-    except (BlockingIOError, OSError):
-        data = b""
-    lines = []
-    if data:
-        buf.extend(data)
-        while b"\n" in buf:
-            line, _, rest = bytes(buf).partition(b"\n")
-            buf[:] = rest
-            text = line.decode(errors="replace").rstrip("\r")
-            lines.append(text)
-            if not quiet:
-                print(f"  | {text}")
-    return lines
-
-
-def write_all(fd, data: bytes):
-    off = 0
-    while off < len(data):
+        target = os.path.realpath(port)
+        pids = [p for p in os.listdir("/proc") if p.isdigit()]
+    except OSError:
+        return []
+    users = []
+    for pid in pids:
+        if int(pid) == os.getpid():
+            continue
+        fddir = f"/proc/{pid}/fd"
         try:
-            off += os.write(fd, data[off:off + 4096])
+            fds = os.listdir(fddir)
+        except OSError:
+            continue  # gone, or not ours to inspect
+        for fd in fds:
+            try:
+                if os.readlink(os.path.join(fddir, fd)) == target:
+                    break
+            except OSError:
+                continue
+        else:
+            continue
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                cmd = f.read().replace(b"\0", b" ").decode(errors="replace").strip()
+        except OSError:
+            cmd = "?"
+        users.append((int(pid), cmd))
+    return users
+
+
+class PushError(Exception):
+    """A failed push attempt. retryable: restarting from BEGIN may succeed."""
+
+    def __init__(self, msg: str, retryable: bool = True):
+        super().__init__(msg)
+        self.retryable = retryable
+
+
+def device_error(line: str) -> bool:
+    return "ota-push:" in line and ("fail" in line or "err=" in line)
+
+
+class DeviceLink:
+    """The serial port as the push sees it: raw writes with a deadline, and the
+    device log as a queue of lines (echoed unless quiet; ack lines are protocol
+    and never echoed). tee: optional binary file getting the raw console."""
+
+    def __init__(self, fd, quiet: bool = False, tee=None):
+        self.fd = fd
+        self.quiet = quiet
+        self.tee = tee
+        self._buf = bytearray()
+        self._lines = collections.deque()
+
+    def write(self, data: bytes, timeout: float = ACK_TIMEOUT):
+        view = memoryview(data)
+        off = 0
+        deadline = time.monotonic() + timeout
+        while off < len(data):
+            try:
+                off += os.write(self.fd, view[off:])
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise PushError("device stopped accepting data "
+                                    "(USB OUT stalled — is the kernel alive?)")
+                select.select([], [self.fd], [], 0.05)
+            except OSError as e:
+                raise PushError(f"serial write failed: {e}", retryable=False)
+
+    def next_line(self, timeout: float):
+        """The next complete device line, or None after `timeout` seconds."""
+        if not self._lines:
+            self._read(timeout)
+        return self._lines.popleft() if self._lines else None
+
+    def _read(self, timeout: float):
+        try:
+            r, _, _ = select.select([self.fd], [], [], max(0.0, timeout))
+            if not r:
+                return
+            data = os.read(self.fd, 65536)
         except BlockingIOError:
-            time.sleep(0.005)
-    termios.tcdrain(fd)
+            return
+        except OSError as e:
+            raise PushError(f"serial read failed: {e}", retryable=False)
+        if not data:
+            return
+        if self.tee:
+            self.tee.write(data)
+            self.tee.flush()
+        self._buf.extend(data)
+        while b"\n" in self._buf:
+            line, _, rest = bytes(self._buf).partition(b"\n")
+            self._buf[:] = rest
+            text = line.decode(errors="replace").rstrip("\r")
+            self._lines.append(text)
+            if not self.quiet and not ACK_RE.search(text):
+                print(f"  | {text}")
+
+
+class PushSender:
+    """Flow-controlled BEGIN/DATA/END sender (PushProtocol.h). `link` needs
+    write(bytes, timeout) and next_line(timeout); `clock` is injectable so the
+    host tests (tests/ota/carsh_ota_test.py) can simulate the device."""
+
+    def __init__(self, link, clock=time.monotonic, window: int = MAX_IN_FLIGHT,
+                 ack_poll: float = ACK_POLL, ack_timeout: float = ACK_TIMEOUT,
+                 chunk: int = CHUNK, progress=print):
+        if HEADER_LEN + chunk + 4 > window:
+            raise ValueError("a DATA packet must fit in the window")
+        self.link = link
+        self.clock = clock
+        self.window = window
+        self.ack_poll = ack_poll
+        self.ack_timeout = ack_timeout
+        self.chunk = chunk
+        self.progress = progress
+        self.queries = 0        # QUERY packets sent (stats / tests)
+        self.begin_resends = 0
+
+    def _lines(self, timeout: float):
+        """Device lines until `timeout` passes without one; raises on failures.
+        Lazy: lines after a `break` stay queued in the link (e.g. the kernel's
+        apply=ok right behind the final ack is the caller's to read)."""
+        line = self.link.next_line(timeout)
+        while line is not None:
+            if device_error(line):
+                raise PushError(f"device: {line.strip()}",
+                                retryable="recv failed" in line)
+            yield line
+            line = self.link.next_line(0)
+
+    def send(self, carup: bytes):
+        """Push one .carup: returns once the device has acked END (or logged
+        "recv ok"); raises PushError otherwise. Lines after that stay queued
+        in the link for the caller's apply wait."""
+        pkts = data_packets(carup, self.chunk)
+        end_seq = pkts[-1][0]
+        if end_seq > 0xFFFF:
+            raise PushError(f"package too large ({len(carup)} B) for 16-bit seq",
+                            retryable=False)
+        begin = packet(TYPE_BEGIN, 0, struct.pack(
+            "<II", len(carup), zlib.crc32(carup) & 0xFFFFFFFF))
+        query = packet(TYPE_QUERY, 0, b"")
+
+        # BEGIN: idempotent before any DATA, so just re-send it until acked.
+        self.link.write(begin)
+        t0 = t_sent = self.clock()
+        acked = False
+        while not acked:
+            for line in self._lines(0.05):
+                m = ACK_RE.search(line)
+                if m and int(m.group(1)) == 0:
+                    acked = True
+                    break
+            now = self.clock()
+            if acked:
+                break
+            if now - t0 > self.ack_timeout:
+                raise PushError("no ack for BEGIN (is a push-capable kernel "
+                                "running, and nothing else reading the port?)")
+            if now - t_sent >= self.ack_poll:
+                self.link.write(begin)
+                self.begin_resends += 1
+                t_sent = now
+
+        # DATA + END, never more than `window` bytes beyond the last ack.
+        acked_seq = 0
+        next_i = 0
+        inflight = collections.deque()  # (seq, nbytes) sent, not yet acked
+        inflight_bytes = 0
+        t_progress = t_query = t_start = self.clock()
+        last_pct = -1
+        while acked_seq < end_seq:
+            while next_i < len(pkts):
+                seq, pkt = pkts[next_i]
+                if inflight and inflight_bytes + len(pkt) > self.window:
+                    break
+                self.link.write(pkt)
+                inflight.append((seq, len(pkt)))
+                inflight_bytes += len(pkt)
+                next_i += 1
+            sent_seq = pkts[next_i - 1][0] if next_i else 0
+            for line in self._lines(0.05):
+                if "ota-push: recv ok" in line:
+                    a = end_seq  # END's ack line was lost; the device has it all
+                else:
+                    m = ACK_RE.search(line)
+                    a = int(m.group(1)) if m else -1
+                if acked_seq < a <= sent_seq:  # stale/foreign acks ignored
+                    acked_seq = a
+                    while inflight and inflight[0][0] <= a:
+                        inflight_bytes -= inflight.popleft()[1]
+                    t_progress = t_query = self.clock()
+                    if acked_seq >= end_seq:
+                        break  # leave what follows (apply=ok ...) queued
+            now = self.clock()
+            if acked_seq >= end_seq:
+                break
+            if now - t_progress > self.ack_timeout:
+                raise PushError(f"device stopped acknowledging after seq "
+                                f"{acked_seq}/{end_seq} (stalled kernel?)")
+            if now - t_query >= self.ack_poll:
+                self.link.write(query)  # "re-send your ack" (13 bytes)
+                self.queries += 1
+                t_query = now
+            pct = acked_seq * 10 // end_seq
+            if pct != last_pct:
+                last_pct = pct
+                self.progress(f"  push: {min(acked_seq * self.chunk, len(carup))}"
+                              f"/{len(carup)} B acked")
+        dt = self.clock() - t_start
+        rate = len(carup) / dt / 1024 if dt > 0 else 0
+        self.progress(f"sent {len(carup)} B in {dt:.1f}s ({rate:.0f} KiB/s), "
+                      "waiting for the kernel ...")
+
+
+def push_with_retries(sender: PushSender, link, carup: bytes, retries: int,
+                      settle: float = 1.0) -> bool:
+    """sender.send() with restarts from BEGIN; False when out of attempts."""
+    for attempt in range(retries + 1):
+        try:
+            sender.send(carup)
+            return True
+        except PushError as e:
+            print(f"push attempt {attempt + 1} failed: {e}", file=sys.stderr)
+            if not e.retryable or attempt == retries:
+                return False
+            print("restarting the transfer from BEGIN ...", file=sys.stderr)
+            # Let the kernel log/reset the failed receive before the new BEGIN;
+            # anything it says about the old attempt is dropped here.
+            deadline = sender.clock() + settle
+            while sender.clock() < deadline:
+                link.next_line(0.05)
+    return False
 
 
 # --- commands -----------------------------------------------------------------
@@ -177,24 +423,22 @@ def cmd_pack(args):
     print(f"wrote {args.out}")
 
 
-def send_carup(fd, carup: bytes, quiet: bool):
-    log = bytearray()
-    write_all(fd, packet(TYPE_BEGIN, 0,
-                         struct.pack("<II", len(carup),
-                                     zlib.crc32(carup) & 0xFFFFFFFF)))
-    seq = 1
-    t0 = time.monotonic()
-    for off in range(0, len(carup), CHUNK):
-        write_all(fd, packet(TYPE_DATA, seq, carup[off:off + CHUNK]))
-        seq += 1
-        if seq % 64 == 0:
-            drain_log(fd, log, quiet)  # keep the console moving during send
-    write_all(fd, packet(TYPE_END, seq, b""))
-    dt = time.monotonic() - t0
-    rate = len(carup) / dt / 1024 if dt > 0 else 0
-    print(f"sent {len(carup)} B in {dt:.1f}s ({rate:.0f} KiB/s), waiting for "
-          "the kernel ...")
-    return log
+def check_port_free(args) -> bool:
+    users = port_users(args.port)
+    if not users or args.shared_port:
+        return True
+    print(f"error: {args.port} is also open in:", file=sys.stderr)
+    for pid, cmd in users:
+        print(f"    pid {pid}: {cmd}", file=sys.stderr)
+    print("Two readers split the device's output between them, so this script "
+          "would miss the\ndevice's flow-control acks. Stop that process for the "
+          "push (--log FILE keeps a raw\ncapture meanwhile), or pass "
+          "--shared-port to try anyway.", file=sys.stderr)
+    return False
+
+
+def open_tee(args):
+    return open(args.log, "ab", buffering=0) if args.log else None
 
 
 def cmd_push(args):
@@ -203,30 +447,46 @@ def cmd_push(args):
             carup = f.read()
     else:
         carup = make_package(args)
+    if not check_port_free(args):
+        return 1
 
     fd = open_port(args.port)
+    tee = None
     try:
-        log = send_carup(fd, carup, args.quiet)
+        tee = open_tee(args)
+        link = DeviceLink(fd, args.quiet, tee)
+        sender = PushSender(link)
+        if not push_with_retries(sender, link, carup, args.retries):
+            return 1
         deadline = time.monotonic() + args.timeout
-        ok = rebooting = False
-        while time.monotonic() < deadline:
-            for line in drain_log(fd, log, args.quiet):
+        ok = False
+        try:
+            while time.monotonic() < deadline:
+                line = link.next_line(0.1)
+                if line is None:
+                    continue
                 if "ota-push: apply=ok" in line:
                     ok = True
-                if "ota-push:" in line and ("fail" in line or "err" in line):
+                if device_error(line):
                     print(f"DEVICE ERROR: {line}", file=sys.stderr)
                     return 1
                 if "ota-push: rebooting" in line:
-                    rebooting = True
-            if rebooting:
-                break
-            time.sleep(0.05)
+                    break
+        except PushError:
+            if not ok:
+                raise
+            # the port dropped right after apply=ok: that's the reboot
         if not ok:
             print("no apply=ok from the device (is the image key provisioned "
                   "and the kernel running?)", file=sys.stderr)
             return 1
+    except PushError as e:
+        print(f"push failed: {e}", file=sys.stderr)
+        return 1
     finally:
         os.close(fd)
+        if tee:
+            tee.close()
 
     print("applied — device is rebooting into the new slot")
     if args.watch:
@@ -238,26 +498,30 @@ def watch_boot(args):
     """Re-open the port as it comes back and echo the boot log."""
     print(f"watching {args.port} for the reboot (^C to stop) ...")
     deadline = time.monotonic() + args.timeout
-    log = bytearray()
-    while time.monotonic() < deadline:
-        try:
-            fd = open_port(args.port, wait=deadline - time.monotonic())
-        except OSError:
-            break
-        try:
-            while time.monotonic() < deadline:
-                for line in drain_log(fd, log, quiet=False):
-                    if "entering UI loop" in line:
+    tee = open_tee(args)
+    try:
+        while time.monotonic() < deadline:
+            try:
+                fd = open_port(args.port, wait=deadline - time.monotonic())
+            except OSError:
+                break
+            link = DeviceLink(fd, quiet=False, tee=tee)
+            try:
+                while time.monotonic() < deadline:
+                    line = link.next_line(0.1)
+                    if line is not None and "entering UI loop" in line:
                         print("new image is up.")
                         return 0
-                time.sleep(0.05)
-        except OSError:
-            pass  # port vanished (reboot) — reopen
-        finally:
-            try:
-                os.close(fd)
-            except OSError:
-                pass
+            except PushError:
+                pass  # port vanished (reboot) — reopen
+            finally:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+    finally:
+        if tee:
+            tee.close()
     print("timed out waiting for the new image (power-cycle + serial log to "
           "debug; A/B rollback protects the card)", file=sys.stderr)
     return 1
@@ -307,6 +571,17 @@ def main():
     fl.add_argument("--timeout", type=float, default=120.0)
     fl.add_argument("--quiet", action="store_true")
     fl.set_defaults(fn=cmd_push, carup=None, watch=True)
+
+    for p in (ps, fl):
+        p.add_argument("--retries", type=int, default=2,
+                       help="restart the transfer from BEGIN this many times "
+                            "after a failed receive or an ack timeout")
+        p.add_argument("--log", metavar="FILE",
+                       help="append the raw console (incl. acks) to FILE, like "
+                            "scripts/bench_capture.py")
+        p.add_argument("--shared-port", action="store_true",
+                       help="push even if another process has the port open "
+                            "(it will steal ack lines; expect stalls)")
 
     args = ap.parse_args()
     sys.exit(args.fn(args) or 0)
