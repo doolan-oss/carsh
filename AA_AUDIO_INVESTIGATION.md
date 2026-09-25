@@ -202,7 +202,9 @@ The fast loop (see `CLAUDE.md` → "The bench loop"): build
 boot the Pi with the CA525 + phone, re-plug the dongle if AA doesn't connect within
 ~15 s (it wedges across a Pi power-cycle), project, and **listen**. Watch the serial
 log (`/dev/ttyACM0`, 115200) for the new audio instrumentation + the existing
-`alive: ... inFlight=2 ring=0 inErr=0 outErr=0` health line. Success = smooth audio
+`alive:` health line (since 2026-09-25: `alive: state=... tx=... rx=... inFlight=2
+ring=0 link=...`; the `inErr`/`outErr` counters are gone — a transfer error now
+latches the link dead, see `HARDWARE_TODO.md` H8). Success = smooth audio
 through music + nav voice for minutes. Note in the log any underrun counter going to
 zero.
 
@@ -218,7 +220,10 @@ them. And the dongle wedges across Pi reboots; re-plug it to recover.
    With music playing, watch whether `under=` climbs in lockstep with `dec(us) max`
    spikes / `q=` (queue) backing up. That correlation IS the prime hypothesis.
 2. **A/B the decode (cheap, decisive).** Build with decode skipped:
-   `make CARSH_HAVE_OPENH264=1 CPPFLAGS=-DCARSH_AA_SKIP_DECODE` and listen. AUs still
+   `make clean && CPPFLAGS=-DCARSH_AA_SKIP_DECODE make CARSH_HAVE_OPENH264=1` and
+   listen. (Pass it through the environment: `CPPFLAGS=` on the make command line
+   replaces every C++ flag the Makefile adds, and `make clean` because the Makefile
+   doesn't track the flags.) AUs still
    drain (no queue backup) but openh264 never runs. If audio goes smooth, decode load
    is confirmed as the cause — and the dedicated-core scaffold becomes the priority.
 3. **Then test the real fix build** (`make CARSH_HAVE_OPENH264=1`, decode on): success

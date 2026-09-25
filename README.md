@@ -62,11 +62,10 @@ rail, and a USB-C serial console for telemetry are all confirmed on the board.
 Host-complete: PcmRing/audio engine/gapless, decoders (WAV/FLAC/MP3/Opus/AAC),
 PlayerController, library DB/search/smart-playlists/tags/indexer, BS.1770
 ReplayGain, cover-art+ASCII, RBJ EQ, profiles, EQ presets, OTA
-crypto/package/A-B state machine, the UI toolkit + 8 tabs (incl. BT scan/connect),
-and the Bluetooth integration seam.
+crypto/package/A-B state machine, the UI toolkit + 9 tabs (incl. BT scan/connect and
+Android Auto), and the Bluetooth integration seam.
 
 Still hardware-gated (bench): I2S DAC (have a working PWM jack), real-time/underrun
-behavior under load, USB across a drive/hub matrix, BTstack on a real radio
-(A2DP/AVRCP — `CARSH_HAVE_BTSTACK=1` compiles+links today; USB ACL path + firmware
-blob remain), WiFi, and the OTA flash write + chainloader. See **[STATUS.md](STATUS.md)**
-and **[HARDWARE_TODO.md](HARDWARE_TODO.md)**.
+behavior under load, USB across a drive/hub matrix, Bluetooth AVRCP (A2DP audio
+already plays on the board with `CARSH_HAVE_BTSTACK=1`), WiFi, and the OTA push +
+chainloader. See **[STATUS.md](STATUS.md)** and **[HARDWARE_TODO.md](HARDWARE_TODO.md)**.
