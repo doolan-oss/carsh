@@ -179,6 +179,12 @@ carsh::device::CircleSource g_sdSource(0, carsh::hal::SourceType::Sd, "SD:");
 carsh::device::CircleSource g_usbSource(1, carsh::hal::SourceType::Usb, "USB:");
 carsh::profile::ProfileManager g_profiles;
 carsh::bt::AvrcpMetadata g_btMeta;  // latest AVRCP now-playing (BT source)
+// An AVRCP report (playback status or track attribute) arrived since the current
+// phone connected: MediaSession then takes the BT play/pause state from AVRCP
+// alone, instead of from A2DP activity. Both are reset per connection, so a
+// reconnect never shows (or acts on) the previous connection's status. Written
+// by the BT run-loop task, read by the UI loop: cooperative tasks on core 0.
+bool g_btAvrcpReported = false;
 std::vector<carsh::bt::DiscoveredDevice> g_btDevices;  // scan results for the BT tab
 }  // namespace
 
@@ -526,11 +532,23 @@ CStdlibApp::TShutdownMode CKernel::Run(void) {
     static carsh::device::CircleBluetooth bt;  // outlives Run for the glue callbacks
     carsh::bt::BluetoothCallbacks btcb;
     btcb.onConnected = [](const carsh::bt::BdAddr& a) {
+        g_btMeta = carsh::bt::AvrcpMetadata{};  // a new phone reports afresh
+        g_btAvrcpReported = false;
         carsh::profile::BdAddr pa; pa.b = a;
         g_profiles.onBtConnected(pa);
     };
-    btcb.onDisconnected = [](const carsh::bt::BdAddr&) { g_profiles.onBtDisconnected(); };
-    btcb.onMetadata = [](const carsh::bt::AvrcpMetadata& m) { g_btMeta = m; };
+    btcb.onDisconnected = [](const carsh::bt::BdAddr&) {
+        // The glue does not publish an empty metadata when AVRCP goes away, so drop
+        // the last status here: a stale PLAYING would otherwise read as "streaming"
+        // and take the session on the next connect.
+        g_btMeta = carsh::bt::AvrcpMetadata{};
+        g_btAvrcpReported = false;
+        g_profiles.onBtDisconnected();
+    };
+    btcb.onMetadata = [](const carsh::bt::AvrcpMetadata& m) {
+        g_btMeta = m;
+        g_btAvrcpReported = true;
+    };
     btcb.onA2dpPcm = [](const float* p, std::size_t f, uint8_t ch) {
         g_btRing.write(p, f * ch);
         g_btPcmChunks.fetch_add(1, std::memory_order_relaxed);
@@ -830,12 +848,15 @@ CStdlibApp::TShutdownMode CKernel::Run(void) {
             mgr.onTouch(ev);
             touchStampUs = 0;
         }
-        // The ring was completely full and lost a Down/Up (the UI stalled > 1 s).
-        // A lost Up would leave ScreenManager's primary-contact latch waiting for
-        // it forever, ignoring every later touch: reset the touch routing (cancels
-        // the contact in progress like a tab switch — an AA press gets its Release —
-        // and drops the latch) so the next Down starts cleanly. Checked after the
-        // drain, so every event queued before the loss was delivered first.
+        // The ring was completely full and lost a Down/Up. Moves stop queueing at
+        // 112 events, so this takes a UI stall long enough for that Move backlog
+        // (~1.1 s of one finger's drag at 100 Hz) PLUS 16 more Down/Up events (8+
+        // taps, or several fingers) before the drain. Rare, but a lost Up would
+        // leave ScreenManager's primary-contact latch waiting for it forever,
+        // ignoring every later touch: reset the touch routing (cancels the contact
+        // in progress like a tab switch — an AA press gets its Release — and drops
+        // the latch) so the next Down starts cleanly. Checked after the drain, so
+        // every event queued before the loss was delivered first.
         if (touch.lostTransitionSinceLastCheck()) {
             mgr.resetTouch();
             mLogger.Write(FROM, LogWarning,
@@ -972,12 +993,15 @@ CStdlibApp::TShutdownMode CKernel::Run(void) {
         // A phone that STARTS playing takes the session and keeps it while paused
         // (review A2), until the user explicitly starts local playback again
         // (takeLocalSession) or it disconnects — see MediaSession.
-        // BT is "streaming" while A2DP PCM keeps arriving or AVRCP says PLAYING.
+        // BT is "streaming" while A2DP PCM keeps arriving or AVRCP says PLAYING (that
+        // decides who owns the session). Its '>' / '||' and the play/pause command
+        // follow AVRCP once it has reported on this connection: a paused phone keeps
+        // streaming PCM for a while (the 800 ms hold + its own silence tail).
         const uint64_t nowUs = CTimer::GetClockTicks64();
         const bool btStreaming =
             btActivity.update(g_btPcmChunks.load(std::memory_order_relaxed), nowUs) ||
             g_btMeta.playing;
-        session.setBluetooth(bt.connected(), btStreaming, g_btMeta);
+        session.setBluetooth(bt.connected(), btStreaming, g_btMeta, g_btAvrcpReported);
         // Android Auto: a projection session is up, and its media audio is playing
         // (media PCM arriving, or the jitter buffer still playing it out). Ownership
         // no longer ends when the jitter buffer disengages on a pause.

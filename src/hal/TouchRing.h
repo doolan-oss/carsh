@@ -41,6 +41,10 @@ struct StampedTouch {
     TouchEvent ev;
     std::uint64_t us = 0;
 };
+// TouchEvent (20 bytes) + padding + the 8-byte stamp; keeps the TouchRing size
+// comment below honest.
+static_assert(sizeof(StampedTouch) == 32,
+              "StampedTouch size changed: update the TouchRing size comment");
 
 // Generic lock-free single-producer/single-consumer ring of trivially copyable T.
 template <typename T, std::size_t N>
