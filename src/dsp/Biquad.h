@@ -29,10 +29,15 @@ struct BiquadCoeffs {
 
     static BiquadCoeffs identity() { return {}; }
 
+    // A corner at or above Nyquist (sampleRate / 2) can't be realised at this rate
+    // (past it sin(w0) < 0 and the RBJ poles leave the unit circle), so such a band
+    // is passed through (identity) rather than designed unstable. That happens when
+    // a fixed layout runs at a low output rate, e.g. a 16 kHz band on 22.05 kHz audio.
     static BiquadCoeffs design(FilterType type, double freqHz, double sampleRate,
                                double gainDb, double q) {
         BiquadCoeffs c;
         if (sampleRate <= 0 || freqHz <= 0 || q <= 0) return c;
+        if (freqHz >= sampleRate / 2) return c;
         const double w0 = 2.0 * M_PI * freqHz / sampleRate;
         const double cosw = std::cos(w0);
         const double sinw = std::sin(w0);

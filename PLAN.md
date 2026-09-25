@@ -132,7 +132,7 @@ context (the I2S DMA callback) and everything else is best-effort cooperative.
 | Decode task | CTask | Fill ring to high-water, then `Yield()`. Block size ≤ 10 ms of audio. | Highest cooperative |
 | BTstack run loop | CTask | Pump HCI/L2CAP; A2DP media bytes go to a decode ring. Yield each pass. | High |
 | UI/render task | CTask | ~30 fps tick; dirty-region redraw; yields after each frame. | Medium |
-| Touch input task | CTask | Poll firmware touchbuffer >60 Hz; enqueue events. Cheap. | Medium |
+| Touch input pump | Timer IRQ | Circle `CTimer` periodic handler, 100 Hz: read the firmware touchbuffer, stamp + enqueue events into a lock-free ring the UI task drains. Cheap, bounded. (As built: not a CTask — a per-frame poll from the UI loop was only ~10-25 Hz and lost taps.) | IRQ (bounded, like the DMA callback) |
 | Library indexer task | CTask | Chunked work (one file per slice), `Yield()` between files. Pausable. | Low |
 | OTA/Net task | CTask | Only active opportunistically; never during playback-critical windows. | Lowest |
 
@@ -189,7 +189,8 @@ complexity, risks.
 - **Complexity:** Low. Mostly gesture/debounce on top of a working Circle driver.
 - **Risks:** Minor — the buffer is a FIFO updated at ~60 Hz with a "count == 99 means
   updating" sentinel, so we must poll faster than 60 Hz and skip the sentinel state to
-  avoid corrupt/lost points. No bus identification or scope work needed.
+  avoid corrupt/lost points. No bus identification or scope work needed. (As built:
+  `CircleTouch` pumps it at 100 Hz from the timer IRQ; see STATUS.md.)
 
 ### 2.4 Audio Engine (mixer + render callback host)
 - **Responsibilities:** Own the active sound device **behind an `ISoundDevice` abstraction**
@@ -649,7 +650,7 @@ Legend: **BMF** = bare-metal-friendly (no OS deps, malloc-only, no threads requi
 | # | Risk | Sev | Lik | Mitigation |
 |---|---|---|---|---|
 | R1 | **DSI panel init / framebuffer quirks** — bare-metal relies on VideoCore firmware to bring up the official 7" DSI panel; config.txt/`ignore_lcd`, firmware version, and dual-cam/disp quirks can leave no framebuffer. | High | Med | Validate Phase 0 on real hardware first; pin a known-good firmware + `config.txt` (`display_default_lcd`, `dtoverlay=vc4-...` as needed); keep HDMI fallback path for bring-up; document exact firmware blob versions. |
-| R2 | **Touch access mechanism** — ~~which I2C bus~~ **RESOLVED by research**: don't use I2C at all; the firmware publishes touch via the `GET_TOUCHBUF` mailbox buffer and Circle's `CRPiTouchScreen` already reads it. | Low | Low | Use `CRPiTouchScreen`; poll >60 Hz; honor the `count==99` "updating" sentinel to avoid FIFO corruption. Hardware check is just "does Circle's touch sample report points," not bus bring-up. |
+| R2 | **Touch access mechanism** — ~~which I2C bus~~ **RESOLVED by research**: don't use I2C at all; the firmware publishes touch via the `GET_TOUCHBUF` mailbox buffer and Circle's `CRPiTouchScreen` already reads it. | Low | Low | Use `CRPiTouchScreen`; poll >60 Hz (as built: 100 Hz from the timer IRQ); honor the `count==99` "updating" sentinel to avoid FIFO corruption. Hardware check is just "does Circle's touch sample report points," not bus bring-up. |
 | R3 | **Bluetooth firmware blob (CYW43455 .hcd)** — onboard controller needs a vendor HCI firmware patch loaded at init; version mismatch → BT dead. | High | Med | Reuse Circle's proven firmware-load path; pin the exact .hcd from a known Pi firmware; verify with an HCI reset/read-local-version probe before BTstack init. |
 | R4 | **BTstack ↔ Circle HCI transport bridge** — gluing BTstack's `hci_transport_t` to Circle's UART/BCM transport + run loop is custom and error-prone. | High | Med | Start from BTstack's posix/embedded transport template; implement the run-loop as a dedicated `CTask`; build an HCI loopback/echo test before profiles. |
 | R5 | **USB host stability across drives/hubs** — flaky enumeration, power, or quirky drives cause read stalls → audio underrun or mount failure. | High | Med | Lean on Circle's tested stack; test a matrix of drives/hubs; powered hub recommendation; treat USB reads as fallible (timeouts, retry, deep ring buffer absorbs stalls); never read USB from the audio callback. |

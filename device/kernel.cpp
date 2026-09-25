@@ -9,7 +9,7 @@
 #include <circle/devicenameservice.h>
 #include <circle/startup.h>      // reboot() for the OTA-push restart
 #include <circle/synchronize.h>  // EnableIRQs() for the panic-flush handler
-#include <circle/timer.h>        // CTimer::GetClockTicks() for the flush spin
+#include <circle/sysconfig.h>    // HEAP_BLOCK_BUCKET_SIZES (the build guard below)
 
 #include <cstdarg>
 #include <cstdio>
@@ -28,6 +28,7 @@
 #include "CircleAaDecodeCore.h"
 #include "CircleAaDriver.h"
 #include "CircleAoaTransport.h"
+#include "CircleClock.h"
 #include "aa/AaProjection.h"
 #include "aa/AsyncH264Decoder.h"
 #include "aa/FrameRelay.h"
@@ -57,6 +58,7 @@
 #include "library/ArtSource.h"
 #include "player/PlayerController.h"
 #include "player/MediaSession.h"
+#include "player/OutputRate.h"
 #include "profile/ProfileManager.h"
 #include "ui/Canvas.h"
 #include "ui/Screen.h"
@@ -65,6 +67,25 @@
 #include "ui/Screens.h"
 
 #define FROM "carsh"
+
+// Refuse to build against a libcircle without scripts/patches/sysconfig-heap-
+// buckets.patch (review L1), as the chainloader does for its patch. Circle's heap
+// only reuses a freed block whose size matches a bucket, and the stock list stops
+// at 512 KiB: every larger block carsh frees (a cover-art decode buffer, up to
+// ~55 MB at kMaxArtDim; vector regrowth; per-session AA buffers) would be lost for
+// good, and the heap would run down over a drive. An image built without the patch
+// looks fine on the bench and fails hours later, so fail here instead. (This
+// checks the header; a patched header over a stale libcircle.a still needs the
+// full rebuild the README describes.)
+namespace carsh_build_guard {
+constexpr unsigned kHeapBuckets[] = {HEAP_BLOCK_BUCKET_SIZES};
+constexpr unsigned kLargestHeapBucket =
+    kHeapBuckets[sizeof kHeapBuckets / sizeof kHeapBuckets[0] - 1];
+static_assert(kLargestHeapBucket >= 0x8000000,
+              "libcircle lacks scripts/patches/sysconfig-heap-buckets.patch (largest "
+              "heap bucket < 128 MiB): freed blocks > 512 KiB would never be reused. "
+              "Apply it and rebuild all of libcircle (scripts/patches/README.md).");
+}  // namespace carsh_build_guard
 
 namespace {
 // --- Panic flush over USB-C -------------------------------------------------
@@ -85,8 +106,8 @@ carsh::device::OtaPushService g_otaPush;
 void carshPanicFlush(void) {
     if (g_panicGadget == nullptr) return;
     EnableIRQs();
-    const unsigned start = CTimer::GetClockTicks();  // free-running 1 MHz counter
-    while (CTimer::GetClockTicks() - start < 4u * 1000000u) {  // ~4 s
+    const uint32_t start = carsh::device::clockUs32();
+    while (carsh::device::clockUs32() - start < 4u * 1000000u) {  // ~4 s
         g_panicGadget->UpdatePlugAndPlay();
     }
 }
@@ -179,11 +200,12 @@ carsh::device::CircleSource g_sdSource(0, carsh::hal::SourceType::Sd, "SD:");
 carsh::device::CircleSource g_usbSource(1, carsh::hal::SourceType::Usb, "USB:");
 carsh::profile::ProfileManager g_profiles;
 carsh::bt::AvrcpMetadata g_btMeta;  // latest AVRCP now-playing (BT source)
-// An AVRCP report (playback status or track attribute) arrived since the current
-// phone connected: MediaSession then takes the BT play/pause state from AVRCP
-// alone, instead of from A2DP activity. Both are reset per connection, so a
-// reconnect never shows (or acts on) the previous connection's status. Written
-// by the BT run-loop task, read by the UI loop: cooperative tasks on core 0.
+// The phone's current AVRCP session has reported (a playback status or a track
+// attribute): MediaSession then takes the BT play state, and whether the phone
+// started playing, from AVRCP alone instead of from A2DP activity. Both are reset
+// on every (re)connect and when that AVRCP session ends (onAvrcpEnded), so neither
+// a reconnect nor an AVRCP-only release keeps acting on an old status. Written by
+// the BT run-loop task, read by the UI loop: cooperative tasks on core 0.
 bool g_btAvrcpReported = false;
 std::vector<carsh::bt::DiscoveredDevice> g_btDevices;  // scan results for the BT tab
 }  // namespace
@@ -399,7 +421,7 @@ CStdlibApp::TShutdownMode CKernel::Run(void) {
     // The browser is the platform-independent model (host-tested); the screen just
     // renders its rows + forwards intents back into it.
     carsh::library::LibraryBrowser browser(g_db);
-    browser.setSeed(CTimer::GetClockTicks() | 1u);  // vary the shuffle per boot
+    browser.setSeed(carsh::device::clockUs32() | 1u);  // vary the shuffle per boot
 
     // Bumped whenever the queue CONTENTS change (not on a within-queue jump), so the
     // Queue tab only rebuilds its rows when needed rather than every frame.
@@ -538,9 +560,8 @@ CStdlibApp::TShutdownMode CKernel::Run(void) {
         g_profiles.onBtConnected(pa);
     };
     btcb.onDisconnected = [](const carsh::bt::BdAddr&) {
-        // The glue does not publish an empty metadata when AVRCP goes away, so drop
-        // the last status here: a stale PLAYING would otherwise read as "streaming"
-        // and take the session on the next connect.
+        // (onAvrcpEnded normally came first; cleared again for a link that never
+        // had AVRCP.) A stale PLAYING would take the session on the next connect.
         g_btMeta = carsh::bt::AvrcpMetadata{};
         g_btAvrcpReported = false;
         g_profiles.onBtDisconnected();
@@ -548,6 +569,13 @@ CStdlibApp::TShutdownMode CKernel::Run(void) {
     btcb.onMetadata = [](const carsh::bt::AvrcpMetadata& m) {
         g_btMeta = m;
         g_btAvrcpReported = true;
+    };
+    // The phone's AVRCP session ended, possibly with A2DP still streaming: forget
+    // its status, so MediaSession falls back to A2DP activity (music still playing
+    // shows '||', not the last PAUSED) until AVRCP connects and reports again.
+    btcb.onAvrcpEnded = [] {
+        g_btMeta = carsh::bt::AvrcpMetadata{};
+        g_btAvrcpReported = false;
     };
     btcb.onA2dpPcm = [](const float* p, std::size_t f, uint8_t ch) {
         g_btRing.write(p, f * ch);
@@ -708,12 +736,14 @@ CStdlibApp::TShutdownMode CKernel::Run(void) {
     carsh::device::CircleAaDriver aaDriver;  // drives AA over uaa1 from this loop
     aaDriver.setProjection(&aaProjection);
 
-    // AA input-event timestamps: a continuous 64-bit microsecond clock
-    // (CTimer::GetClockTicks64 — the 32-bit GetClockTicks wraps every ~71.6 min,
-    // review T10), clamped monotonic across touch + keys. A touch carries its CAPTURE
-    // time from the 100 Hz driver pump (touchStampUs, set while the UI loop
+    // AA input-event timestamps: carsh's continuous 64-bit microsecond clock
+    // (device::clockUs — the 32-bit GetClockTicks wraps every ~71.6 min, review T10,
+    // and Circle's GetClockTicks64 restarts near 0 after ~94.9 h). A touch carries its
+    // CAPTURE time from the 100 Hz driver pump (touchStampUs, set while the UI loop
     // dispatches that event), so a drag drained in a burst still reaches the phone
-    // with its real spacing — the phone derives fling velocity from it.
+    // with its real spacing — the phone derives fling velocity from it. The clamp
+    // only guards against small skews between the two stamp sources (a key stamped
+    // now vs a touch stamped at capture): the clock itself never steps back.
     uint64_t touchStampUs = 0;  // capture time of the touch being dispatched, else 0
     uint64_t lastAaInputUs = 0;
     auto aaInputStamp = [&](uint64_t us) {
@@ -722,7 +752,7 @@ CStdlibApp::TShutdownMode CKernel::Run(void) {
         return us;
     };
     auto sendAaKey = [&](carsh::aa::MediaKey key) {
-        aaProjection.sendMediaKey(key, aaInputStamp(CTimer::GetClockTicks64()));
+        aaProjection.sendMediaKey(key, aaInputStamp(carsh::device::clockUs()));
     };
 
     // AA tab: stream the raw contact on the video to the phone (review T3). The
@@ -733,7 +763,7 @@ CStdlibApp::TShutdownMode CKernel::Run(void) {
     // taps and the volume rail never reach this path. Tie the phone's video focus
     // to whether the AA tab is the active one.
     androidAuto.onTouchAction = [&](carsh::aa::TouchAction action, int sx, int sy) {
-        const uint64_t ts = touchStampUs ? touchStampUs : CTimer::GetClockTicks64();
+        const uint64_t ts = touchStampUs ? touchStampUs : carsh::device::clockUs();
         aaProjection.forwardTouch(sx, sy, action, aaInputStamp(ts));
     };
     androidAuto.onFocusChanged = [&](bool focused) { aaProjection.setFocus(focused); };
@@ -803,7 +833,8 @@ CStdlibApp::TShutdownMode CKernel::Run(void) {
     unsigned aaTickMaxUs = 0, aaTickSumUs = 0, aaTickCount = 0;
     // render() time window (us). render() is the one stretch with NO audio refill, so
     // its peak ~= the worst gap g_aaRing faces — the suspected source of the remaining
-    // AA stutter (the 720p video blit on core 0, + memory contention with core 3).
+    // AA stutter (the 480p (800x480) video blit on core 0, + memory contention with
+    // core 3).
     unsigned renderMaxUs = 0, renderSumUs = 0, renderCount = 0;
     unsigned lastQueueVersion = ~0u;  // forces the Queue tab to build its rows once
     // Album art (local source): sidecar covers rendered to ASCII, cached by albumKey
@@ -911,49 +942,103 @@ CStdlibApp::TShutdownMode CKernel::Run(void) {
         // Refresh now-playing from the player each frame.
         carsh::player::PlayerState ps = player.state();
 
-        // Open / adapt the PWM output to the current track's sample rate, lazily.
-        // The core has no resampler, so the device must clock at the track's native
-        // rate (a fixed rate would shift pitch). Opening from closed is clean, and
-        // close() drains the DMA so a rate-change reopen is safe; a single-rate
-        // library opens once and never reopens.
-        // When a phone is connected over A2DP, clock the output at the SBC stream
-        // rate (typically 44.1 kHz); otherwise at the local track's rate. The output
-        // device always renders g_outSink, which mixes BT audio over the local
-        // engine. Reopen only on a rate change (close() drains the DMA safely).
-        unsigned wantRate = curRate;
-        bool wantOpen = false;
-        if (g_aaRing.readable() > 0) {
-            // Android Auto media audio is streaming (48 kHz stereo PCM) — open the
-            // jack at that rate so the PWM sink drains g_aaRing. Highest priority:
-            // while projecting, AA owns the output.
-            wantRate = kRate;
-            wantOpen = true;
-        } else if (bt.connected()) {
-            uint32_t r = carsh::device::btGlueA2dpSampleRate();
-            wantRate = r ? r : 44100;
-            wantOpen = true;
-        } else if (ps.queueIndex >= 0 && ps.queueIndex < int(g_queueIds.size())) {
-            // The rate the player is actually producing (PlayerState::sampleRate:
-            // the heard decoder's native rate, which changes on a non-gapless
-            // restart at a new rate), so the jack reclocks from the true rate even
-            // if the library row says 0 or is stale. The row's rate is only a
-            // fallback, then 48 kHz.
-            uint32_t r = ps.sampleRate;
-            if (r == 0) {
-                const carsh::library::Track* t =
-                    g_db.get(g_queueIds[std::size_t(ps.queueIndex)]);
-                if (t) r = t->sampleRate;
-            }
-            wantRate = r ? r : kRate;
-            wantOpen = true;
+        // Now Playing: arbitrate the local player vs the Bluetooth phone and show
+        // whichever currently owns the output. The local snapshot resolves metadata
+        // via the actual queue (g_queueIds); the BT side comes from AVRCP (g_btMeta).
+        carsh::player::MediaSession::LocalState ls;
+        if (ps.queueIndex >= 0 && ps.queueIndex < int(g_queueIds.size())) {
+            const carsh::library::Track* t =
+                g_db.get(g_queueIds[std::size_t(ps.queueIndex)]);
+            if (t) { ls.hasTrack = true; ls.title = g_db.title(*t);
+                     ls.artist = g_db.artist(*t); ls.album = g_db.album(*t); }
         }
-        if (wantOpen && (wantRate != curRate || !sound.isOpen())) {
-            curRate = wantRate;
-            if (sound.open({curRate, 16, kChannels}, &g_outSink))
-                diag("audio: PWM jack @ %u Hz%s", unsigned(curRate),
-                     bt.connected() ? " (BT)" : "");
-            else
-                diag("audio: PWM open FAILED");
+        ls.playing = ps.transport == carsh::player::Transport::Playing;
+        ls.positionMs = ps.positionMs;
+        ls.durationMs = ps.durationMs;
+        session.setLocal(ls);
+        // A phone that STARTS playing takes the session and keeps it while paused
+        // (review A2), until the user explicitly starts local playback again
+        // (takeLocalSession) or it disconnects — see MediaSession. Audio alone is
+        // not "started playing" (a chime or a navigation prompt must not pause the
+        // local track): a BT phone whose AVRCP has reported starts when AVRCP says
+        // PLAYING; AA, or a phone without AVRCP, once its audio has kept coming for
+        // MediaSession::kTakeoverMs.
+        // "Audible" is PCM chunks arriving (StreamActivity, 800 ms hold), not ring
+        // occupancy — a stale sub-block tail would pin it on. For AA it also covers
+        // the jitter buffer still playing out what arrived. nowUs is carsh's
+        // monotonic clock: the takeover timer subtracts it.
+        const uint64_t nowUs = carsh::device::clockUs();
+        const bool btAudible =
+            btActivity.update(g_btPcmChunks.load(std::memory_order_relaxed), nowUs);
+        session.setBluetooth(bt.connected(), btAudible, g_btMeta, g_btAvrcpReported,
+                             nowUs);
+        const bool aaAudible = aaActivity.update(aaMediaChunks, nowUs) ||
+                               g_aaJitter.engaged();
+        session.setAndroidAuto(aaProjection.connected(), aaAudible, nowUs);
+        // A phone just took over while the local player was playing underneath it:
+        // pause the local player (review P4). Only an explicit local action resumes
+        // it — pausing the phone must never start the USB track by itself.
+        if (session.shouldPauseLocal()) {
+            player.pause();
+            mLogger.Write(FROM, LogNotice, "audio: local player paused (%s took over)",
+                          session.source() == carsh::player::Source::AndroidAuto
+                              ? "Android Auto" : "Bluetooth");
+        }
+        g_btOwnsOutput.store(session.source() == carsh::player::Source::Bluetooth,
+                             std::memory_order_relaxed);
+
+        // Open / adapt the PWM output, lazily, at the rate of the audio being played.
+        // The core has no resampler, so the jack must clock at that audio's own rate
+        // (a fixed rate would shift pitch). player::chooseOutputRate() picks it (see
+        // OutputRate.h): live remote audio first, as in g_outSink's mix (so a chime
+        // plays at its own rate), then the session owner — the local track's rate
+        // whenever local owns it, even with a phone connected — and only then what
+        // is connected. Opening from closed is clean, and close() drains the DMA so
+        // a rate-change reopen is safe; a single-rate library opens once and never
+        // reopens. (Remote audio that starts over a local track at another rate can
+        // play a block or so before the reopen: the rate is chosen once per frame.)
+        {
+            carsh::player::OutputRateInputs ri;
+            ri.owner = session.source();
+            // AA is output exactly while its jitter buffer is engaged (then it owns
+            // every block, even as the tail of a stream local took over from). Not
+            // on mere arrival: during the ~480 ms prime the local track is still
+            // what is heard. A2DP is output as soon as a block is buffered, so it
+            // counts while its PCM arrives (not as a paused stream's tail).
+            ri.aaAudible = g_aaJitter.engaged();
+            ri.btAudible = session.audible(carsh::player::Source::Bluetooth);
+            ri.aaConnected = aaProjection.connected();
+            ri.btConnected = bt.connected();
+            ri.btRate = carsh::device::btGlueA2dpSampleRate();
+            if (ps.queueIndex >= 0 && ps.queueIndex < int(g_queueIds.size())) {
+                // The rate the player is actually producing (PlayerState::sampleRate:
+                // the heard decoder's native rate, which changes on a non-gapless
+                // restart at a new rate), so the jack reclocks from the true rate
+                // even if the library row says 0 or is stale. The row's rate is only
+                // a fallback, then 48 kHz.
+                ri.localTrack = true;
+                ri.localRate = ps.sampleRate;
+                if (ri.localRate == 0) {
+                    const carsh::library::Track* t =
+                        g_db.get(g_queueIds[std::size_t(ps.queueIndex)]);
+                    if (t) ri.localRate = t->sampleRate;
+                }
+            }
+            const carsh::player::OutputRate want = carsh::player::chooseOutputRate(ri);
+            if (want.hz != 0 && (want.hz != curRate || !sound.isOpen())) {
+                curRate = want.hz;
+                // The engine EQ's biquads are specific to one sample rate: re-design
+                // them for the new clock (the same IRQ-safe bank swap as an edit)
+                // before the first block runs at it.
+                g_eq.setSampleRate(curRate);
+                if (sound.open({curRate, 16, kChannels}, &g_outSink))
+                    diag("audio: PWM jack @ %u Hz (%s)", unsigned(curRate),
+                         want.source == carsh::player::Source::AndroidAuto ? "Android Auto"
+                         : want.source == carsh::player::Source::Bluetooth ? "Bluetooth"
+                                                                           : "local");
+                else
+                    diag("audio: PWM open FAILED");
+            }
         }
 
         // Output level for the meter. With a real device open, its DMA/IRQ
@@ -975,50 +1060,6 @@ CStdlibApp::TShutdownMode CKernel::Run(void) {
         } else {
             audioPeak *= 0.80f;
         }
-
-        // Now Playing: arbitrate the local player vs the Bluetooth phone and show
-        // whichever currently owns the output. The local snapshot resolves metadata
-        // via the actual queue (g_queueIds); the BT side comes from AVRCP (g_btMeta).
-        carsh::player::MediaSession::LocalState ls;
-        if (ps.queueIndex >= 0 && ps.queueIndex < int(g_queueIds.size())) {
-            const carsh::library::Track* t =
-                g_db.get(g_queueIds[std::size_t(ps.queueIndex)]);
-            if (t) { ls.hasTrack = true; ls.title = g_db.title(*t);
-                     ls.artist = g_db.artist(*t); ls.album = g_db.album(*t); }
-        }
-        ls.playing = ps.transport == carsh::player::Transport::Playing;
-        ls.positionMs = ps.positionMs;
-        ls.durationMs = ps.durationMs;
-        session.setLocal(ls);
-        // A phone that STARTS playing takes the session and keeps it while paused
-        // (review A2), until the user explicitly starts local playback again
-        // (takeLocalSession) or it disconnects — see MediaSession.
-        // BT is "streaming" while A2DP PCM keeps arriving or AVRCP says PLAYING (that
-        // decides who owns the session). Its '>' / '||' and the play/pause command
-        // follow AVRCP once it has reported on this connection: a paused phone keeps
-        // streaming PCM for a while (the 800 ms hold + its own silence tail).
-        const uint64_t nowUs = CTimer::GetClockTicks64();
-        const bool btStreaming =
-            btActivity.update(g_btPcmChunks.load(std::memory_order_relaxed), nowUs) ||
-            g_btMeta.playing;
-        session.setBluetooth(bt.connected(), btStreaming, g_btMeta, g_btAvrcpReported);
-        // Android Auto: a projection session is up, and its media audio is playing
-        // (media PCM arriving, or the jitter buffer still playing it out). Ownership
-        // no longer ends when the jitter buffer disengages on a pause.
-        const bool aaStreaming = aaActivity.update(aaMediaChunks, nowUs) ||
-                                 g_aaJitter.engaged();
-        session.setAndroidAuto(aaProjection.connected(), aaStreaming);
-        // A phone just took over while the local player was playing underneath it:
-        // pause the local player (review P4). Only an explicit local action resumes
-        // it — pausing the phone must never start the USB track by itself.
-        if (session.shouldPauseLocal()) {
-            player.pause();
-            mLogger.Write(FROM, LogNotice, "audio: local player paused (%s took over)",
-                          session.source() == carsh::player::Source::AndroidAuto
-                              ? "Android Auto" : "Bluetooth");
-        }
-        g_btOwnsOutput.store(session.source() == carsh::player::Source::Bluetooth,
-                             std::memory_order_relaxed);
 
         const carsh::player::MediaSession::NowPlayingView v = session.view();
         carsh::ui::NowPlayingScreen::State st;
@@ -1094,9 +1135,9 @@ CStdlibApp::TShutdownMode CKernel::Run(void) {
         }
 
         {
-            const unsigned t0 = CTimer::GetClockTicks();
+            const uint32_t t0 = carsh::device::clockUs32();
             mgr.render(canvas);
-            const unsigned dt = CTimer::GetClockTicks() - t0;
+            const unsigned dt = carsh::device::clockUs32() - t0;
             if (dt > renderMaxUs) renderMaxUs = dt;
             renderSumUs += dt;
             ++renderCount;
@@ -1105,9 +1146,11 @@ CStdlibApp::TShutdownMode CKernel::Run(void) {
         // Storage/USB diagnostics panel (toggle: tap the top-right marker).
         // Mirrors the boot/scan log (SD/USB mount, indexed file/track counts)
         // onto the display so storage issues are visible without a serial cable.
-        // Hidden on the AA tab, where it would cover the phone's UI.
-        const bool diagAllowed = mgr.activeIndex() != aaTabIndex;
-        if (mDiagVisible && diagAllowed) {
+        // None of the overlays (panel, marker, level meter) are drawn on the AA tab:
+        // the video fills the content rect there, so they would cover the phone's UI
+        // while touches in them still go to the phone.
+        const bool overlaysAllowed = mgr.activeIndex() != aaTabIndex;
+        if (mDiagVisible && overlaysAllowed) {
             int dx = mgr.contentRect().x;  // clear of the left volume rail
             int n = int(mDiag.size());
             canvas.fillRect(dx, 0, 380, n * 10 + 4, 0xC8000000u);
@@ -1120,7 +1163,7 @@ CStdlibApp::TShutdownMode CKernel::Run(void) {
         // Toggle affordance: a small marker in the top-right corner (green when
         // the panel is shown, dim when hidden), inside the kDiagHotW x kDiagHotH
         // hot zone the touch drain checks.
-        if (diagAllowed)
+        if (overlaysAllowed)
             canvas.fillRect(rt.width() - 14, 2, 12, 12,
                             mDiagVisible ? 0xFF33FF66u : 0x80FFFFFFu);
 
@@ -1128,7 +1171,9 @@ CStdlibApp::TShutdownMode CKernel::Run(void) {
         // in the gap just above the tab bar. Green / amber / red near clip. The
         // underrun counter (u=) climbing means the decoder isn't feeding the ring
         // fast enough; 0 with a moving bar means the audio pipeline is healthy.
-        {
+        // Not on the AA tab (it sits inside the video there); the ~1 Hz
+        // `aa-audio: ... under=` log line carries the AA underruns meanwhile.
+        if (overlaysAllowed) {
             int my = mgr.contentRect().h - 16, mx = mgr.contentRect().x + 4,
                 mw = 280, mh = 12;
             canvas.drawText(mx, my + 2, "OUT", 0xFFFFFFFFu, 0, 1);
@@ -1164,9 +1209,9 @@ CStdlibApp::TShutdownMode CKernel::Run(void) {
         // keeps the ring topped across the blit. UI-task driven so it never races
         // with the UpdatePlugAndPlay above. Each tick timed for the health log below.
         auto aaTick = [&] {
-            const unsigned t0 = CTimer::GetClockTicks();  // 1 MHz free-running (us)
+            const uint32_t t0 = carsh::device::clockUs32();  // us; t1 - t0 wrap-safe
             aaDriver.tick();
-            const unsigned dt = CTimer::GetClockTicks() - t0;
+            const unsigned dt = carsh::device::clockUs32() - t0;
             if (dt > aaTickMaxUs) aaTickMaxUs = dt;
             aaTickSumUs += dt;
             ++aaTickCount;

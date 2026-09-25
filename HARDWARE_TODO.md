@@ -188,13 +188,14 @@ this is the prioritized list for the first hardware session. Format:
 
 ### H9 — Bench checklist: `claude/review-fixes` (2026-09-25)  [NOTHING BENCHED YET]
 - **Scope:** everything this branch fixed after the 2026-09-25 code review. All of it
-  is host-done (449 host tests pass) and cross-builds in all six device variants;
+  is host-done (469 host tests pass) and cross-builds in all six device variants;
   none of it has run on the Pi. Expected log lines are quoted as the code prints
   them; the review IDs (T1, A1, ...) match the commit messages.
 - **Prep.**
   1. circle-stdlib with all seven `scripts/patches/` + the manual gadget VID edit, and a
      **full libcircle rebuild** (the two sysconfig patches change `sysconfig.h`) —
-     `scripts/patches/README.md`. Build `cd device && make clean && make
+     `scripts/patches/README.md`. (The app no longer builds without the heap-bucket
+     patch; a patched header over a stale `libcircle.a` is not caught, so rebuild.) Build `cd device && make clean && make
      CARSH_HAVE_OPENH264=1 CARSH_HAVE_BTSTACK=1` (`make clean` whenever the `CARSH_*`
      flags change: the Makefile doesn't track them) and `device/chainloader`.
   2. **One card swap is unavoidable.** Kernels built before this branch never ack a
@@ -214,7 +215,9 @@ this is the prioritized list for the first hardware session. Format:
      After PAUSE, Now Playing stays ANDROID AUTO with '>', and '>' resumes AA.
   4. Tap the AA mic (or "Hey Google"): the log shows `tx frame ch=7 id=8006` and the
      voice session times out on silence (no mic uplink) instead of hanging.
-  5. AA touch + keys still work after > 72 min of uptime.
+  5. AA touch + keys still work after > 72 min of uptime. (All stamps now come from
+     carsh's own counter clock, `device::clockUs`, which doesn't have Circle's ~94.9 h
+     overflow; a > 95 h soak is optional.)
 - **B. AA link faults + H8 re-bench** (A1, A3-A5, A7, A9). Removals are noticed only
   when the kernel pumps USB plug-and-play (every 33 UI frames), so `~N ms` figures are
   upper bounds, coarse by about a second.
@@ -253,7 +256,8 @@ this is the prioritized list for the first hardware session. Format:
   1. On Lib/Queue, 40 ms taps and 80 ms / 150 px flicks register (flicks scroll, never
      select), also on the AA tab while video plays; two taps 50 ms apart both
      register. `touch: ring dropped` never appears in normal use; no PWM/AA underrun
-     regression from the timer IRQ (`u=`/`au=` on screen, `aa-audio: ... under=`).
+     regression from the timer IRQ (`u=`/`au=` on screen on the non-AA tabs,
+     `aa-audio: ... under=` in the log).
   2. Two fingers: confirm the FT5406 reports distinct ids per contact. A palm/thumb on
      the rail while scrolling a list leaves the volume alone; a stray second contact
      doesn't steal a tap. (By design a thumb resting on the rail blocks taps elsewhere
@@ -265,7 +269,8 @@ this is the prioritized list for the first hardware session. Format:
      BACK/PLAY/SHUFFLE row; long titles end in `..` before the A-Z strip.
   5. Diagnostics corner: the A-Z strip's 'A' is tappable; the top-right marker (20×20
      hot zone, was 60×60) still toggles the diag panel on non-AA tabs; on the AA tab
-     the marker is hidden and a top-right tap reaches the phone.
+     the marker is hidden and a top-right tap reaches the phone, and nothing (no OUT
+     meter, no `u=`/`au=` text) is drawn over the bottom of the video.
   6. Keep a finger on a Library row while AA's first frame auto-shows the AA tab: the
      phone must not receive a tap.
   7. Touch-loss recovery (needs a temporary debug stall ≥ 1.5 s in the UI loop): drag
@@ -277,19 +282,27 @@ this is the prioritized list for the first hardware session. Format:
   1. A mono MP3/WAV (e.g. a podcast) and a 5.1 FLAC/WAV play cleanly, at the right
      pitch, on both channels; no crash or hang afterwards.
   2. Mixed-rate queue 44.1 → 48 → 44.1 kHz (or SHUFFLE ALL over a mixed library):
-     playback continues and the log shows `audio: PWM jack @ <rate> Hz` at each change;
-     note how audible the ~100-120 ms start-of-track pitch blip is. A `.m4a`/`.opus`
+     playback continues and the log shows `audio: PWM jack @ <rate> Hz (local)` at each
+     change; note how audible the ~100-120 ms start-of-track pitch blip is. **Repeat
+     with a BT phone connected but idle** (and with an AA session up, not playing):
+     the jack must still follow the local track (before, it ran at the phone's rate,
+     so 48 kHz tracks played 8 % slow). A `.m4a`/`.opus`
      queued between two FLACs is skipped (neither decoder is in the device image).
   3. A < 1 s track with ≥ 2 tracks after it (tap it, or next/prev onto it): all play
      through, no crash.
   4. The EQ tab shows 10 bars labelled 31..16000; each tap moves a band ±1 dB,
      audible on local playback (AA/BT audio bypasses the EQ, as before). Flat EQ: no
-     audible change and no PWM underruns from the 10-biquad chain in the IRQ.
+     audible change and no PWM underruns from the 10-biquad chain in the IRQ. With a
+     band boosted, play a tone/sweep file at 44.1 kHz and at 48 kHz: the boost sits at
+     the labelled frequency on both (it sat 8 % low at 44.1 kHz). A 22.05 kHz file
+     with the 16 kHz band boosted plays clean (that band is passed through).
 - **E. Media session** (A2, P4)
-  1. Play a USB track, then start A2DP: the USB track pauses. Pause the phone: silence,
-     the USB track does NOT resume, Now Playing stays on BLUETOOTH. Pick a library
-     track while the phone streams: local plays and the phone gets an AVRCP pause.
-     Repeat with AA.
+  1. Play a USB track, then start media on an AVRCP phone: the USB track pauses at
+     once (`audio: local player paused (Bluetooth took over)`). Pause the phone:
+     silence, the USB track does NOT resume, Now Playing stays on BLUETOOTH. Pick a
+     library track while the phone streams: local plays and the phone gets an AVRCP
+     pause. Repeat with AA media: there the takeover comes ~6 s after the AA audio
+     starts (`MediaSession::kTakeoverMs`; AA is heard over the USB track meanwhile).
   2. AVRCP phone: play from the phone, press pause on Now Playing, then '>' within
      1-3 s: the phone resumes, and the button shows '>' as soon as the pause lands (no
      flicker back to pause during the A2DP silence tail).
@@ -299,7 +312,21 @@ this is the prioritized list for the first hardware session. Format:
      reconnect with a local track playing: the local track is not paused by a stale
      PLAYING and Now Playing shows no old phone title until the phone plays.
   5. A phone without AVRCP (if available): the pause button shows while it streams
-     and does nothing (expected — no AVRCP channel).
+     and does nothing (expected — no AVRCP channel); it takes the session ~6 s after
+     its stream starts, like AA.
+  6. **Chimes and prompts must not take the session** (final review). USB track
+     playing, phone connected with its media paused: a notification sound, then a
+     Maps prompt over A2DP. Each is heard over the USB track; the USB track keeps
+     playing afterwards, Now Playing stays on it, and no `local player paused` line
+     appears. Same while projecting AA with AA media paused: a guidance prompt plays
+     over the USB track and leaves it playing. Record whether AA prompts arrive as
+     media audio (`aa-audio: ... eng=1` during the prompt) and how long the longest
+     prompts run: a sound that lasts ≥ ~5 s (e.g. an Assistant answer) does take the
+     session.
+  7. Rate during a chime: USB track at 48 kHz, phone at 44.1 kHz. The log shows
+     `audio: PWM jack @ 44100 Hz (Bluetooth)` while the chime plays and `@ 48000 Hz
+     (local)` ~1 s after it ends; the chime's pitch is right. Note how audible the two
+     reclocks are (a short gap each).
 - **F. Bluetooth** (B1-B4, B8, absolute volume)
   1. Boot log: four `SDP ... record registered` lines.
   2. Pair and stream: `AVRCP: connected to <phone>` within ~2 s of `A2DP signaling
@@ -311,8 +338,8 @@ this is the prioritized list for the first hardware session. Format:
   4. Absolute volume: moving the phone's slider logs `AVRCP TG: phone volume N/127
      (P%)` and carsh's BT loudness follows it (same loudness at the same slider
      position as before absolute volume); the HU rail still scales on top; phone at 0
-     = silent. Disconnect AVRCP (or the phone): the next connect starts at unity, no
-     stuck-quiet level. Try an iPhone too if one is available.
+     = silent. Disconnect the phone: the next connect starts at unity, no stuck-quiet
+     level. Try an iPhone too if one is available.
   5. CONNECT on an off/out-of-range phone: `ACL link FAILED to ... (status 0x04 ...)`
      and `BT connect failed: 0x4`; the row is not marked, no DISCONN button, PWM rate
      unchanged. DISCONN while streaming with AVRCP up: `ACL link down` and the row
@@ -321,6 +348,11 @@ this is the prioritized list for the first hardware session. Format:
   6. Connect from the phone's own Bluetooth settings (the A2DP-sink record is
      advertised now). Reconnect after link loss / reboot still needs B5 (H6 item 2).
   7. Connect a phone after > 72 min of uptime: no ~71 min stall (B8).
+  8. AVRCP released while A2DP keeps playing (`AVRCP: released` with no `ACL link
+     down`; if it can be provoked, e.g. by the phone's per-device media-control toggle):
+     the loudness does not change (the phone's absolute volume stays applied), and Now
+     Playing stays BLUETOOTH showing '||' while the music plays (not a stale '>'); it
+     goes back to AVRCP when AVRCP reconnects.
 - **G. OTA push + chainloader** (O1, O2, A11) — then run H7b.
   1. After the Prep card swap, the GPIO UART shows `chainboot slot A ...` and the app
      boots; the chain-booted app still starts its decode core (no `CPU core N does not
@@ -342,10 +374,13 @@ this is the prioritized list for the first hardware session. Format:
   3000 px cover decode (still synchronous in the UI loop; ~0.5-1.5 s stall expected);
   a `cover.jpg` over 3000 px falls back to `folder.jpg`; tags and art flags look right
   for real store downloads.
-- **Known limitation (not fixed): Circle's 64-bit clock overflows after ~95 h.** With
+- **Fixed in code: Circle's 64-bit clock overflowed after ~95 h.** With
   `USE_PHYSICAL_COUNTER` (always on for the Pi 4), Step51's `CTimer::GetClockTicks64()`
   computes `CNTPCT * 1000000 / CNTFRQ` in u64, which overflows at the Pi 4's 54 MHz
-  after ~94.9 h of uptime: the µs clock jumps back to ~0. BTstack timers pending at
-  that moment stall once, and `StreamActivity` / the AA input timestamps see the same
-  jump. The fix belongs in Circle (a `scripts/patches` patch computing
-  `(cnt / frq) * 1000000 + (cnt % frq) * 1000000 / frq`).
+  after ~94.9 h of uptime and jumps back to ~0. carsh now reads `CNTPCT_EL0` /
+  `CNTFRQ_EL0` itself (`device/CircleClock.h`) and converts as `(cnt / frq) * 1000000
+  + (cnt % frq) * 1000000 / frq` (host-tested past the overflow point) for every
+  timestamp and interval it takes: touch and AA input stamps, the media session,
+  BTstack's `hal_time_ms`, the AA link supervisor and the diagnostic timers. Bench:
+  nothing to see short of a > 95 h soak (optional); A.5 and F.7 cover the 72-min
+  mark.

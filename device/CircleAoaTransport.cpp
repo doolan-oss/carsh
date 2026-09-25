@@ -6,7 +6,6 @@
 #include <circle/devicenameservice.h>
 #include <circle/logger.h>
 #include <circle/numberpool.h>
-#include <circle/timer.h>
 #include <circle/usb/usb.h>  // REQUEST_*, DESCRIPTOR_ENDPOINT, descriptors
 #include <circle/usb/usbdevice.h>
 #include <circle/usb/usbhcidevice.h>  // CUSBHCIDevice (= CXHCIDevice on the Pi 4)
@@ -14,6 +13,7 @@
 
 #include <cstring>
 
+#include "CircleClock.h"  // clockUs32(): wrap-safe interval timing
 #include "aa/AaTypes.h"  // kUsbTransferSize
 
 namespace carsh::device {
@@ -302,9 +302,9 @@ int CAndroidAutoDevice::write(const uint8_t* data, size_t len, uint32_t /*timeou
         // Own the URB (instead of host->Transfer) — same submit shape + default
         // timeout (USB_TIMEOUT_NONE) as CUSBHostController::Transfer.
         CUSBRequest urb(m_pBulkOut, m_pOutBuffer, chunk);
-        const unsigned t0 = CTimer::GetClockTicks();
+        const uint32_t t0 = clockUs32();
         if (!host->SubmitBlockingRequest(&urb)) {
-            m_lastOutBlockedMs = (CTimer::GetClockTicks() - t0) / 1000;
+            m_lastOutBlockedMs = (clockUs32() - t0) / 1000;
             m_link.onOutFailed();
             return -1;
         }

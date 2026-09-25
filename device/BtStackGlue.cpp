@@ -174,15 +174,19 @@ void sbcPcmHandler(int16_t* data, int numFrames, int numChannels, int sampleRate
 }
 
 // The connected phone's AVRCP session ended (LinkTracker: its AVRCP was released
-// or its link dropped). Clear its metadata and publish the cleared state, so the
-// kernel's copy does not keep the old title with playing=true. That would let
-// Now Playing hand itself to Bluetooth on the next connect with the previous
-// track. Drop its absolute volume as well: without AVRCP the phone scales its own
-// PCM again.
+// or its link dropped). Forget its metadata and tell the app with its own signal,
+// NOT an empty metadata: the app would read that as AVRCP reporting "paused" and
+// keep treating AVRCP as authoritative while A2DP may still be playing. The app
+// drops its copy and falls back to A2DP activity.
+//
+// The absolute volume is kept. A phone in absolute-volume mode keeps sending
+// full-scale PCM after an AVRCP-only release (AOSP keeps the A2DP device's
+// absolute-volume behaviour), so resetting to unity here would jump the loudness
+// by up to ~58 dB mid-song. It is reset when the link drops (onDisconnected) and
+// when the phone's next AVRCP connection comes up (CONNECTION_ESTABLISHED).
 void endAvrcpSession() {
     g_nowPlaying.resetAll();
-    g_absVolume.reset();
-    if (g_owner) g_owner->deliverMetadata(g_nowPlaying.metadata());
+    if (g_owner) g_owner->deliverAvrcpEnded();
 }
 
 // A2DP media payload -> SBC decoder. Strip the AVDTP media header first: a 12-byte
@@ -593,6 +597,7 @@ bool btGlueInit(CircleBluetooth* owner) {
         if (g_owner) g_owner->deliverConnected(a);
     };
     linkCb.onDisconnected = [](const carsh::bt::BdAddr&) {
+        g_absVolume.reset();  // that phone's volume goes with its link
         if (g_owner) g_owner->deliverDisconnected();
     };
     linkCb.onConnectFailed = [](const carsh::bt::BdAddr& a, int reason) {

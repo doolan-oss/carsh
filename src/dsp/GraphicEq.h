@@ -15,8 +15,11 @@ namespace carsh::dsp {
 
 // Classic 10-band octave graphic EQ: peaking filters at the ISO octave centres
 // 31.5 Hz .. 16 kHz, flat (0 dB), Q = sqrt(2) (one octave wide, so neighbouring
-// bands overlap smoothly). 16 kHz stays below Nyquist at every rate the output runs
-// at (44.1 kHz and up).
+// bands overlap smoothly). The engine EQ is designed at the output's current rate
+// (the kernel calls EqProcessor::setSampleRate() whenever it reclocks the jack),
+// so each band acts at its labelled frequency. 16 kHz is below Nyquist at 44.1 kHz
+// and up; on lower-rate material (32 kHz and below) the top band can't exist and
+// is passed through (BiquadCoeffs::design).
 inline EqConfig defaultGraphicEq() {
     static constexpr double kCentresHz[] = {31.5, 63,   125,  250,  500,
                                             1000, 2000, 4000, 8000, 16000};

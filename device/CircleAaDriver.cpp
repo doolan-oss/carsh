@@ -3,13 +3,13 @@
 
 #include <circle/devicenameservice.h>
 #include <circle/logger.h>
-#include <circle/timer.h>
 #include <circle-mbedtls/threadingmodule.h>  // installs mbedTLS THREADING_ALT mutex glue
 
 #include <cstring>
 
 #include "AaCryptoMbedTls.h"     // the mbedTLS-backed IAaCrypto (rung 4b)
 #include "CircleAoaTransport.h"  // CAndroidAutoDevice (the IAaTransport behind uaa1)
+#include "CircleClock.h"         // clockUs(): monotonic, no ~95 h overflow
 
 namespace carsh::device {
 namespace {
@@ -57,9 +57,11 @@ int CircleAaDriver::rngEntropy(void* ctx, unsigned char* buf, size_t len) {
 }
 
 CircleAaDriver::~CircleAaDriver() {
-    // Run() is returning (the OTA reboot path): free the session quietly — the UI the
-    // projection hooks drive is being torn down too — and stop watching the transport
-    // so its later removal can't call back into a dead driver.
+    // Not reached today: the driver is a local in CKernel::Run(), whose UI loop never
+    // exits (an OTA push reboots from inside the loop, review A11). Should the owner
+    // ever unwind, free the session quietly — the UI the projection hooks drive is
+    // being torn down too — and stop watching the transport so its later removal
+    // can't call back into a dead driver.
     endSession(false);
     unwatchTransport();
 }
@@ -288,7 +290,11 @@ void CircleAaDriver::forceReenumerate() {
 }
 
 void CircleAaDriver::tick() {
-    const uint64_t nowMs = CTimer::GetClockTicks64() / 1000;
+    // The link supervisor subtracts these (grace period, re-enumeration timeout), so
+    // the clock must never step back: Circle's GetClockTicks64() restarts near 0
+    // after ~94.9 h of uptime, which would end a grace period at once and report a
+    // forced dongle lost immediately.
+    const uint64_t nowMs = clockUs() / 1000;
 
     // 1. The bound transport was destroyed (unplug, the dongle's own re-cycle, or our
     //    forced re-enumeration): the session it carried, if any, is over. Logged every

@@ -100,8 +100,12 @@ Adds large heap buckets to Circle's `HEAP_BLOCK_BUCKET_SIZES` in `sysconfig.h`:
 list when its size equals a bucket. With the stock list, whose largest bucket is
 0x80000, every freed malloc/new block over 512 KiB was lost for good; cover-art
 decodes, tag buffers, vector regrowth and per-session buffers slowly used up HEAP_LOW
-this way (review L1). The hunk is independent of `sysconfig-multicore.patch` and
-applies before or after it. Like that patch, it needs a full libcircle rebuild:
+this way (review L1). The app refuses to build without it: `device/kernel.cpp`
+`static_assert`s that the largest `HEAP_BLOCK_BUCKET_SIZES` entry is at least
+0x8000000 (the check reads the header, so a patched header over a stale
+`libcircle.a` still needs the rebuild below). The hunk is independent of
+`sysconfig-multicore.patch` and applies before or after it. Like that patch, it
+needs a full libcircle rebuild:
 ```sh
 patch -p1 -d third_party/circle-stdlib/libs/circle < scripts/patches/sysconfig-heap-buckets.patch
 ( cd third_party/circle-stdlib/libs/circle && ./makeall clean && ./makeall -j$(nproc) )

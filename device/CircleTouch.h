@@ -38,6 +38,7 @@
 #include <atomic>
 #include <cstdint>
 
+#include "CircleClock.h"
 #include "hal/Touch.h"
 #include "hal/TouchRing.h"
 
@@ -83,8 +84,9 @@ public:
         return true;
     }
 
-    // Capture time (64-bit µs, CTimer::GetClockTicks64) of the event the last
-    // successful poll() returned — the AA input channel's event timestamp.
+    // Capture time (µs, device::clockUs(): monotonic, no ~95 h overflow) of the
+    // event the last successful poll() returned — the AA input channel's event
+    // timestamp.
     uint64_t lastEventUs() const { return lastUs_; }
 
     // Events the ring refused under backlog (diagnostics).
@@ -111,7 +113,7 @@ private:
         CircleTouch* self = s_self.load(std::memory_order_acquire);
         if (self == nullptr) return;
         carsh::hal::StampedTouch s;
-        s.us = CTimer::GetClockTicks64();
+        s.us = clockUs();
         s.ev.id = int(nID);
         s.ev.x = int(nPosX);
         s.ev.y = int(nPosY);
