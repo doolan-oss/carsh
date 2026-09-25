@@ -46,9 +46,21 @@ enum class AvrcpPlayStatus : uint8_t {
 
 class NowPlayingAssembler {
 public:
-    // Clear all fields. Call on track-changed and when a new now-playing query
-    // begins, so stale title/artist don't bleed across tracks.
-    void reset() { md_ = AvrcpMetadata{}; }
+    // New track: clear the track's attributes (title/artist/album/duration) so
+    // stale values don't bleed across tracks, but KEEP the playback status. It is
+    // a separate notification the phone does not resend on a track change: an
+    // auto-advance while playing is still playing. (Clearing it on every
+    // TRACK_CHANGED — BTstack emits that for the connect-time INTERIM too, right
+    // after the PLAYING status — published "paused" while the phone played, and
+    // the play/pause key then sent PLAY to a playing phone. Review finding B4.)
+    void resetTrack() {
+        const bool playing = md_.playing;
+        md_ = AvrcpMetadata{};
+        md_.playing = playing;
+    }
+
+    // Clear everything, playback status included: the AVRCP connection is gone.
+    void resetAll() { md_ = AvrcpMetadata{}; }
 
     // Feed one media attribute. `value` is NOT NUL-terminated (length-delimited,
     // as AVRCP delivers it). Unknown ids are ignored. The playing flag is owned

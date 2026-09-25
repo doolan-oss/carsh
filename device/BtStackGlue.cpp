@@ -288,7 +288,7 @@ void avrcpPacketHandler(uint8_t type, uint16_t, uint8_t* packet, uint16_t) {
         case AVRCP_SUBEVENT_CONNECTION_RELEASED: {
             uint16_t cid = avrcp_subevent_connection_released_get_avrcp_cid(packet);
             CLogger::Get()->Write(FromBt, LogNotice, "AVRCP: released (cid 0x%04x)", cid);
-            if (cid == g_link.avrcpCid()) g_nowPlaying.reset();
+            if (cid == g_link.avrcpCid()) g_nowPlaying.resetAll();
             g_link.avrcpReleased(cid);
             break;
         }
@@ -318,9 +318,10 @@ void avrcpControllerPacketHandler(uint8_t type, uint16_t, uint8_t* packet, uint1
     using carsh::bt::AvrcpAttr;
     switch (hci_event_avrcp_meta_get_subevent_code(packet)) {
         case AVRCP_SUBEVENT_NOTIFICATION_TRACK_CHANGED:
-            // New track: drop the previous track's attributes and re-query this
-            // track's metadata (the fresh attributes arrive via the subevents below).
-            g_nowPlaying.reset();
+            // New track: drop the previous track's attributes (the playback status
+            // stays — the phone does not resend it on a track change) and re-query
+            // this track's metadata (it arrives via the subevents below).
+            g_nowPlaying.resetTrack();
             avrcp_controller_get_now_playing_info(cid);
             break;
         // Now-playing attributes arrive one subevent at a time; accumulate them
