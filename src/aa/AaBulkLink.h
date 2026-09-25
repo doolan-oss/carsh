@@ -111,6 +111,38 @@ public:
         return static_cast<int>(n);
     }
 
+    // A new AA session (a fresh AaMessenger + AaConnection) is about to start reading
+    // this link — call it BEFORE that session sends its VERSION_REQUEST. The first
+    // session on a link keeps whatever is buffered (nothing, in practice: the phone
+    // speaks only after our VERSION_REQUEST), so the proven first-session path is
+    // untouched. A later session on the SAME link (the driver re-binding a transport
+    // Circle could not remove) must not parse the previous session's leftovers — a
+    // half frame or stale TLS records would desync its framing from the first byte —
+    // so everything buffered is discarded (discardBuffered()). Returns the bytes
+    // discarded. Task context (the consumer) only.
+    size_t beginSession() {
+        if (sessions_++ == 0) return 0;
+        return discardBuffered();
+    }
+
+    // Consumer-side flush: drop every byte the producer has published so far. IRQ-safe
+    // with the existing SPSC discipline and no URB bookkeeping — it is exactly a read()
+    // of everything into the void: only the consumer-owned head_ moves (to the tail it
+    // acquired), and the release store hands the space back to the producer. Bytes the
+    // producer publishes after the tail snapshot are kept, in order: a bulk-IN request
+    // already posted can't be recalled, so this cleans the ring up to "now", not the
+    // pipe. Returns the bytes dropped (0 on an empty ring). Never clears the fault
+    // latch: a dead link stays dead (read()/write() keep returning -1).
+    size_t discardBuffered() {
+        const size_t head = head_.load(std::memory_order_relaxed);  // consumer-owned
+        const size_t tail = tail_.load(std::memory_order_acquire);
+        head_.store(tail, std::memory_order_release);
+        return (tail - head) & kMask;
+    }
+
+    // Sessions begun on this link (beginSession calls) — for the driver's log.
+    unsigned sessions() const { return sessions_; }
+
     // Bulk-OUT bookkeeping (task context). write() must check writable() first and
     // never submit on a dead link.
     bool writable() const { return !dead(); }
@@ -149,6 +181,7 @@ private:
     std::atomic<uint8_t> fault_{0};
     std::atomic<uint32_t> rxBytes_{0};  // bytes accepted into the ring
     std::atomic<uint32_t> txBytes_{0};  // bytes the bulk-OUT pipe confirmed sent
+    unsigned sessions_ = 0;             // consumer-owned (task context only)
 };
 
 }  // namespace carsh::aa

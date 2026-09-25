@@ -29,6 +29,18 @@ const char* stateName(carsh::aa::AaState s) {
     return "?";
 }
 
+// Why the connection entered AaState::Shutdown (AaConnection::shutdownReason()).
+const char* shutdownReasonName(carsh::aa::AaShutdownReason r) {
+    using R = carsh::aa::AaShutdownReason;
+    switch (r) {
+        case R::None: return "none";
+        case R::PhoneRequest: return "phone exit (SHUTDOWN_REQUEST)";
+        case R::VersionRejected: return "version rejected";
+        case R::CryptoFailure: return "TLS failure";
+    }
+    return "?";
+}
+
 }  // namespace
 
 int CircleAaDriver::rngEntropy(void* ctx, unsigned char* buf, size_t len) {
@@ -101,6 +113,10 @@ void CircleAaDriver::bind(CAndroidAutoDevice* aa) {
     removedHandle_ = aa->RegisterRemovedHandler(&CircleAaDriver::transportRemoved, this);
     faultLogged_ = false;
     sup_.onTransportBound();
+    // Before the new messenger reads anything or the VERSION_REQUEST goes out: on a
+    // transport that already carried a session (forceReenumerate's fallback re-binds
+    // one Circle could not remove), drop the old session's bytes still in the RX ring.
+    const unsigned stale = aa->beginSession();
 
     // circle-mbedtls is built MBEDTLS_THREADING_C + MBEDTLS_THREADING_ALT, so
     // mbedTLS's mutex callbacks MUST be installed (mbedtls_threading_set_alt)
@@ -138,8 +154,11 @@ void CircleAaDriver::bind(CAndroidAutoDevice* aa) {
                                   "channel msg ch=%u id=%04x len=%u", (unsigned)c,
                                   (unsigned)id, (unsigned)n);
         };
-        cbs.onShutdown = [] {
-            CLogger::Get()->Write(From, LogNotice, "phone requested shutdown");
+        cbs.onShutdown = [this] {
+            CLogger::Get()->Write(From, LogNotice, "connection shut down: %s",
+                                  conn_ != nullptr
+                                      ? shutdownReasonName(conn_->shutdownReason())
+                                      : "?");
         };
     }
     // Diagnostic: log every received frame (esp. in the Running phase) on the
@@ -155,7 +174,14 @@ void CircleAaDriver::bind(CAndroidAutoDevice* aa) {
     };
     conn_ = new carsh::aa::AaConnection(*msger_, *crypto_, cbs);
     if (projection_ != nullptr) projection_->setConnection(conn_);
-    CLogger::Get()->Write(From, LogNotice, "uaa1 bound — sending VERSION_REQUEST");
+    if (aa->sessions() > 1) {
+        CLogger::Get()->Write(From, LogWarning,
+                              "uaa1 re-bound (same transport, session %u; discarded %u "
+                              "stale RX bytes) — sending VERSION_REQUEST",
+                              aa->sessions(), stale);
+    } else {
+        CLogger::Get()->Write(From, LogNotice, "uaa1 bound — sending VERSION_REQUEST");
+    }
     conn_->start();
     lastState_ = static_cast<int>(conn_->state());
 }
@@ -192,10 +218,22 @@ void CircleAaDriver::forceReenumerate() {
     // On success aa is deleted inside this call; transportRemoved() has already
     // cleared bound_ and flagged transportGone_ (tick() consumes it next time).
     if (!aoaForceReenumerate(aa)) {
-        // Circle couldn't remove it: stop watching this instance. The next tick binds
-        // it again: its link is still dead, so that session ends at once and the
-        // bounded retry continues (a healthy link after a Shutdown gets a fresh
-        // VERSION_REQUEST instead — a soft restart).
+        // Circle couldn't remove it (the hub refused CLEAR_FEATURE(PORT_ENABLE)), so
+        // this transport still exists. Stop watching it; the next tick binds the SAME
+        // instance again as a new session, and the attempt stays counted in the budget.
+        //  * Dead link (the usual case here — including an RX ring that overflowed
+        //    while nobody read it during the grace period): that session ends at once
+        //    and the removal is retried after the next grace period, at most maxForced
+        //    times in a row, then "AA link lost — replug dongle".
+        //  * Live link (a version reject or TLS failure left the pipe healthy): a
+        //    best-effort retry on the same accessory connection, NOT a clean restart.
+        //    bind() discards what the old session left in the RX ring, but a bulk-IN
+        //    request already posted can still deliver old-session bytes (they then
+        //    fail the new session, most likely as a TLS failure, and the bounded retry
+        //    continues), and whether the dongle answers a second VERSION_REQUEST on
+        //    one accessory connection is untested. If nothing answers, the session
+        //    waits in VersionExchange — as with a dongle that has no phone — until the
+        //    dongle re-cycles, the link faults, or it is replugged.
         unwatchTransport();
         sup_.onTransportGone();
     }
@@ -255,8 +293,11 @@ void CircleAaDriver::tick() {
         const bool heartbeat = (++ticks_ % 60 == 0);
         if (changed) {
             lastState_ = st;
-            CLogger::Get()->Write(From, LogNotice, "state -> %s (tx=%u rx=%u bytes)",
-                                  stateName(conn_->state()), bound_ ? bound_->txBytes() : 0,
+            const bool down = conn_->state() == carsh::aa::AaState::Shutdown;
+            CLogger::Get()->Write(From, LogNotice, "state -> %s%s%s (tx=%u rx=%u bytes)",
+                                  stateName(conn_->state()), down ? ": " : "",
+                                  down ? shutdownReasonName(conn_->shutdownReason()) : "",
+                                  bound_ ? bound_->txBytes() : 0,
                                   bound_ ? bound_->rxBytes() : 0);
         } else if (heartbeat && bound_ != nullptr) {
             // Transport-health heartbeat: tx/rx plus the bulk-pipe state, so a stall
@@ -280,19 +321,31 @@ void CircleAaDriver::tick() {
         }
     }
 
-    // 6. Session end + recovery policy (AaLinkSupervisor, host-tested).
+    // 6. Session end + recovery policy (AaLinkSupervisor, host-tested). The shutdown
+    //    reason matters: a phone Exit ends the session without forcing anything.
     using Action = carsh::aa::AaLinkSupervisor::Action;
-    const bool shutdown = conn_ != nullptr && conn_->state() == carsh::aa::AaState::Shutdown;
+    using Cause = carsh::aa::AaLinkSupervisor::EndCause;
+    const carsh::aa::AaShutdownReason shutdown =
+        conn_ != nullptr ? conn_->shutdownReason() : carsh::aa::AaShutdownReason::None;
     const bool running = conn_ != nullptr && conn_->state() == carsh::aa::AaState::Running;
     switch (sup_.update(nowMs, linkDead, shutdown, running)) {
         case Action::None:
             break;
         case Action::EndSession:
-            CLogger::Get()->Write(From, LogWarning, "session ended (%s) — tearing down; "
-                                  "waiting %u ms for the dongle to re-cycle",
-                                  linkDead ? carsh::aa::aaLinkFaultName(fault)
-                                           : "connection shut down",
-                                  static_cast<unsigned>(sup_.config().graceMs));
+            if (sup_.endCause() == Cause::PhoneExit) {
+                CLogger::Get()->Write(From, LogNotice,
+                                      "session ended (%s) — tearing down; no forced "
+                                      "re-enumeration (the dongle re-cycles when the phone "
+                                      "leaves; replug it if AA does not come back)",
+                                      shutdownReasonName(shutdown));
+            } else {
+                CLogger::Get()->Write(From, LogWarning, "session ended (%s) — tearing down; "
+                                      "waiting %u ms for the dongle to re-cycle",
+                                      sup_.endCause() == Cause::LinkDead
+                                          ? carsh::aa::aaLinkFaultName(fault)
+                                          : shutdownReasonName(shutdown),
+                                      static_cast<unsigned>(sup_.config().graceMs));
+            }
             endSession(true);
             break;
         case Action::ForceReenumerate:
