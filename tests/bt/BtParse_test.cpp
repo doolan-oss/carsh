@@ -69,19 +69,44 @@ TEST(BtParse, DurationParseIsDefensive) {
     CHECK_EQ(a.metadata().durationMs, uint32_t(0xFFFFFFFF));
 }
 
-TEST(BtParse, ResetClearsStaleFieldsAcrossTracks) {
+TEST(BtParse, ResetTrackClearsStaleFieldsAcrossTracks) {
     NowPlayingAssembler a;
     attr(a, AvrcpAttr::Title, "Old Title");
     attr(a, AvrcpAttr::Artist, "Old Artist");
-    a.setPlaybackStatus(uint8_t(bt::AvrcpPlayStatus::Playing));
-    a.reset();
+    attr(a, AvrcpAttr::PlayingTimeMs, "330000");
+    a.resetTrack();
     CHECK(!a.hasText());
-    CHECK(!a.metadata().playing);
     CHECK_EQ(a.metadata().title, std::string(""));
+    CHECK_EQ(a.metadata().durationMs, uint32_t(0));
     // New track sets only the title; artist must NOT carry over from the old one.
     attr(a, AvrcpAttr::Title, "New Title");
     CHECK_EQ(a.metadata().title, std::string("New Title"));
     CHECK_EQ(a.metadata().artist, std::string(""));
+}
+
+TEST(BtParse, PlaybackStatusSurvivesTrackChange) {
+    // B4: the connect-time sequence BTstack delivers is PLAYBACK_STATUS(INTERIM,
+    // PLAYING) then TRACK_CHANGED(INTERIM); likewise an auto-advance while playing
+    // sends TRACK_CHANGED with no new status. The track reset must not turn a
+    // playing phone into "paused" (which made the play/pause key send PLAY).
+    NowPlayingAssembler a;
+    a.setPlaybackStatus(uint8_t(bt::AvrcpPlayStatus::Playing));
+    a.resetTrack();
+    attr(a, AvrcpAttr::Title, "Teardrop");
+    CHECK(a.metadata().playing);
+    a.setPlaybackStatus(uint8_t(bt::AvrcpPlayStatus::Paused));
+    a.resetTrack();
+    CHECK(!a.metadata().playing);
+}
+
+TEST(BtParse, ResetAllClearsPlaybackStatusToo) {
+    // AVRCP connection released: nothing about the old session may linger.
+    NowPlayingAssembler a;
+    attr(a, AvrcpAttr::Title, "Old Title");
+    a.setPlaybackStatus(uint8_t(bt::AvrcpPlayStatus::Playing));
+    a.resetAll();
+    CHECK(!a.hasText());
+    CHECK(!a.metadata().playing);
 }
 
 TEST(BtParse, UnknownAttributeIdsAreIgnored) {
