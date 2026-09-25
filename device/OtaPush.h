@@ -8,7 +8,11 @@
 //
 // Status is reported as "ota-push: ..." log lines on the same USB-C serial the
 // host script (scripts/carsh_ota.py) is already reading; the strings here are
-// its protocol, keep them in sync.
+// its protocol, keep them in sync. The per-packet flow-control acks
+// ("ota-push: ack <seq>", PushProtocol.h kAckLogFormat) are logged by the
+// CircleUsbLog task as it drains the gadget, not by poll(): the UI loop runs
+// too rarely to pace a multi-MB transfer. A "recv failed" line makes the host
+// restart the transfer from BEGIN (carsh_ota.py --retries).
 //
 // Health confirmation is dev-loop pragmatic: reaching CKernel::Run() with
 // storage up counts as healthy (confirmBootHealthy below). The user-confirmed
