@@ -16,9 +16,9 @@
 
 namespace carsh::bt {
 
-// Milliseconds since boot, in BTstack's hal_time_ms() format, from a 64-bit
-// microsecond count (e.g. Circle's CTimer::GetClockTicks64()). Truncating to
-// 32 bits gives exactly the full-range uint32 wrap that BTstack assumes.
+// Milliseconds since boot, in BTstack's hal_time_ms() format, from a continuous
+// 64-bit microsecond count (device::clockUs() on the Pi). Truncating to 32 bits
+// gives exactly the full-range uint32 wrap that BTstack assumes.
 constexpr uint32_t btstackTimeMs(uint64_t micros) {
     return static_cast<uint32_t>(micros / 1000u);
 }

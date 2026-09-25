@@ -570,7 +570,7 @@ pending). The trigger itself is still unexplained. Also video frame-drop-when-be
 
 ## Review-fix branch — 2026-09-25 (`claude/review-fixes`; host + device build only)
 
-A full code review, then fixes. All host-tested (449 host tests) and cross-built in
+A full code review, then fixes. All host-tested (469 host tests) and cross-built in
 all six device variants; **nothing here has run on the Pi** — the bench checklist is
 `HARDWARE_TODO.md` H9. AA-relevant results:
 - **AA touch and media keys had never reached the phone.** `sendTouch` put
@@ -588,4 +588,15 @@ all six device variants; **nothing here has run on the Pi** — the bench checkl
   `AaProjection::disconnect()` resets the AA tab. The mic channel is answered (no
   uplink), PingResponse echoes the int64 timestamp, reassembly is capped at 1 MiB, and
   the OTA reboot no longer destroys the decoder under the decode core.
-- **Now Playing:** AA stays the session owner while paused, so '>' resumes it.
+- **Now Playing:** AA stays the session owner while paused, so '>' resumes it. AA
+  has no play-status channel and carsh opens only the MEDIA audio channel, so
+  guidance and system sounds most likely arrive as media audio too (unverified): AA
+  takes the session (and pauses a playing USB track) only after
+  `MediaSession::kTakeoverMs` (6 s) of unbroken media audio; a prompt plays over the
+  local track and leaves it playing. The jack runs at 48 kHz while AA audio is
+  actually output (its jitter buffer engaged) or AA owns the session, not whenever
+  the AA ring holds data.
+- **Timestamps:** touch and key stamps come from carsh's own counter clock
+  (`device::clockUs`); Circle's `GetClockTicks64()` overflowed after ~94.9 h and
+  would have frozen them behind the monotonic clamp. The OUT level meter is no
+  longer drawn over the video.

@@ -50,6 +50,9 @@ public:
     void simulateMetadata(const carsh::bt::AvrcpMetadata& m) {
         if (cb_.onMetadata) cb_.onMetadata(m);
     }
+    void simulateAvrcpEnded() {
+        if (cb_.onAvrcpEnded) cb_.onAvrcpEnded();
+    }
     void simulateA2dpPcm(const float* pcm, std::size_t frames, uint8_t ch) {
         if (cb_.onA2dpPcm) cb_.onA2dpPcm(pcm, frames, ch);
     }

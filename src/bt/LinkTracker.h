@@ -26,8 +26,8 @@
 //  - Disconnection Complete only counts when its status is success and its handle
 //    is a tracked link (a failed HCI_Disconnect, or BTstack's synthetic event for
 //    an unknown handle, changes nothing).
-//  - The connected phone's AVRCP session (its now-playing metadata and absolute
-//    volume) ends exactly once: when that AVRCP connection is released or when
+//  - The connected phone's AVRCP session (its now-playing metadata and play
+//    status) ends exactly once: when that AVRCP connection is released or when
 //    the phone's link drops with AVRCP still up, whichever BTstack reports first.
 #pragma once
 
@@ -54,10 +54,11 @@ public:
         std::function<void(const BdAddr&)> onConnected;
         std::function<void(const BdAddr&)> onDisconnected;
         std::function<void(const BdAddr&, int reason)> onConnectFailed;
-        // The connected phone's AVRCP session is over. Its metadata and absolute
-        // volume no longer apply, so the glue resets and republishes them.
-        // Otherwise a stale title and playing=true would stick. On a link drop this
-        // fires before onDisconnected.
+        // The connected phone's AVRCP session is over: its metadata and play
+        // status no longer apply, so the glue drops them and tells the app
+        // (IBluetooth onAvrcpEnded), which falls back to A2DP activity. Otherwise
+        // a stale title and PLAYING/PAUSED would stick. On a link drop this fires
+        // before onDisconnected.
         std::function<void(const BdAddr&)> onAvrcpSessionEnded;
     };
     void setCallbacks(Callbacks cb) { cb_ = std::move(cb); }

@@ -41,6 +41,9 @@ public:
     void deliverMetadata(const carsh::bt::AvrcpMetadata& m) {
         if (cb_.onMetadata) cb_.onMetadata(m);
     }
+    void deliverAvrcpEnded() {
+        if (cb_.onAvrcpEnded) cb_.onAvrcpEnded();
+    }
     void deliverA2dpPcm(const float* pcm, unsigned frames, unsigned channels) {
         if (cb_.onA2dpPcm) cb_.onA2dpPcm(pcm, frames, (uint8_t)channels);
     }

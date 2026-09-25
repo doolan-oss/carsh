@@ -74,8 +74,10 @@ public:
     }
 
     // No absolute volume in force: a new AVRCP session, or the connected phone's
-    // session ended. Unity gain, because the phone scales its own PCM then. This is
-    // also the volume carsh reports in its VOLUME_CHANGED INTERIM.
+    // link dropped. Unity gain, because the phone scales its own PCM then. This is
+    // also the volume carsh reports in its VOLUME_CHANGED INTERIM. (An AVRCP-only
+    // release keeps the gain: the phone stays in absolute-volume mode for its
+    // A2DP stream.)
     void reset() { set(kMax); }
 
     uint8_t volume() const { return volume_; }

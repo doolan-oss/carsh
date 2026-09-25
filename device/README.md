@@ -17,8 +17,9 @@ export PATH=/opt/arm-toolchain/bin:$PATH
 cd ../third_party/circle-stdlib
 
 # 3. Before the first build: apply carsh's seven tracked Circle patches (see
-#    ../scripts/patches/README.md — without them the AA image doesn't compile,
-#    the dongle never binds and the chainloader doesn't build), then set a
+#    ../scripts/patches/README.md — without them no image builds (kernel.cpp
+#    checks for the heap-bucket patch), the AA image doesn't compile, the dongle
+#    never binds and the chainloader doesn't build), then set a
 #    non-zero USB Vendor ID for the USB-C serial-log gadget (the default 0x0000 is
 #    rejected by Circle's gadget driver; this one is a manual edit, not a patch).
 #    carsh uses the pid.codes open-source VID 0x1209 for development — replace
@@ -105,8 +106,9 @@ The app binds to `bt::IBluetooth`; `device/CircleBluetooth` implements it. All
 BTstack-specific code is in `device/BtStackGlue.cpp`, **gated behind
 `CARSH_HAVE_BTSTACK`** — the default build links a stub (no BT), so the rest of
 the image is unaffected. The kernel already wires the seam: connect → driver
-profile switch, AVRCP metadata → BT now-playing, decoded A2DP PCM → `g_btRing`,
-and a `CircleBtRunLoopTask` that pumps the BTstack run loop.
+profile switch, AVRCP metadata → BT now-playing (and `onAvrcpEnded` → back to A2DP
+activity when the phone's AVRCP session ends), decoded A2DP PCM → `g_btRing`, and a
+`CircleBtRunLoopTask` that pumps the BTstack run loop.
 
 ### Building it
 
@@ -122,8 +124,8 @@ three carsh files:
 
 - `btstack_config.h` — Classic-only A2DP-sink + AVRCP, embedded run loop, no
   BLE/mesh (small footprint).
-- `HalCircle.cpp` — the embedded HAL (`hal_time_ms` via `CTimer`, `hal_cpu_*`
-  via Circle critical sections).
+- `HalCircle.cpp` — the embedded HAL (`hal_time_ms` from carsh's counter clock,
+  `device/CircleClock.h`, `hal_cpu_*` via Circle critical sections).
 - `CircleHciTransport.cpp` — a `hci_transport_t` backed by Circle's
   `CUSBBluetoothDevice` (the stage-1 USB-dongle path).
 - `BtStackClassicShims.c` — the `hci_le_rand` command descriptor (BLE-gated

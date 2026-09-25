@@ -6,9 +6,12 @@
 // is told through IBluetooth's callbacks. No radio needed (H6).
 #include "bt/LinkTracker.h"
 
+#include <cstring>
+#include <string>
 #include <vector>
 
 #include "Test.h"
+#include "bt/AbsoluteVolume.h"
 #include "bt/NowPlaying.h"
 #include "player/MediaSession.h"
 #include "profile/ProfileManager.h"
@@ -410,34 +413,69 @@ TEST(LinkTracker, NoSessionEndWithoutAvrcpOrForASecondaryPhone) {
     CHECK_EQ(r.count('D'), 1);
 }
 
-TEST(LinkTracker, StaleNowPlayingDoesNotSurviveTheLinkDrop) {
-    // The glue's wiring (BtStackGlue.cpp endAvrcpSession): session end -> resetAll()
-    // -> publish. The kernel then feeds MediaSession with the published metadata,
-    // and a playing flag counts as "BT streaming".
-    LinkTracker t;
-    bt::NowPlayingAssembler np;
-    bt::AvrcpMetadata published;  // the kernel's g_btMeta
-    LinkTracker::Callbacks cb;
-    cb.onAvrcpSessionEnded = [&](const BdAddr&) {
-        np.resetAll();
-        published = np.metadata();
-    };
-    t.setCallbacks(cb);
+// The glue + kernel wiring around the session end, as the tests below model it:
+// BtStackGlue's endAvrcpSession() drops the assembled metadata and calls the app's
+// onAvrcpEnded (NOT an empty metadata: the kernel would read that as an AVRCP
+// report); the kernel then clears g_btMeta and g_btAvrcpReported, and feeds both to
+// MediaSession every frame. The absolute volume is reset only on a link drop
+// (onDisconnected) and when the connected phone's AVRCP (re)connects.
+namespace {
+struct GlueAndKernel {
+    bt::NowPlayingAssembler np;     // the glue's g_nowPlaying
+    bt::AbsoluteVolume vol;         // the glue's g_absVolume
+    bt::AvrcpMetadata meta;         // the kernel's g_btMeta
+    bool reported = false;          // the kernel's g_btAvrcpReported
 
-    phoneUpWithAvrcp(t, kPhone, 0x000B, 0x07);
-    const char title[] = "Old Song";
-    np.setAttribute(uint8_t(bt::AvrcpAttr::Title), title, sizeof(title) - 1);
-    np.setPlaybackStatus(uint8_t(bt::AvrcpPlayStatus::Playing));
-    published = np.metadata();
+    void attach(LinkTracker& t) {
+        LinkTracker::Callbacks cb;
+        cb.onConnected = [this](const BdAddr&) { meta = {}; reported = false; };
+        cb.onDisconnected = [this](const BdAddr&) {
+            vol.reset();
+            meta = {};
+            reported = false;
+        };
+        cb.onAvrcpSessionEnded = [this](const BdAddr&) {
+            np.resetAll();
+            meta = {};
+            reported = false;
+        };
+        t.setCallbacks(cb);
+    }
+    // AVRCP_SUBEVENT_CONNECTION_ESTABLISHED for the connected phone.
+    void avrcpUp(LinkTracker& t, uint16_t cid, const BdAddr& a) {
+        t.avrcpEstablished(0, cid, a);
+        if (cid == t.avrcpCid()) vol.reset();
+    }
+    // The phone reports over AVRCP (the kernel's onMetadata).
+    void report(const char* title, bool playing) {
+        np.setAttribute(uint8_t(bt::AvrcpAttr::Title), title, std::strlen(title));
+        np.setPlaybackStatus(uint8_t(playing ? bt::AvrcpPlayStatus::Playing
+                                             : bt::AvrcpPlayStatus::Paused));
+        meta = np.metadata();
+        reported = true;
+    }
+};
+}  // namespace
+
+TEST(LinkTracker, StaleNowPlayingDoesNotSurviveTheLinkDrop) {
+    LinkTracker t;
+    GlueAndKernel k;
+    k.attach(t);
+    t.aclConnectionComplete(0, 0x000B, kPhone);
+    t.a2dpSignalingEstablished(0, 0x41, kPhone);
+    t.a2dpStreamEstablished(0, kPhone);
+    k.avrcpUp(t, 0x07, kPhone);
+    k.report("Old Song", true);
 
     // The phone goes out of range while playing.
     t.aclDisconnectionComplete(0, 0x000B, kConnectionTimeout);
-    CHECK(!published.playing);
-    CHECK(published.title.empty());
+    CHECK(!k.meta.playing);
+    CHECK(k.meta.title.empty());
+    CHECK(!k.reported);
 
     // The user plays a local track, then the phone's link comes back (ACL only,
-    // AVRCP not up yet). A stale playing=true would count as BT streaming, take
-    // the session from the local track and pause it.
+    // AVRCP not up yet). A stale PLAYING would take the session from the local
+    // track and pause it.
     player::MediaSession session;
     player::MediaSession::LocalState local;
     local.hasTrack = true;
@@ -446,8 +484,53 @@ TEST(LinkTracker, StaleNowPlayingDoesNotSurviveTheLinkDrop) {
     session.setLocal(local);
     session.selectLocal();
     t.aclConnectionComplete(0, 0x000D, kPhone);
-    session.setBluetooth(t.connected(), published.playing, published);
+    session.setBluetooth(t.connected(), false, k.meta, k.reported, 1000000);
     CHECK(session.source() == player::Source::Local);
     CHECK(!session.shouldPauseLocal());
     CHECK_EQ(session.view().title, std::string("Local"));
+}
+
+// AVRCP alone is released while A2DP keeps streaming (final review): the kernel
+// must stop treating AVRCP as authoritative, so Now Playing shows '||' for the
+// music that is still playing instead of the last PAUSED/'>', and the phone's
+// absolute volume must stay in force (it keeps sending full-scale PCM).
+TEST(LinkTracker, AvrcpOnlyReleaseEndsTheReportButKeepsTheVolume) {
+    LinkTracker t;
+    GlueAndKernel k;
+    k.attach(t);
+    t.aclConnectionComplete(0, 0x000B, kPhone);
+    t.a2dpSignalingEstablished(0, 0x41, kPhone);
+    t.a2dpStreamEstablished(0, kPhone);
+    k.avrcpUp(t, 0x07, kPhone);
+    k.vol.set(40);  // SetAbsoluteVolume: ~31 %
+    const float gain = k.vol.gain();
+    CHECK(gain < 0.5f);
+
+    player::MediaSession session;
+    player::MediaSession::LocalState local;
+    local.hasTrack = true;
+    local.title = "Local";
+    session.setLocal(local);
+    uint64_t now = 1000000;
+    k.report("Phone Song", true);
+    session.setBluetooth(t.connected(), true, k.meta, k.reported, now);
+    CHECK(session.source() == player::Source::Bluetooth);
+    CHECK(session.view().playing);
+
+    t.avrcpReleased(0x07);  // AVRCP only: ACL and A2DP stay up, music plays on
+    CHECK(t.connected());
+    CHECK(!k.reported);
+    CHECK_EQ(k.vol.gain(), gain);
+    session.setBluetooth(t.connected(), true, k.meta, k.reported, now += 33000);
+    CHECK(session.source() == player::Source::Bluetooth);
+    CHECK(session.view().playing);  // '||' from the stream, not a stale '>'
+    CHECK(session.playPauseCommand() == bt::AvrcpCommand::Pause);
+
+    // AVRCP comes back: a new session starts from unity until the phone sets it.
+    k.avrcpUp(t, 0x08, kPhone);
+    CHECK_EQ(k.vol.gain(), 1.0f);
+    k.vol.set(40);
+    // The link drops: the volume goes with it.
+    t.aclDisconnectionComplete(0, 0x000B, kConnectionTimeout);
+    CHECK_EQ(k.vol.gain(), 1.0f);
 }
