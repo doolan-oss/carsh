@@ -218,7 +218,8 @@ the [[no-linux-bare-metal]] constraint. Plan:
   Constrained-Baseline, so a full profile isn't needed.
 - Keep the advertised **480p (800×480)** video config (we *own* the service-
   discovery video params, so we cap what the phone sends). Decode YUV → NEON
-  YUV→RGB → scale-blit into `contentRect()` (800×480 → 696×432, ~0.87×).
+  YUV→RGB → scale-blit into `contentRect()` (800×480 → 720×432 at (66,0) inside the
+  748×432 content rect, 0.9×).
 - **Measure on-target FPS first** — this is the one number that can force a
   fallback (lower fps in the video config, or split decode across both spare
   cores). 800×480 CB on an A72+NEON is feasible but tight; treat FPS as a gate.
@@ -258,9 +259,10 @@ Approach when Phase 4 lands:
    everything else stays standard chrome. The volume rail + tab bar that frame it
    are already **hw-validated** on the Pi 4, so this confines cleanly by design.
 2. **Resolution + scale.** AA video sizes are fixed standards (480p = 800×480,
-   720p, 1080p) — you can't request 696×432. Keep the already-advertised **480p**
+   720p, 1080p) — you can't request 748×432. Keep the already-advertised **480p**
    (service-discovery video config), decode 800×480, and **scale-blit** into the
-   696×432 content rect (~0.87×, a cheap, good-quality downscale). Map touches in
+   748×432 content rect (height-bound fit: 720×432 at (66,0), 0.9×, a cheap,
+   good-quality downscale). Map touches in
    the content rect back to 800×480 for the AA input channel (pure geometry —
    host-testable when wired).
 3. **Tie video focus to the active tab.** Send `VIDEO_FOCUS_INDICATION` FOCUSED
@@ -390,7 +392,10 @@ AV-setup → 3 s idle), which rules out a deterministic protocol bug — it's a
 timing-sensitive USB/xHCI issue. Tried and ruled out: **async bulk-OUT** (regressed
 response latency, reverted), **double-buffered bulk-IN** (2 URBs always posted — no
 change, kept), **IN endpoint recovery** (the dongle genuinely re-enumerates; removal is
-just detected ~1 s later by the next `UpdatePlugAndPlay`). The reference hit analogous
+just detected ~1 s later by the next `UpdatePlugAndPlay`) (2026-09-25 review A3: the
+carsh re-post path could never run — a halted xHCI endpoint never completes the second
+URB — and re-posting onto a halted ring does nothing; replaced by the dead-link latch +
+forced re-enumeration). The reference hit analogous
 "bulk issues" and solved them with **ESP-IDF-specific** USB-FIFO/pacing tweaks that don't
 translate to the Pi's xHCI.
 
@@ -493,16 +498,29 @@ at ~1 Hz so a slow-booting dongle is seen.
   `src/aa/AaProjection` ties the live `AaConnection` to the decoder, the AA tab, and
   audio: video media → `IH264Decoder::feed` → decoded frame → `AndroidAutoScreen::
   setFrame`; audio media → a PCM hook; channel-open/shutdown → `setConnected`;
-  content-rect touch → `sendTouch` (input channel); AA-tab focus → `sendVideoFocus`
+  raw touch (Press on down / Drag on move / Release on up) → `sendTouch` (input
+  channel); AA-tab focus → `sendVideoFocus`
   (`VIDEO_FOCUS_INDICATION`). Host-tested end to end with fakes
   (`tests/aa/AaProjection_test.cpp`). `CircleAaDriver` binds the projection to each
   connection across dongle cycles; `device/kernel.cpp` provides the real hooks +
   `CircleH264Decoder` (under `CARSH_HAVE_OPENH264`). *Remaining `[hw]`:* the live
   end-to-end projection on the board, and draining the AA audio ring to the jack with
   audio focus (rung 7). The device link itself is bench-only here (no toolchain).
-- [ ] **Phase 5 / rung 7** — polish: AV sync / flow-control tuning, audio focus +
-  draining AA PCM to the jack, disconnect/reconnect, raw touch (drag) streaming,
-  optional mic uplink.
+  (Both have run on the bench since 2026-06-29 — see the log below.)
+- [~] **Phase 5 / rung 7** — polish: AV sync / flow-control tuning, audio focus +
+  draining AA PCM to the jack (AA media audio plays on the bench since 2026-06-29),
+  and:
+  - [x] *raw touch (drag) streaming* — host-done 2026-09-25: the AA tab's raw path
+    (ScreenManager raw-touch opt-in) sends PRESS on down, DRAG per move, RELEASE on
+    up, from a 100 Hz touch pump with 64-bit capture timestamps; `sendTouch` now uses
+    the aasdk layout (the old encoding never reached the phone). Primary pointer only
+    — multi-pointer (POINTER_DOWN/UP + action_index) is future work. `[hw]`
+    HARDWARE_TODO H9 §A.
+  - [x] *disconnect/reconnect* — host-done 2026-09-25: `AaProjection::disconnect()`;
+    Shutdown on SHUTDOWN_REQUEST (acknowledged) or a TLS failure; `AaLinkSupervisor`
+    ends the session and re-enumerates the dongle if it doesn't re-cycle. `[hw]` H9 §B.
+  - [ ] *optional mic uplink* — the AV-input channel is answered (OK) but no uplink is
+    sent, so voice sessions time out on silence.
 
 The whole protocol spine — framing, protobuf, the full connection handshake, video
 NAL parsing — plus the AA UI surface and the USB-AOA transport scaffold now build
@@ -541,7 +559,33 @@ Result: `under` ≈ 1 brief blip / 4 s, `primes=1` (never collapses), `dropped=0
 real-time decode, video smooth. Residual = the dongle's wireless burstiness (only HU
 lever left is more buffer = more latency). Detail in `AA_AUDIO_INVESTIGATION.md`.
 
-**Still open (see `HARDWARE_TODO.md` H8):** the **intermittent xHCI `Transfer error 4`
-on the bulk-IN during the TLS handshake** that occasionally hard-hangs the board at
-startup ("AA doesn't start up stable"; recovers on power-cycle + dongle re-plug) — the
-top AA bug. And video frame-drop-when-behind (no policy yet).
+**Still open (see `HARDWARE_TODO.md` H8):** the intermittent xHCI `Transfer error 4`
+on the bulk-IN during the TLS handshake. Its board hard-hang was carsh's own ISR
+assert, fixed 2026-09-25: the error now ends the session and the dongle is
+re-cycled/re-enumerated automatically (`AaLinkSupervisor`, bench verification
+pending). The trigger itself is still unexplained. Also video frame-drop-when-behind
+(no policy yet).
+
+---
+
+## Review-fix branch — 2026-09-25 (`claude/review-fixes`; host + device build only)
+
+A full code review, then fixes. All host-tested (449 host tests) and cross-built in
+all six device variants; **nothing here has run on the Pi** — the bench checklist is
+`HARDWARE_TODO.md` H9. AA-relevant results:
+- **AA touch and media keys had never reached the phone.** `sendTouch` put
+  `touch_event` in field 2 (`disp_channel`, so the phone skipped it) with action and
+  action_index swapped, and media keys went out as field 3 (= `touch_event`). The
+  "hardware-validated `sendTouch`" in STATUS was never backed by a bench log. Now the
+  aasdk `InputEventIndication` layout (touch_event 3, button_event 4), golden-byte
+  tested, plus raw PRESS/DRAG/RELEASE streaming (rung 7 above).
+- **The H8 hang** was `GetResultLength()` on the failed bulk-IN URB — an assert inside
+  the xHCI ISR. Link faults now latch the transport dead (`AaBulkLink`) and
+  `AaLinkSupervisor` ends the session, gives the dongle 3 s to re-cycle, then forces a
+  re-enumeration (max 3). A phone Exit forces nothing.
+- **Session lifecycle:** SHUTDOWN_REQUEST acknowledged; a fatal TLS error (lost or
+  corrupted record) → Shutdown(CryptoFailure) instead of a silent wedge;
+  `AaProjection::disconnect()` resets the AA tab. The mic channel is answered (no
+  uplink), PingResponse echoes the int64 timestamp, reassembly is capped at 1 MiB, and
+  the OTA reboot no longer destroys the decoder under the decode core.
+- **Now Playing:** AA stays the session owner while paused, so '>' resumes it.

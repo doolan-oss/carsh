@@ -43,11 +43,15 @@ cmake -S . -B build && cmake --build build -j
 **Device image (cross-compiled, aarch64-none-elf bare metal):**
 ```sh
 export PATH=/opt/arm-toolchain/bin:$PATH           # the cross toolchain
-# one-time: scripts/fetch_circle.sh then build circle-stdlib (STDLIB_SUPPORT=4)
+# one-time: scripts/fetch_circle.sh, apply scripts/patches/ (+ the gadget VID edit),
+# then build circle-stdlib (./configure -r 4 -> STDLIB_SUPPORT=3) — device/README.md
 cd device && make                                   # -> device/kernel8-rpi4.img
 cd device && make CARSH_HAVE_BTSTACK=1              # variant with BTstack (A2DP) linked
+cd device && make CARSH_HAVE_OPENH264=1 CARSH_HAVE_BTSTACK=1  # the bench image (AA video + BT)
 ```
-Default `make` links a **stub** for Bluetooth; the rest of the image is real.
+Default `make` links a **stub** for Bluetooth and no H.264 decoder (the AA tab stays
+on its placeholder). `make clean` when switching variants — the Makefile doesn't
+track the `CARSH_*` flags.
 
 **mbedTLS (for the AA TLS work):** `cd third_party/circle-stdlib && make mbedtls`
 builds `libmbed{crypto,x509,tls}.a` + `libcircle-mbedtls.a` (bare-metal config +
@@ -58,11 +62,16 @@ entropy via Circle's hardware RNG).
 `third_party/circle-stdlib/` is git-ignored, so local edits to it are tracked as
 patches under `scripts/patches/` and **must be re-applied after a fresh checkout**
 (see `scripts/patches/README.md`). Current patches: a USB Bluetooth ACL path, an
-Android-Auto USB factory hook, a USB hub reconfigure fix, and **`sysconfig-multicore`
-(enables `ARM_ALLOW_MULTI_CORE`)**. After patching, rebuild the affected lib (e.g.
+Android-Auto USB factory hook, a USB hub reconfigure fix, **`sysconfig-multicore`
+(enables `ARM_ALLOW_MULTI_CORE`)**, **`sysconfig-heap-buckets`** (freed >512 KiB heap
+blocks get reused), `chainboot-multicore` (lets the A/B chainloader chain-boot from
+the multi-core libcircle) and `usbcdcgadget-rx-overrun` (a full CDC RX ring no longer
+asserts in the USB IRQ). Plus one manual edit that is **not** a patch:
+`USB_GADGET_VENDOR_ID 0x1209` in `sysconfig.h` (`device/README.md` step 3) — without
+it there is no `/dev/ttyACM0`. After patching, rebuild the affected lib (e.g.
 `cd third_party/circle-stdlib/libs/circle/lib/usb && make`) then relink the image —
-**except the multicore patch, which needs a full `libcircle` rebuild** (see the bench
-loop above).
+**except the two sysconfig patches, which need a full `libcircle` rebuild** (see the
+multi-core note below).
 
 ## The bench loop (hardware iteration)
 
@@ -71,7 +80,7 @@ console** (a CDC-ACM gadget on the dwc2 port → `/dev/ttyACM0` on the dev host)
 loop, with the card in a USB reader as `/dev/sda1` (label `CARSHBOOT`):
 ```sh
 udisksctl mount -b /dev/sda1
-cp device/kernel8-rpi4.img /run/media/$USER/CARSHBOOT/ && sync
+cp device/kernel8-rpi4.img /run/media/$USER/CARSHBOOT/ && sync   # A/B card: -> kernel8-A.img
 udisksctl unmount -b /dev/sda1
 # move card to the Pi, power on; capture the console (survives power-cycles):
 python3 scripts/bench_capture.py bench.log &   # run in background, re-attaches on reboot
@@ -80,7 +89,11 @@ python3 scripts/bench_capture.py bench.log &   # run in background, re-attaches 
 `device/chainloader/README.md`):** `scripts/carsh_ota.py flash` pushes the freshly
 built image over the same USB-C console; the kernel verifies + stages it to the
 inactive slot and reboots through the chainloader (bad image = automatic rollback,
-3 tries). One-time setup: `carsh_ota.py keygen` then rebuild. `[hw]`-pending: H7b.
+3 tries). One-time setup: `carsh_ota.py keygen` then rebuild. The push is
+flow-controlled by `ota-push: ack` lines on the console: stop `bench_capture.py` first
+(the script refuses otherwise) and use `carsh_ota.py flash --log bench.log`. Kernels
+from before 2026-09-25 don't ack, so the first such image goes on by card swap.
+`[hw]`-pending: H7b/H9.
 
 Bare metal has no remote shell — **route diagnostics to the serial log and iterate**.
 The USB-C console is brought up before the USB host in `kernel.cpp` so enumeration
@@ -93,10 +106,10 @@ logs are captured. Batch your logging up-front; each flash is a manual card swap
 
 > **Multi-core (since 2026-06-29):** AA H.264 decode runs on a dedicated A72 core, so
 > circle is now built with **`ARM_ALLOW_MULTI_CORE`** (`scripts/patches/sysconfig-multicore.patch`).
-> After a fresh `scripts/fetch_circle.sh` you MUST re-apply that patch and **rebuild all
+> After a fresh `scripts/fetch_circle.sh` you MUST re-apply the patches and **rebuild all
 > of libcircle** (`cd third_party/circle-stdlib/libs/circle && ./makeall clean && ./makeall -j`),
-> not just one dir — it changes the MMU (inner-shareable cacheable, which makes the
-> cross-core SPSC handoffs coherent) + the secondary-core spin-up.
+> not just one dir — the multicore patch changes the MMU (inner-shareable cacheable,
+> which makes the cross-core SPSC handoffs coherent) + the secondary-core spin-up.
 
 ## Current focus: wireless Android Auto via a USB dongle
 
@@ -111,6 +124,11 @@ parse) is host-tested and merged. Bring-up status (full log in `AA_PLAN.md`):
   version → **live TLS** (real aasdk cert in `AaHuCert.h`) → service discovery →
   channels → **H.264 video + media audio both play.** AA media is also wired into the
   player UI (Now Playing source badge + transport keys; see `player::MediaSession`).
+- **AA input (2026-09-25, `claude/review-fixes`, host-done, bench pending):** touch and
+  media keys had never reached the phone (wrong `InputEventIndication` field numbers).
+  They now use the aasdk layout (touch_event 3, button_event 4), the AA tab streams
+  raw PRESS/DRAG/RELEASE from a 100 Hz touch pump, and Now Playing keeps a paused AA
+  session so '>' resumes it. Bench checklist: `HARDWARE_TODO.md` H9.
 - **Choppy audio: fixed (2026-06-29, "good enough" on the bench; PR #24 branch
   `claude/aa-decode-core`).** Decode moved to a **dedicated A72 core**
   (`CircleAaDecodeCore` + `ARM_ALLOW_MULTI_CORE`), frames cross to the UI core via a
@@ -121,10 +139,12 @@ parse) is host-tested and merged. Bring-up status (full log in `AA_PLAN.md`):
   quick-resume for the dongle's bursty WiFi audio delivery. Full story in
   `AA_AUDIO_INVESTIGATION.md`.
 - **Open / next:** the **intermittent xHCI `Transfer error 4` on the bulk-IN during
-  the TLS handshake** — non-deterministic; sometimes hard-hangs the board at startup
-  ("AA doesn't start up stable"), recovers on a power-cycle + dongle re-plug. This is
-  the top AA bug to chase (see `HARDWARE_TODO.md` H8). Also: video can lag under heavy
-  motion (no frame-drop policy; audio was prioritised).
+  the TLS handshake** — non-deterministic. The board hard-hang it caused was carsh's
+  own `GetResultLength()` assert inside the xHCI ISR (fixed 2026-09-25): a link fault
+  now ends the session and the dongle is re-cycled, or force-re-enumerated,
+  automatically. Still to do: bench-verify that, and find the trigger (see
+  `HARDWARE_TODO.md` H8). Also: video can lag under heavy motion (no frame-drop
+  policy; audio was prioritised).
 
 When picking up: read `AA_PLAN.md` (plan + bench log), `AA_AUDIO_INVESTIGATION.md`
 (the audio fix), and `STATUS.md` (module state).
