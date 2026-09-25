@@ -1,0 +1,24 @@
+--- a/include/circle/sysconfig.h
++++ b/include/circle/sysconfig.h
+@@ -84,8 +84,20 @@
+ // separated list of increasing bucket sizes. All sizes must be a
+ // multiple of 64. Up to 20 sizes can be defined.
+ 
++// carsh: add large buckets (768 KiB .. 128 MiB, ~1.5x steps, 2x above 16 MiB) so
++// a freed big block goes back on a free list and is reused. With the stock list
++// (largest 0x80000) every freed block > 512 KiB is lost for good, and carsh frees
++// such blocks routinely (cover-art decode, growing std::vectors, per-session AA
++// buffers), so HEAP_LOW slowly ran out. malloc() and operator new
++// (STDLIB_SUPPORT>=3 routes new through newlib malloc) both use this allocator.
++// Uses all 20 buckets (HEAP_BLOCK_MAX_BUCKETS); the small buckets are unchanged,
++// and only large requests walk past them.
++// Tracked: scripts/patches/sysconfig-heap-buckets.patch
+ #ifndef HEAP_BLOCK_BUCKET_SIZES
+-#define HEAP_BLOCK_BUCKET_SIZES	0x40,0x400,0x1000,0x4000,0x10000,0x40000,0x80000
++#define HEAP_BLOCK_BUCKET_SIZES	0x40,0x400,0x1000,0x4000,0x10000,0x40000,0x80000, \
++				0xC0000,0x100000,0x180000,0x200000,0x300000,0x400000, \
++				0x600000,0x800000,0xC00000,0x1000000,0x2000000,0x4000000, \
++				0x8000000
+ #endif
+ 
+ ///////////////////////////////////////////////////////////////////////
