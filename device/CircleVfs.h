@@ -78,6 +78,22 @@ public:
         return true;
     }
 
+    bool writeFile(const std::string& path, const std::uint8_t* data,
+                   std::size_t len) override {
+        const std::string fat = toFat(path);
+        // Best-effort: create the parent directory (e.g. SD:/carsh) if absent.
+        auto slash = fat.find_last_of('/');
+        if (slash != std::string::npos && slash > drive_.size())
+            f_mkdir(fat.substr(0, slash).c_str());  // FR_EXIST is fine
+        FIL fil{};
+        if (f_open(&fil, fat.c_str(), FA_WRITE | FA_CREATE_ALWAYS) != FR_OK)
+            return false;
+        UINT bw = 0;
+        FRESULT r = len ? f_write(&fil, data, UINT(len), &bw) : FR_OK;
+        f_close(&fil);
+        return r == FR_OK && bw == len;
+    }
+
 private:
     std::string toFat(const std::string& logical) const {
         if (logical.empty() || logical == "/") return drive_ + "/";

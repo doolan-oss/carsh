@@ -86,6 +86,15 @@ public:
         return true;
     }
 
+    bool writeFile(const std::string& path, const std::uint8_t* data,
+                   std::size_t len) override {
+        FILE* f = std::fopen(realPath(path).c_str(), "wb");
+        if (!f) return false;
+        std::size_t w = len ? std::fwrite(data, 1, len, f) : 0;
+        std::fclose(f);
+        return w == len;
+    }
+
     const std::string& mountRoot() const { return root_; }
 
 private:
