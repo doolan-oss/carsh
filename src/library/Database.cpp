@@ -219,6 +219,29 @@ std::vector<std::string> Database::artists() const {
     return out;
 }
 
+std::vector<uint64_t> Database::byArtist(const std::string& albumArtist) const {
+    const std::string key = normalize(albumArtist);
+    std::vector<uint32_t> idx;
+    for (uint32_t i : sortOrder_)
+        if (normalize(strings_.get(tracks_[i].albumArtistRef)) == key) idx.push_back(i);
+    return idsFromSortedIndices(idx);
+}
+
+std::vector<Database::AlbumEntry> Database::albumsByArtist(
+    const std::string& albumArtist) const {
+    const std::string key = normalize(albumArtist);
+    std::vector<AlbumEntry> out;
+    std::unordered_map<uint64_t, bool> seen;
+    for (uint32_t i : sortOrder_) {
+        const Track& t = tracks_[i];
+        if (normalize(strings_.get(t.albumArtistRef)) != key) continue;
+        if (seen.emplace(t.albumKey, true).second)
+            out.push_back({t.albumKey, strings_.get(t.albumRef),
+                           strings_.get(t.albumArtistRef)});
+    }
+    return out;
+}
+
 // --- Persistence ------------------------------------------------------------
 // Layout: ["CDB1"][u32 trackCount][Track[] raw][u32 stringsLen][strings blob].
 // Track is POD; we copy it byte-for-byte (host is little-endian; the Pi 4 is too,
