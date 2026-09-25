@@ -23,10 +23,14 @@
 //     a stream the app just paused can't grab the session straight back. The
 //     returned PauseRequest names the remotes the app should pause.
 //   * With nothing latched: Android Auto if it's connected and there's no local
-//     track, else Bluetooth under the same rule, else the local player.
+//     track, else Bluetooth under the same rule, else the local player. This
+//     fallback only picks what Now Playing shows; it never pauses the local player.
 // Transport (play/pause/next/prev) routes to the owner: AA media keys over the input
-// channel, AVRCP to the BT phone, or the local player. While a remote owns the
-// session the local player must not play underneath it (shouldPauseLocal()).
+// channel, AVRCP to the BT phone, or the local player. While a remote has TAKEN the
+// session (latched) the local player must not play underneath it
+// (shouldPauseLocal()). The BT phone's '>' / '||' (and so its play/pause command)
+// follows AVRCP once AVRCP has reported on the connection; its A2DP stream stands in
+// only for a phone that never reports.
 #pragma once
 
 #include <cstdint>
@@ -104,10 +108,29 @@ public:
     void setLocal(const LocalState& s) { local_ = s; }
     // connected: a phone is linked. streaming: it's actively producing audio
     // (A2DP PCM arriving, or AVRCP playback status == PLAYING). md: latest AVRCP.
-    void setBluetooth(bool connected, bool streaming, const carsh::bt::AvrcpMetadata& md) {
+    // avrcpReported: the phone's AVRCP has reported on THIS connection (a playback
+    // status or a track attribute arrived since it connected). From then on AVRCP's
+    // PLAYING/PAUSED alone decides the BT '>' / '||' and the play/pause command; a
+    // phone that never reports (no AVRCP) falls back to its A2DP stream. See
+    // btPlaying().
+    void setBluetooth(bool connected, bool streaming, const carsh::bt::AvrcpMetadata& md,
+                      bool avrcpReported) {
         bt_.update(connected, streaming);
         btMeta_ = md;
+        if (!connected)
+            avrcpSeen_ = false;  // a new connection must report again
+        else if (avrcpReported)
+            avrcpSeen_ = true;   // latched for the rest of this connection
         resolve();
+    }
+    // Same, for a caller without a report flag: AVRCP counts as having reported once
+    // md carries anything (PLAYING, a title/artist/album, or a duration). A phone
+    // whose only report so far is PAUSED/STOPPED with no track text is
+    // indistinguishable from one without AVRCP here; pass the flag to tell them apart.
+    void setBluetooth(bool connected, bool streaming, const carsh::bt::AvrcpMetadata& md) {
+        setBluetooth(connected, streaming, md,
+                     md.playing || !md.title.empty() || !md.artist.empty() ||
+                         !md.album.empty() || md.durationMs != 0);
     }
     // connected: a projection session is up (AaProjection::connected()).
     // streaming: AA media audio is playing (media PCM arriving / the output engaged).
@@ -155,7 +178,7 @@ public:
             v.album = btMeta_.album;
             v.durationMs = btMeta_.durationMs;
             v.positionMs = 0;  // AVRCP play position not tracked yet (no BT scrub)
-            v.playing = btMeta_.playing;
+            v.playing = btPlaying();
         } else if (local_.hasTrack) {
             v.title = local_.title;
             v.artist = local_.artist;
@@ -173,16 +196,22 @@ public:
     // Where a transport intent should go right now.
     Source transportTarget() const { return source(); }
 
-    // A remote source owns the session but the local player is still playing
-    // underneath it (the remote just took over): the app must pause the local
-    // player. It is only ever resumed by an explicit local action.
-    bool shouldPauseLocal() const { return source() != Source::Local && local_.playing; }
+    // A remote source has TAKEN the session (it started playing and is latched)
+    // but the local player is still playing underneath it: the app must pause the
+    // local player. It is only ever resumed by an explicit local action. The
+    // unlatched fallback (no local track + a phone connected) never pauses local:
+    // nothing was started there, and a local player that is Playing without a
+    // track row must not be paused again every frame.
+    bool shouldPauseLocal() const {
+        return latched_ != Source::Local && source() == latched_ && local_.playing;
+    }
 
     // Convenience for a play/pause toggle: the AVRCP command to send when BT is the
-    // target (Play when currently paused/stopped, Pause when playing).
+    // target (Play when currently paused/stopped, Pause when playing). Matches the
+    // view's '>' / '||' for the BT source.
     carsh::bt::AvrcpCommand playPauseCommand() const {
-        return btMeta_.playing ? carsh::bt::AvrcpCommand::Pause
-                               : carsh::bt::AvrcpCommand::Play;
+        return btPlaying() ? carsh::bt::AvrcpCommand::Pause
+                           : carsh::bt::AvrcpCommand::Play;
     }
 
 private:
@@ -205,6 +234,16 @@ private:
         }
     };
 
+    // The BT phone is playing, for '>' / '||' and the play/pause command. Once AVRCP
+    // has reported on this connection it is authoritative: A2DP keeps delivering PCM
+    // for a while after a pause (the kernel's 800 ms activity hold, plus the silence
+    // an Android phone keeps streaming until its A2DP output goes to standby, ~3 s),
+    // and other phone audio (a navigation prompt) streams while the media app is
+    // paused. Letting that stream override AVRCP PAUSED would show '||' and send
+    // PAUSE to a paused phone, so "pause, then resume" would do nothing. Only a phone
+    // that has never reported (no AVRCP) falls back to its A2DP stream.
+    bool btPlaying() const { return avrcpSeen_ ? btMeta_.playing : bt_.streaming; }
+
     void resolve() {
         // A remote that is playing takes (or keeps) the session; AA outranks BT.
         // With neither active the latch holds, so a paused remote stays the owner.
@@ -223,6 +262,7 @@ private:
     Remote aa_;
     Source latched_ = Source::Local;  // Local = nothing latched / local selected
     carsh::bt::AvrcpMetadata btMeta_;
+    bool avrcpSeen_ = false;  // AVRCP has reported on the current BT connection
 };
 
 }  // namespace carsh::player

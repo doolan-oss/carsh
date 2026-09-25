@@ -98,6 +98,39 @@ TEST(TouchRing, BacklogShedsMovesButKeepsTransitions) {
     CHECK_EQ(last.us, std::uint64_t(1001));
 }
 
+// A Down/Up lost to a completely full ring is counted on its own and reported to
+// the consumer once (it must reset contact tracking that may wait for that Up);
+// shed Moves never raise it.
+TEST(TouchRing, LostTransitionsCountedSeparatelyFromShedMoves) {
+    TouchRing r;
+    CHECK(r.pushEvent(ev(TouchPhase::Down, 5, 5, 0)));
+    while (r.pushEvent(ev(TouchPhase::Move, 6, 5, 1))) {}
+    const std::uint32_t shed = r.dropped();
+    CHECK(shed >= std::uint32_t(1));
+    CHECK_EQ(r.droppedTransitions(), std::uint32_t(0));
+    CHECK(!r.lostTransitionSinceLastCheck());
+
+    // Fill the reserved slots with transitions; the next one is lost.
+    while (r.size() < TouchRing::capacity())
+        CHECK(r.pushEvent(ev(TouchPhase::Down, 7, 7, 2, 1)));
+    CHECK(!r.pushEvent(ev(TouchPhase::Up, 0, 0, 3)));
+    CHECK(!r.pushEvent(ev(TouchPhase::Move, 8, 8, 4)));  // a shed Move: not a transition
+    CHECK_EQ(r.droppedTransitions(), std::uint32_t(1));
+    CHECK_EQ(r.dropped(), shed + 2);                     // the total counts both
+    CHECK(r.lostTransitionSinceLastCheck());
+    CHECK(!r.lostTransitionSinceLastCheck());            // once per loss
+
+    // Space again, then two more losses between checks: reported once.
+    StampedTouch o;
+    REQUIRE(r.pop(o));
+    CHECK(r.pushEvent(ev(TouchPhase::Up, 0, 0, 5)));
+    CHECK(!r.pushEvent(ev(TouchPhase::Down, 9, 9, 6)));
+    CHECK(!r.pushEvent(ev(TouchPhase::Up, 0, 0, 7)));
+    CHECK_EQ(r.droppedTransitions(), std::uint32_t(3));
+    CHECK(r.lostTransitionSinceLastCheck());
+    CHECK(!r.lostTransitionSinceLastCheck());
+}
+
 // A real concurrent producer/consumer: every event arrives once, in order.
 TEST(TouchRing, ConcurrentProducerConsumerKeepsOrder) {
     static SpscRing<uint32_t, 64> r;  // static: keep the big test object off the stack

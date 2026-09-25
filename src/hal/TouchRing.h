@@ -19,7 +19,10 @@
 // full (fewer than kReserve free slots) further Moves are dropped — a later Move or
 // the Up supersedes them — so the reserved slots stay free for the Down/Up events
 // that start and end a contact. Only a completely full ring drops a Down/Up. Drops
-// are counted for the diagnostics log.
+// are counted for the diagnostics log, and a lost Down/Up is also counted on its
+// own: a consumer that tracks contacts (ScreenManager's primary-contact latch) may
+// be left waiting for an Up that never comes, so it checks
+// lostTransitionSinceLastCheck() after each drain and resets its contact state.
 #pragma once
 
 #include <array>
@@ -38,6 +41,10 @@ struct StampedTouch {
     TouchEvent ev;
     std::uint64_t us = 0;
 };
+// TouchEvent (20 bytes) + padding + the 8-byte stamp; keeps the TouchRing size
+// comment below honest.
+static_assert(sizeof(StampedTouch) == 32,
+              "StampedTouch size changed: update the TouchRing size comment");
 
 // Generic lock-free single-producer/single-consumer ring of trivially copyable T.
 template <typename T, std::size_t N>
@@ -91,8 +98,8 @@ private:
     std::atomic<std::uint32_t> dropped_{0};
 };
 
-// The touch queue: 128 events (~2.5 KiB) is > 1 s of a single finger's Moves at the
-// 100 Hz pump rate, far more than one UI frame's worth.
+// The touch queue: 128 events (32 bytes each, ~4 KiB) is > 1 s of a single
+// finger's Moves at the 100 Hz pump rate, far more than one UI frame's worth.
 class TouchRing : public SpscRing<StampedTouch, 128> {
 public:
     // Free slots kept for Down/Up once the ring is backed up (see the header).
@@ -100,12 +107,38 @@ public:
 
     // Producer only (the driver pump). Applies the backlog policy.
     bool pushEvent(const StampedTouch& e) {
-        if (e.ev.phase == TouchPhase::Move && size() >= capacity() - kReserve) {
-            countDrop();
-            return false;
+        if (e.ev.phase == TouchPhase::Move) {
+            if (size() >= capacity() - kReserve) {
+                countDrop();
+                return false;
+            }
+            return push(e);
         }
-        return push(e);
+        if (push(e)) return true;
+        // A Down/Up lost to a completely full ring (push() counted it in dropped()).
+        droppedTransitions_.fetch_add(1, std::memory_order_relaxed);
+        return false;
     }
+
+    // Down/Up events refused so far (any thread; a subset of dropped()).
+    std::uint32_t droppedTransitions() const {
+        return droppedTransitions_.load(std::memory_order_relaxed);
+    }
+
+    // Consumer only: true if a Down/Up has been dropped since the previous call.
+    // Call it after draining: every event queued before the drop was valid and has
+    // been delivered, so the consumer can then reset per-contact state that may be
+    // waiting for the lost Up.
+    bool lostTransitionSinceLastCheck() {
+        const std::uint32_t n = droppedTransitions();
+        if (n == seenTransitionDrops_) return false;
+        seenTransitionDrops_ = n;
+        return true;
+    }
+
+private:
+    std::atomic<std::uint32_t> droppedTransitions_{0};  // producer writes
+    std::uint32_t seenTransitionDrops_ = 0;              // consumer only
 };
 
 }  // namespace carsh::hal

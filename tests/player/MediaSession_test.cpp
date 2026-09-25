@@ -112,9 +112,132 @@ TEST(MediaSession, TransportTargetAndPlayPauseCommand) {
     CHECK(s.transportTarget() == Source::Bluetooth);
     CHECK(s.playPauseCommand() == carsh::bt::AvrcpCommand::Pause);
 
-    // BT paused -> toggle should PLAY.
+    // BT paused -> toggle should PLAY, even while A2DP still delivers PCM (the
+    // kernel's activity hold + the phone's post-pause silence tail): AVRCP has
+    // reported, so its PAUSED wins over the stream.
     s.setBluetooth(true, true, btMeta("Phone Song", false));
+    CHECK(s.transportTarget() == Source::Bluetooth);
+    CHECK(!s.view().playing);
     CHECK(s.playPauseCommand() == carsh::bt::AvrcpCommand::Play);
+
+    // ...and once no PCM arrives either.
+    s.setBluetooth(true, false, btMeta("Phone Song", false));
+    CHECK(s.transportTarget() == Source::Bluetooth);  // still latched while paused
+    CHECK(s.playPauseCommand() == carsh::bt::AvrcpCommand::Play);
+}
+
+// "Pause, then resume a moment later" from the head unit, on an AVRCP phone that
+// keeps streaming A2DP after the pause (Android streams silence until its output
+// goes to standby, ~3 s). Every frame of that tail must show '>' and send PLAY.
+// A navigation prompt streaming while the media app is paused is the same case.
+TEST(MediaSession, AvrcpPauseWinsOverTrailingA2dpStream) {
+    MediaSession s;
+    s.setLocal(localTrack("Song A", false));
+    s.setBluetooth(true, true, btMeta("Phone Song", true));
+    CHECK(s.view().playing);
+    CHECK(s.playPauseCommand() == carsh::bt::AvrcpCommand::Pause);  // the user pauses
+
+    for (int frame = 0; frame < 5; ++frame) {  // AVRCP PAUSED, PCM still arriving
+        s.setBluetooth(true, true, btMeta("Phone Song", false));
+        CHECK(s.source() == Source::Bluetooth);
+        CHECK(!s.view().playing);
+        CHECK(s.playPauseCommand() == carsh::bt::AvrcpCommand::Play);  // resume works
+    }
+
+    // AVRCP authority survives a report that carries nothing (the flag latches for
+    // the connection), e.g. a status-only update after a track change cleared text.
+    s.setBluetooth(true, true, carsh::bt::AvrcpMetadata{});
+    CHECK(!s.view().playing);
+    CHECK(s.playPauseCommand() == carsh::bt::AvrcpCommand::Play);
+
+    // A phone that connects with its media app already paused (AVRCP reports the
+    // track, never PLAYING) while a navigation prompt streams: '>' and PLAY from
+    // the first frame. The track attributes alone count as an AVRCP report.
+    MediaSession n;
+    n.setLocal(localTrack("Song A", false));
+    carsh::bt::AvrcpMetadata titleOnly;
+    titleOnly.title = "Phone Song";
+    n.setBluetooth(true, true, titleOnly);
+    CHECK(n.source() == Source::Bluetooth);
+    CHECK(!n.view().playing);
+    CHECK(n.playPauseCommand() == carsh::bt::AvrcpCommand::Play);
+
+    // A PLAYING status before any track text (the status INTERIM arrives first)
+    // is a report too: the pause that follows wins over the stream's tail.
+    MediaSession p;
+    carsh::bt::AvrcpMetadata statusPlaying;
+    statusPlaying.playing = true;
+    p.setBluetooth(true, true, statusPlaying);
+    CHECK(p.view().playing);
+    p.setBluetooth(true, true, carsh::bt::AvrcpMetadata{});  // PAUSED, PCM tail
+    CHECK(!p.view().playing);
+    CHECK(p.playPauseCommand() == carsh::bt::AvrcpCommand::Play);
+}
+
+// A phone that has never reported over AVRCP on this connection (no AVRCP, so no
+// status and no title): its A2DP stream stands in for "playing", so Now Playing
+// shows '||' while it streams and '>' once it stops.
+TEST(MediaSession, BluetoothStreamWithoutAvrcpStatusIsPausable) {
+    MediaSession s;
+    s.setLocal(localTrack("Song A", false));
+    const carsh::bt::AvrcpMetadata none;  // nothing ever reported
+    s.setBluetooth(true, true, none);     // PCM arriving
+    CHECK(s.transportTarget() == Source::Bluetooth);
+    CHECK_EQ(s.view().title, std::string("Bluetooth"));
+    CHECK(s.view().playing);
+    CHECK(s.playPauseCommand() == carsh::bt::AvrcpCommand::Pause);
+    // The stream stops: '>' and PLAY.
+    s.setBluetooth(true, false, none);
+    CHECK(s.transportTarget() == Source::Bluetooth);
+    CHECK(!s.view().playing);
+    CHECK(s.playPauseCommand() == carsh::bt::AvrcpCommand::Play);
+
+    // AVRCP comes up and reports PLAYING: from now on it is authoritative.
+    s.setBluetooth(true, true, btMeta("Phone Song", true));
+    CHECK(s.view().playing);
+    s.setBluetooth(true, true, btMeta("Phone Song", false));  // paused, PCM tail
+    CHECK(!s.view().playing);
+    CHECK(s.playPauseCommand() == carsh::bt::AvrcpCommand::Play);
+
+    // A disconnect forgets it: the next connection (a phone without AVRCP) falls
+    // back to its stream again.
+    s.setBluetooth(false, false, none);
+    s.setBluetooth(true, true, none);
+    CHECK(s.view().playing);
+    CHECK(s.playPauseCommand() == carsh::bt::AvrcpCommand::Pause);
+}
+
+// With the explicit report flag (what the kernel passes: an AVRCP callback arrived
+// since this connection came up), a status-only report of PAUSED/STOPPED with no
+// track text still makes AVRCP authoritative, so other phone audio streaming while
+// no media plays shows '>' and the toggle sends PLAY. Without the flag the same
+// metadata can't be told apart from a phone without AVRCP.
+TEST(MediaSession, ExplicitAvrcpReportMakesStatusOnlyPauseAuthoritative) {
+    const carsh::bt::AvrcpMetadata pausedNoText;  // PAUSED, no attributes yet
+
+    MediaSession s;
+    s.setLocal(localTrack("Song A", false));
+    s.setBluetooth(true, true, pausedNoText, /*avrcpReported=*/true);  // nav prompt
+    CHECK(s.source() == Source::Bluetooth);
+    CHECK(!s.view().playing);
+    CHECK(s.playPauseCommand() == carsh::bt::AvrcpCommand::Play);
+    s.setBluetooth(true, true, pausedNoText, true);
+    CHECK(!s.view().playing);
+
+    MediaSession n;  // not reported: the stream stands in
+    n.setLocal(localTrack("Song A", false));
+    n.setBluetooth(true, true, pausedNoText, /*avrcpReported=*/false);
+    CHECK(n.view().playing);
+    CHECK(n.playPauseCommand() == carsh::bt::AvrcpCommand::Pause);
+    // The flag latches for the connection: a later frame without it (the caller's
+    // own flag is per-connection too) keeps AVRCP authoritative...
+    n.setBluetooth(true, true, pausedNoText, true);
+    n.setBluetooth(true, true, pausedNoText, false);
+    CHECK(!n.view().playing);
+    // ...until the phone disconnects.
+    n.setBluetooth(false, false, pausedNoText, false);
+    n.setBluetooth(true, true, pausedNoText, false);
+    CHECK(n.view().playing);
 }
 
 // --- Latched ownership (review A2 / P4) --------------------------------------
@@ -273,8 +396,10 @@ TEST(MediaSession, ConnectedAndroidAutoShownWithNoLocalTrack) {
     CHECK(s.source() == Source::Local);
 }
 
-// The last source to START playing wins, whichever it is.
-TEST(MediaSession, LastRemoteToStartWins) {
+// A remote that STARTS playing takes the session from a paused (latched) owner,
+// whichever it is. But while both actually stream, AA outranks BT regardless of
+// which started last (it outranks A2DP in the audio mix too).
+TEST(MediaSession, StartingRemoteTakesPausedSessionButAaOutranksStreamingBt) {
     MediaSession s;
     s.setAndroidAuto(true, true);
     s.setAndroidAuto(true, false);            // AA paused (latched)
@@ -284,6 +409,45 @@ TEST(MediaSession, LastRemoteToStartWins) {
     CHECK(s.source() == Source::Bluetooth);   // BT paused, still latched
     s.setAndroidAuto(true, true);
     CHECK(s.source() == Source::AndroidAuto);
+
+    // BT starts while AA is still streaming: BT started last, AA keeps it.
+    s.setBluetooth(true, true, btMeta("Phone Song", true));
+    CHECK(s.source() == Source::AndroidAuto);
+    CHECK(s.transportTarget() == Source::AndroidAuto);
+    s.setAndroidAuto(true, true);             // next frame: both still streaming
+    CHECK(s.source() == Source::AndroidAuto);
+    // AA pauses; BT is still streaming, so it is what's audible: BT takes over.
+    s.setAndroidAuto(true, false);
+    CHECK(s.source() == Source::Bluetooth);
+}
+
+// shouldPauseLocal() is about a remote TAKING the session, not the unlatched
+// fallback: with no local track row and a phone merely connected, Now Playing
+// shows the phone, but a local player that is Playing (its queue entry missing
+// from the library) must not be paused every frame.
+TEST(MediaSession, UnlatchedFallbackNeverPausesLocal) {
+    MediaSession::LocalState playingNoRow;  // hasTrack = false
+    playingNoRow.playing = true;
+
+    MediaSession a;
+    a.setLocal(playingNoRow);
+    a.setAndroidAuto(true, false);            // connected, idle
+    CHECK(a.source() == Source::AndroidAuto);  // shown via the fallback
+    CHECK(!a.shouldPauseLocal());
+    a.setAndroidAuto(true, true);             // AA media starts: it takes over
+    CHECK(a.shouldPauseLocal());
+
+    MediaSession b;
+    b.setLocal(playingNoRow);
+    b.setBluetooth(true, false, btMeta("Phone Song", false));
+    CHECK(b.source() == Source::Bluetooth);
+    CHECK(!b.shouldPauseLocal());
+    b.setBluetooth(true, true, btMeta("Phone Song", true));
+    CHECK(b.shouldPauseLocal());
+    // The owner disconnects: the latch drops and local is left alone again.
+    b.setBluetooth(false, false, btMeta("", false));
+    CHECK(b.source() == Source::Local);
+    CHECK(!b.shouldPauseLocal());
 }
 
 // --- StreamActivity ------------------------------------------------------------
