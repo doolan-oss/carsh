@@ -33,8 +33,9 @@ uint32_t btGlueA2dpSampleRate() { return 0; }
 // commands/events plus the ACL bulk path added by
 // scripts/patches/usbbluetooth-acl.patch).
 #include "CircleHciTransport.h"
-#include "bt/LinkTracker.h"  // platform-independent connection bookkeeping
-#include "bt/NowPlaying.h"   // platform-independent AVRCP metadata assembly
+#include "bt/AbsoluteVolume.h"  // platform-independent AVRCP absolute volume -> gain
+#include "bt/LinkTracker.h"     // platform-independent connection bookkeeping
+#include "bt/NowPlaying.h"      // platform-independent AVRCP metadata assembly
 
 #include <circle/logger.h>  // bench bring-up diagnostics over the serial log
 #include <cstddef>
@@ -111,6 +112,12 @@ uint8_t g_localSeid = 0;
 // (host-tested in tests/bt/BtParse_test).
 carsh::bt::NowPlayingAssembler g_nowPlaying;
 
+// The connected phone's AVRCP absolute volume, applied as a gain to its decoded
+// A2DP PCM (see bt/AbsoluteVolume.h for why carsh implements it). Unity unless the
+// phone uses absolute volume. It is set from the TG handler and applied in
+// sbcPcmHandler; both run in the BTstack run-loop task, so no locking is needed.
+carsh::bt::AbsoluteVolume g_absVolume;
+
 // SBC -> PCM decoder for the A2DP media payload (bluedroid).
 const btstack_sbc_decoder_t* g_sbcDecoder = nullptr;
 btstack_sbc_decoder_bluedroid_t g_sbcContext;
@@ -153,16 +160,29 @@ carsh::bt::BdAddr toBdAddr(const uint8_t* a) {
     return out;
 }
 
-// SBC decoder callback: interleaved int16 PCM -> float, forwarded to the engine
-// ring via the owner. The jitter buffer + clock-drift SRC (R12) live downstream.
+// SBC decoder callback: interleaved int16 PCM -> float with the phone's absolute
+// volume applied, forwarded to the engine ring via the owner. The HU master gain,
+// the jitter buffer and the clock-drift SRC (R12) live downstream.
 void sbcPcmHandler(int16_t* data, int numFrames, int numChannels, int sampleRate,
                    void* /*ctx*/) {
     g_btSampleRate = static_cast<uint32_t>(sampleRate);
     if (!g_owner) return;
     const int n = numFrames * numChannels;
     if (n <= 0 || n > (int)(sizeof(g_pcmFloat) / sizeof(g_pcmFloat[0]))) return;
-    for (int i = 0; i < n; ++i) g_pcmFloat[i] = data[i] * (1.0f / 32768.0f);
+    g_absVolume.apply(data, g_pcmFloat, (std::size_t)numFrames, (unsigned)numChannels);
     g_owner->deliverA2dpPcm(g_pcmFloat, (unsigned)numFrames, (unsigned)numChannels);
+}
+
+// The connected phone's AVRCP session ended (LinkTracker: its AVRCP was released
+// or its link dropped). Clear its metadata and publish the cleared state, so the
+// kernel's copy does not keep the old title with playing=true. That would let
+// Now Playing hand itself to Bluetooth on the next connect with the previous
+// track. Drop its absolute volume as well: without AVRCP the phone scales its own
+// PCM again.
+void endAvrcpSession() {
+    g_nowPlaying.resetAll();
+    g_absVolume.reset();
+    if (g_owner) g_owner->deliverMetadata(g_nowPlaying.metadata());
 }
 
 // A2DP media payload -> SBC decoder. Strip the AVDTP media header first: a 12-byte
@@ -275,7 +295,16 @@ void avrcpPacketHandler(uint8_t type, uint16_t, uint8_t* packet, uint16_t) {
             }
             CLogger::Get()->Write(FromBt, LogNotice, "AVRCP: connected to %s (cid 0x%04x)",
                                   bd_addr_to_str(addr), cid);
+            // Target side: absolute volume. Declare VOLUME_CHANGED in GetCapabilities
+            // (as a2dp_sink_demo.c does) and start the TG's volume at 0x7F, which
+            // matches the unity gain. BTstack answers RegisterNotification(
+            // VOLUME_CHANGED) with this value whatever we declare, and a fresh
+            // connection holds 0, so a phone would otherwise be told "volume 0".
+            // Nothing is sent here: no notification is registered yet.
+            avrcp_target_support_event(cid, AVRCP_NOTIFICATION_EVENT_VOLUME_CHANGED);
+            avrcp_target_volume_changed(cid, carsh::bt::AbsoluteVolume::kMax);
             if (cid != g_link.avrcpCid()) break;  // not the connected phone's AVRCP
+            g_absVolume.reset();  // no absolute volume until the phone sets one
             // Subscribe to playback-status + track-changed notifications and pull the
             // current track's attributes, so the now-playing subevents below start
             // arriving and refresh on every change. Without this the controller is
@@ -290,7 +319,7 @@ void avrcpPacketHandler(uint8_t type, uint16_t, uint8_t* packet, uint16_t) {
         case AVRCP_SUBEVENT_CONNECTION_RELEASED: {
             uint16_t cid = avrcp_subevent_connection_released_get_avrcp_cid(packet);
             CLogger::Get()->Write(FromBt, LogNotice, "AVRCP: released (cid 0x%04x)", cid);
-            if (cid == g_link.avrcpCid()) g_nowPlaying.resetAll();
+            // The connected phone's -> onAvrcpSessionEnded -> endAvrcpSession().
             g_link.avrcpReleased(cid);
             break;
         }
@@ -369,11 +398,11 @@ void avrcpControllerPacketHandler(uint8_t type, uint16_t, uint8_t* packet, uint1
 }
 
 // AVRCP target events (avrcp_target_register_packet_handler): the phone acting as
-// controller toward carsh. carsh's TG is a Category-2 monitor/amplifier and does
-// not advertise absolute volume (no avrcp_target_support_event), so phones keep
-// scaling their own volume and carsh's volume rail stays the one master. BTstack
-// asserts on a missing handler for any of these, so it must exist even though
-// there is little to do.
+// controller toward carsh. carsh's TG is a Category-2 monitor/amplifier and
+// implements absolute volume. The phone's SetAbsoluteVolume becomes a gain on its
+// A2DP PCM (bt/AbsoluteVolume.h explains why, instead of not advertising it). The
+// HU volume rail still applies after it, as the master. BTstack asserts on a
+// missing handler for any of these, so this handler must be registered.
 void avrcpTargetPacketHandler(uint8_t type, uint16_t, uint8_t* packet, uint16_t) {
     if (type != HCI_EVENT_PACKET) return;
     if (hci_event_packet_get_type(packet) != HCI_EVENT_AVRCP_META) return;
@@ -385,12 +414,27 @@ void avrcpTargetPacketHandler(uint8_t type, uint16_t, uint8_t* packet, uint16_t)
             avrcp_target_play_status(avrcp_subevent_play_status_query_get_avrcp_cid(packet),
                                      0xFFFFFFFFu, 0xFFFFFFFFu, AVRCP_PLAYBACK_STATUS_STOPPED);
             break;
-        case AVRCP_SUBEVENT_NOTIFICATION_VOLUME_CHANGED:
-            // SetAbsoluteVolume (BTstack has already accepted it). Logged only.
-            CLogger::Get()->Write(
-                FromBt, LogDebug, "AVRCP TG: phone set absolute volume %u",
-                avrcp_subevent_notification_volume_changed_get_absolute_volume(packet));
+        case AVRCP_SUBEVENT_NOTIFICATION_VOLUME_CHANGED: {
+            // SetAbsoluteVolume. BTstack has already stored the value as the TG's
+            // volume, so later VOLUME_CHANGED INTERIMs report it, and accepted it.
+            // The phone now sends unscaled PCM: apply the volume here. Only the
+            // connected phone's counts, because that is whose A2DP is playing.
+            const uint16_t cid = avrcp_subevent_notification_volume_changed_get_avrcp_cid(packet);
+            const uint8_t volume =
+                avrcp_subevent_notification_volume_changed_get_absolute_volume(packet);
+            if (cid == 0 || cid != g_link.avrcpCid()) {
+                CLogger::Get()->Write(FromBt, LogDebug,
+                                      "AVRCP TG: volume %u from cid 0x%04x ignored (not the "
+                                      "connected phone)", volume, cid);
+                break;
+            }
+            g_absVolume.set(volume);
+            CLogger::Get()->Write(FromBt, LogNotice, "AVRCP TG: phone volume %u/127 (%u%%)",
+                                  g_absVolume.volume(),
+                                  unsigned(g_absVolume.volume()) * 100u /
+                                      carsh::bt::AbsoluteVolume::kMax);
             break;
+        }
         case AVRCP_SUBEVENT_OPERATION:
             // Pass-through key from the phone (BTstack has already accepted it).
             CLogger::Get()->Write(FromBt, LogDebug, "AVRCP TG: operation 0x%02x %s",
@@ -555,6 +599,7 @@ bool btGlueInit(CircleBluetooth* owner) {
         CLogger::Get()->Write(FromBt, LogWarning, "connect failed (reason 0x%02x)", reason);
         if (g_owner) g_owner->deliverConnectFailed(a, reason);
     };
+    linkCb.onAvrcpSessionEnded = [](const carsh::bt::BdAddr&) { endAvrcpSession(); };
     g_link.setCallbacks(linkCb);
 
     // 1. Memory pools + embedded run loop (pumped by CircleBtRunLoopTask).

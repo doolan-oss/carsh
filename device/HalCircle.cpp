@@ -10,17 +10,23 @@
 #include <circle/timer.h>
 #include <circle/synchronize.h>
 
+#include "bt/BtClock.h"  // btstackTimeMs(): the wrap contract, host-tested
+
 extern "C" {
 #include "hal_time_ms.h"
 #include "hal_cpu.h"
 }
 
-// Milliseconds since boot. CTimer::GetClockTicks() is the free-running 1 MHz
-// (CLOCKHZ) system counter, so /1000 yields ms. Wraps after ~49 days, which is
-// exactly the uint32_t millisecond contract BTstack's run loop expects (it does
-// timeout math in wrap-safe 32-bit arithmetic).
+static_assert(CLOCKHZ == 1000000, "btstackTimeMs() expects a 1 MHz (microsecond) tick");
+
+// Milliseconds since boot, as a full-range uint32 that wraps after 2^32 ms
+// (~49.7 days). BTstack's run loop compares deadlines with wrap-safe 32-bit
+// subtraction and relies on that. It must come from the 64-bit tick count:
+// CTimer::GetClockTicks() is a 32-bit microsecond count that wraps every 71.6
+// min, and dividing it by 1000 made this clock jump back to 0 at that point.
+// Timers pending across the jump then fired about 71 min late (review B8).
 extern "C" uint32_t hal_time_ms(void) {
-    return CTimer::GetClockTicks() / (CLOCKHZ / 1000);
+    return carsh::bt::btstackTimeMs(CTimer::GetClockTicks64());
 }
 
 // BTstack guards run-loop data-structure updates against its (transport) IRQ
