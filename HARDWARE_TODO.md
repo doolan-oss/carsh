@@ -44,8 +44,14 @@ this is the prioritized list for the first hardware session. Format:
 
 ### H4 — Real-time / underrun behavior under load (Risk R8)
 - **Module:** AudioEngine, decode task, scheduler yield discipline.
-- **Validate:** Confirm no underruns with crossfade + indexer + UI + BT live;
-  measure worst-case cooperative slice; consider `CMultiCoreSupport` for decode.
+- **Done (AA path, 2026-06-29):** AA media-audio underruns root-caused on the bench
+  (serial `aa-audio`/`aa-decode` instrumentation) and fixed — H.264 decode moved to a
+  **dedicated A72 core** (`device/CircleAaDecodeCore.h`, `CMultiCoreSupport`), audio
+  refilled several times per UI loop, `JitterBuffer` prebuffer + quick-resume absorb
+  the dongle's bursty delivery (PR #24). Cross-core handoffs are lock-free SPSC
+  (`src/aa/AuQueue.h`, `src/aa/FrameRelay.h`).
+- **Validate (local player):** confirm no underruns with crossfade + indexer + UI + BT
+  live; measure worst-case cooperative slice.
 - **Stub now:** Host pump is synchronous/deterministic; underrun counter exists but
   cannot exercise real DMA timing.
 
@@ -125,3 +131,25 @@ this is the prioritized list for the first hardware session. Format:
      no controller, but confirm no audio/video hiccups).
   5. `boot_slot.bin` power-loss: yank power mid-apply; expect a clean rescan/boot
      (record written after the slot image; worst case the push is just re-sent).
+
+### H8 — Android Auto stability + video throughput  [partly done — TOP open AA bug]
+- **Module:** `CircleAoaTransport`, Circle xHCI, `CircleAaDecodeCore`.
+- **Done (2026-06-29):** AA video + media audio play end-to-end; choppy audio fixed
+  (H4) and the 720p decode-can't-keep-real-time screen freeze fixed by dropping to
+  480p (native panel) — see `AA_AUDIO_INVESTIGATION.md`, PR #24.
+- **OPEN — intermittent xHCI `Transfer error 4` on bulk-IN during the TLS handshake.**
+  Non-deterministic: usually AA connects fine, but sometimes it stalls in
+  `SslHandshake` (serial shows `rx` stuck at 12, `inFlight=2`, `inErr=0`) for seconds,
+  then `xhciep: Transfer error 4 on endpoint 3` fires and **the board hard-hangs at
+  startup** (serial goes silent; USB-C still enumerated = core wedged, not a
+  disconnect). Recovers on a Pi power-cycle + dongle re-plug; often succeeds on the
+  2nd try. This is the "AA doesn't start up stable" complaint and the same class as
+  the historical bulk-reset blocker (see the `CircleAoaTransport` row in `STATUS.md`).
+  - **Repro/observe:** `python3 scripts/bench_capture.py`; watch for `rx=12` stuck in
+    SslHandshake → `Transfer error 4 on endpoint 3` → silence.
+  - **Next:** usbmon/OpenAuto reference capture on a Linux PC vs the Circle-xHCI path;
+    try resetting/re-posting the IN endpoint on completion-code 4 before it wedges;
+    confirm it's not provoked by the SMP enable (compare `CARSH_NO_DECODE_CORE=1`).
+- **OPEN — video lag under heavy motion.** 480p decode is real-time (~15 ms) but there
+  is no frame-drop policy, so a sustained high-motion scene can still build queue
+  latency. Add "drop to the latest IDR when behind" in the decode pump.
