@@ -1,8 +1,11 @@
 // HeapProbe — replaces the global operator new/delete for the test binary so
 // AllocScope (HeapProbe.h) can record allocation sizes. Outside a scope these are
-// plain malloc/free. Only the two base functions are replaced: libstdc++'s array,
-// nothrow and sized forms forward to them, and the aligned forms keep their own
-// (unrecorded) allocate/free pair.
+// plain malloc/free. The plain, nothrow and array forms are all replaced so every
+// allocation and its deallocation go through the same malloc/free pair — under
+// ASan the sanitizer supplies its own nothrow/array operator new (used e.g. by
+// std::stable_sort's temporary buffer), which would otherwise be freed by our
+// operator delete and trip alloc-dealloc-mismatch. The aligned forms keep their
+// own (unrecorded) allocate/free pair.
 //
 // NOTE: a program may define these only once — if another test ever needs its
 // own allocation hook, extend this one instead of adding a second definition.
@@ -34,8 +37,22 @@ void* operator new(std::size_t n) {
     return p;
 }
 
+void* operator new(std::size_t n, const std::nothrow_t&) noexcept {
+    record(n);
+    return std::malloc(n ? n : 1);
+}
+
+void* operator new[](std::size_t n) { return ::operator new(n); }
+void* operator new[](std::size_t n, const std::nothrow_t& t) noexcept {
+    return ::operator new(n, t);
+}
+
 void operator delete(void* p) noexcept { std::free(p); }
 void operator delete(void* p, std::size_t) noexcept { std::free(p); }
+void operator delete(void* p, const std::nothrow_t&) noexcept { std::free(p); }
+void operator delete[](void* p) noexcept { std::free(p); }
+void operator delete[](void* p, std::size_t) noexcept { std::free(p); }
+void operator delete[](void* p, const std::nothrow_t&) noexcept { std::free(p); }
 
 namespace carsh::testprobe {
 
