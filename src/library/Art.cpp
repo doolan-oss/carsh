@@ -1,6 +1,7 @@
 #include "library/Art.h"
 
 #include <algorithm>
+#include <climits>
 #include <cmath>
 #include <cstring>
 
@@ -10,8 +11,129 @@ namespace carsh::library {
 
 const char* kDensityRamp = " .:-=+*#%@";  // 10 levels, dark -> bright
 
-bool decodeImage(const uint8_t* data, std::size_t len, Image& out) {
+namespace {
+
+// Box-filter px (w x h, `comp` bytes/pixel: 3 = RGB, 4 = RGBA) down to dw x dh
+// RGBA. 3-component input gets opaque alpha.
+Image downscalePixels(const uint8_t* px, int w, int h, int comp, int dw, int dh) {
+    Image out;
+    if (!px || w <= 0 || h <= 0 || dw <= 0 || dh <= 0) return out;
+    out.w = dw;
+    out.h = dh;
+    out.rgba.assign(size_t(dw) * dh * 4, 0);
+    for (int y = 0; y < dh; ++y) {
+        int sy0 = int(int64_t(y) * h / dh);
+        int sy1 = int(int64_t(y + 1) * h / dh);
+        if (sy1 <= sy0) sy1 = sy0 + 1;
+        for (int x = 0; x < dw; ++x) {
+            int sx0 = int(int64_t(x) * w / dw);
+            int sx1 = int(int64_t(x + 1) * w / dw);
+            if (sx1 <= sx0) sx1 = sx0 + 1;
+            uint64_t r = 0, g = 0, b = 0, a = 0, n = 0;
+            for (int sy = sy0; sy < sy1 && sy < h; ++sy)
+                for (int sx = sx0; sx < sx1 && sx < w; ++sx) {
+                    const uint8_t* p = &px[(size_t(sy) * w + sx) * size_t(comp)];
+                    r += p[0]; g += p[1]; b += p[2];
+                    a += comp == 4 ? p[3] : 255u;
+                    ++n;
+                }
+            if (!n) n = 1;
+            uint8_t* d = &out.rgba[(size_t(y) * dw + x) * 4];
+            d[0] = uint8_t(r / n); d[1] = uint8_t(g / n);
+            d[2] = uint8_t(b / n); d[3] = uint8_t(a / n);
+        }
+    }
+    return out;
+}
+
+// hal::IStream -> stb_image callback adapter. stb pulls 128 bytes at a time; on
+// the device every IStream read is an f_read, and sub-sector reads cost a USB
+// mass-storage command per 512-byte sector, so reads are batched through a
+// 64 KiB window (one small heap bucket) rather than loading the whole file.
+// Invariant: the underlying stream sits at bufStart_ + len_.
+class StbStream {
+public:
+    static constexpr std::size_t kWindow = 64 * 1024;
+
+    explicit StbStream(carsh::hal::IStream& s) : s_(s), buf_(kWindow) {
+        s_.seek(0);
+    }
+
+    void rewind() { skipTo(0); }
+
+    int read(char* dst, int n) {
+        if (n <= 0) return 0;
+        std::size_t want = std::size_t(n), done = 0;
+        while (done < want) {
+            if (off_ < len_) {
+                const std::size_t k = std::min(len_ - off_, want - done);
+                std::memcpy(dst + done, buf_.data() + off_, k);
+                off_ += k;
+                done += k;
+                continue;
+            }
+            bufStart_ += len_;
+            len_ = off_ = 0;
+            if (want - done >= kWindow) {  // big read (a PNG IDAT): go direct
+                const std::size_t got = s_.read(dst + done, want - done);
+                bufStart_ += got;
+                done += got;
+                break;
+            }
+            len_ = s_.read(buf_.data(), kWindow);
+            if (len_ == 0) break;
+        }
+        return int(done);
+    }
+
+    void skip(int n) {
+        const int64_t target = int64_t(bufStart_ + off_) + n;
+        skipTo(target < 0 ? 0 : uint64_t(target));
+    }
+
+    int eof() const { return off_ >= len_ && bufStart_ + len_ >= s_.size(); }
+
+    static const stbi_io_callbacks kCallbacks;
+
+private:
+    void skipTo(uint64_t target) {
+        if (target > s_.size()) target = s_.size();
+        if (target >= bufStart_ && target <= bufStart_ + len_) {
+            off_ = std::size_t(target - bufStart_);
+            return;
+        }
+        s_.seek(target);
+        bufStart_ = target;
+        len_ = off_ = 0;
+    }
+
+    carsh::hal::IStream& s_;
+    std::vector<uint8_t> buf_;
+    uint64_t bufStart_ = 0;  // stream offset of buf_[0]
+    std::size_t len_ = 0, off_ = 0;
+};
+
+const stbi_io_callbacks StbStream::kCallbacks = {
+    [](void* u, char* data, int size) {
+        return static_cast<StbStream*>(u)->read(data, size);
+    },
+    [](void* u, int n) { static_cast<StbStream*>(u)->skip(n); },
+    [](void* u) { return static_cast<StbStream*>(u)->eof(); },
+};
+
+bool withinCap(int w, int h, int maxDim) {
+    return w > 0 && h > 0 && w <= maxDim && h <= maxDim;
+}
+
+}  // namespace
+
+bool decodeImage(const uint8_t* data, std::size_t len, Image& out, int maxDim) {
+    if (!data || len == 0 || len > std::size_t(INT_MAX)) return false;
     int w = 0, h = 0, comp = 0;
+    // Header-only probe: reject oversized images before stb allocates for them.
+    if (!stbi_info_from_memory(data, int(len), &w, &h, &comp) ||
+        !withinCap(w, h, maxDim))
+        return false;
     stbi_uc* px = stbi_load_from_memory(data, int(len), &w, &h, &comp, 4);
     if (!px) return false;
     out.w = w;
@@ -21,33 +143,42 @@ bool decodeImage(const uint8_t* data, std::size_t len, Image& out) {
     return true;
 }
 
-Image downscale(const Image& src, int dw, int dh) {
-    Image out;
-    if (!src.valid() || dw <= 0 || dh <= 0) return out;
-    out.w = dw;
-    out.h = dh;
-    out.rgba.assign(size_t(dw) * dh * 4, 0);
-    for (int y = 0; y < dh; ++y) {
-        int sy0 = y * src.h / dh;
-        int sy1 = (y + 1) * src.h / dh;
-        if (sy1 <= sy0) sy1 = sy0 + 1;
-        for (int x = 0; x < dw; ++x) {
-            int sx0 = x * src.w / dw;
-            int sx1 = (x + 1) * src.w / dw;
-            if (sx1 <= sx0) sx1 = sx0 + 1;
-            uint64_t r = 0, g = 0, b = 0, a = 0, n = 0;
-            for (int sy = sy0; sy < sy1 && sy < src.h; ++sy)
-                for (int sx = sx0; sx < sx1 && sx < src.w; ++sx) {
-                    const uint8_t* p = &src.rgba[(size_t(sy) * src.w + sx) * 4];
-                    r += p[0]; g += p[1]; b += p[2]; a += p[3]; ++n;
-                }
-            if (!n) n = 1;
-            uint8_t* d = &out.rgba[(size_t(y) * dw + x) * 4];
-            d[0] = uint8_t(r / n); d[1] = uint8_t(g / n);
-            d[2] = uint8_t(b / n); d[3] = uint8_t(a / n);
+bool decodeImageFitted(carsh::hal::IStream& s, Image& out, int workDim,
+                       int maxDim) {
+    if (workDim <= 0) return false;
+    StbStream st(s);
+    int w = 0, h = 0, comp = 0;
+    if (!stbi_info_from_callbacks(&StbStream::kCallbacks, &st, &w, &h, &comp) ||
+        !withinCap(w, h, maxDim))
+        return false;
+    st.rewind();
+    // RGB, not RGBA: a quarter less transient memory; nothing downstream reads
+    // alpha (ASCII luma + tint).
+    stbi_uc* px = stbi_load_from_callbacks(&StbStream::kCallbacks, &st, &w, &h,
+                                           &comp, 3);
+    if (!px) return false;
+    if (!withinCap(w, h, maxDim)) {  // header lied between probe and decode
+        stbi_image_free(px);
+        return false;
+    }
+    int dw = w, dh = h;
+    if (w > workDim || h > workDim) {
+        if (w >= h) {
+            dw = workDim;
+            dh = std::max(1, int((int64_t(h) * workDim + w / 2) / w));
+        } else {
+            dh = workDim;
+            dw = std::max(1, int((int64_t(w) * workDim + h / 2) / h));
         }
     }
-    return out;
+    out = downscalePixels(px, w, h, 3, dw, dh);
+    stbi_image_free(px);
+    return out.valid();
+}
+
+Image downscale(const Image& src, int dw, int dh) {
+    if (!src.valid()) return Image{};
+    return downscalePixels(src.rgba.data(), src.w, src.h, 4, dw, dh);
 }
 
 uint32_t dominantColor(const Image& img) {
