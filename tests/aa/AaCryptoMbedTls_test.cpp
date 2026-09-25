@@ -146,4 +146,60 @@ TEST(AaCryptoMbedTls, NoRecordsBeforeHandshakeDone) {
     CHECK(cli.encrypt(data, sizeof(data)).empty());
     CHECK(cli.decrypt(data, sizeof(data)).empty());
 }
+// A record lost in transit (the H8 / IRQ-ring-overflow case): the next record fails
+// its MAC because TLS records are sequence-numbered. That must be reported as a
+// sticky failed() — AaConnection turns it into Shutdown(CryptoFailure) — instead of
+// decrypt() quietly returning empty forever with nobody noticing.
+TEST(AaCryptoMbedTls, LostRecordFailsTheSessionForGood) {
+    AaCryptoMbedTls cli(hostEntropy, nullptr);
+    AaCryptoMbedTls srv(hostEntropy, nullptr);
+    srv.setServer(true);
+    REQUIRE(initTest(cli));
+    REQUIRE(initTest(srv));
+    REQUIRE(driveHandshake(cli, srv));
+    CHECK(!cli.failed());
+
+    const std::vector<uint8_t> a = {0x80, 0x01, 1, 2, 3};
+    const std::vector<uint8_t> b = {0x80, 0x01, 4, 5, 6};
+    CHECK(hop(srv, cli, a) == a);
+    CHECK(!cli.failed());
+
+    std::vector<uint8_t> lost = srv.encrypt(a.data(), a.size());  // never delivered
+    REQUIRE(!lost.empty());
+    std::vector<uint8_t> next = srv.encrypt(b.data(), b.size());
+    CHECK(cli.decrypt(next.data(), next.size()).empty());
+    CHECK(cli.failed());
+    CHECK(cli.lastError() != 0);
+
+    // Sticky: even the "missing" record can't revive it, and encrypt stops too.
+    CHECK(cli.decrypt(lost.data(), lost.size()).empty());
+    CHECK(cli.encrypt(b.data(), b.size()).empty());
+    CHECK(cli.failed());
+}
+
+// A corrupted record (flipped ciphertext byte) fails the same way.
+TEST(AaCryptoMbedTls, CorruptedRecordFails) {
+    AaCryptoMbedTls cli(hostEntropy, nullptr);
+    AaCryptoMbedTls srv(hostEntropy, nullptr);
+    srv.setServer(true);
+    REQUIRE(initTest(cli));
+    REQUIRE(initTest(srv));
+    REQUIRE(driveHandshake(cli, srv));
+
+    const std::vector<uint8_t> msg = {0x00, 0x0b, 8, 9, 10, 11};
+    std::vector<uint8_t> rec = srv.encrypt(msg.data(), msg.size());
+    REQUIRE(rec.size() > 8);
+    rec[rec.size() - 1] ^= 0x01;  // corrupt the GCM tag
+    CHECK(cli.decrypt(rec.data(), rec.size()).empty());
+    CHECK(cli.failed());
+}
+
+// A healthy session never reports failed(), and "nothing to read yet" is not a failure.
+TEST(AaCryptoMbedTls, NoFalseFailure) {
+    AaCryptoMbedTls cli(hostEntropy, nullptr);
+    REQUIRE(cli.init());
+    const uint8_t data[] = {1, 2, 3};
+    cli.decrypt(data, sizeof(data));  // before the handshake: a no-op, not a failure
+    CHECK(!cli.failed());
+}
 #endif  // CARSH_HAVE_MBEDTLS

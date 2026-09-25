@@ -6,6 +6,7 @@
 // hooks + CircleH264Decoder; this proves the glue host-side.
 #include "aa/AaProjection.h"
 
+#include <functional>
 #include <vector>
 
 #include "Test.h"
@@ -161,11 +162,16 @@ TEST(AaProjection, EndToEndWiring) {
     CHECK(huSent(hu, ChannelId::Video,
                  static_cast<uint16_t>(AvMsgId::VideoFocusIndication)));
 
-    // Phone shutdown -> projection torn down (placeholder + disconnected).
+    // Phone shutdown -> acknowledged, then projection torn down (placeholder +
+    // disconnected) and the connection unbound.
+    hu.clearSent();
     phoneSend(hu, ChannelId::Control, EncryptionType::Encrypted, 0x000F, {});
     REQUIRE(conn.poll(0));
+    CHECK(huSent(hu, ChannelId::Control, 0x0010));  // SHUTDOWN_RESPONSE
     CHECK(!connected);
+    CHECK(!proj.connected());
     CHECK(!haveFrame);
+    CHECK(!proj.forwardTouch(10, 10, TouchAction::Press, 43));
 }
 
 TEST(AaProjection, OutboundNoOpsWithoutConnection) {
@@ -173,4 +179,213 @@ TEST(AaProjection, OutboundNoOpsWithoutConnection) {
     // No connection bound yet -> touch/focus are safe no-ops returning false.
     CHECK(!proj.forwardTouch(10, 10, TouchAction::Press, 0));
     CHECK(!proj.setFocus(true));
+}
+
+namespace {
+
+// A projection wired to a Running connection with video + input open, recording
+// every hook call. Mirrors the kernel wiring (Hooks + callbacks() + setConnection).
+struct Rig {
+    FakeAaTransport hu;
+    AaMessenger msger{hu};
+    FakeAaCrypto crypto{2};
+    int connectedTrue = 0, connectedFalse = 0, framesShown = 0, framesCleared = 0;
+    std::function<void(bool)> onSetConnected;  // extra behaviour (e.g. a tab switch)
+    AaProjection proj{hooks()};
+    FakeH264Decoder dec{&proj};
+    AaConnection conn{msger, crypto, proj.callbacks()};
+
+    AaProjection::Hooks hooks() {
+        AaProjection::Hooks h;
+        h.showFrame = [this](const uint8_t* rgb, int, int) {
+            (rgb != nullptr ? framesShown : framesCleared)++;
+        };
+        h.setConnected = [this](bool v) {
+            (v ? connectedTrue : connectedFalse)++;
+            if (onSetConnected) onSetConnected(v);
+        };
+        return h;
+    }
+    void up() {
+        proj.setDecoder(&dec);
+        proj.setConnection(&conn);
+        driveToRunning(conn, hu);
+        openChannel(conn, hu, ChannelId::Video);
+        openChannel(conn, hu, ChannelId::Input);
+    }
+    void videoFrame() {
+        phoneSend(hu, ChannelId::Video, EncryptionType::Encrypted,
+                  static_cast<uint16_t>(AvMsgId::MediaIndication), {0, 0, 0, 1, 0x65});
+        REQUIRE(conn.poll(0));
+    }
+};
+
+// Decode one INPUT_EVENT_INDICATION body's touch_event: (touch_action, x, y).
+struct Touch {
+    uint32_t action = 99, x = 0, y = 0;
+};
+Touch decodeTouch(const std::vector<uint8_t>& body) {
+    Touch t;
+    pb::Reader r(body);
+    uint32_t f;
+    uint8_t w;
+    while (!r.eof()) {
+        REQUIRE(r.tag(f, w));
+        if (f == 3 && w == 2) {  // touch_event
+            pb::Reader te(nullptr, 0);
+            REQUIRE(r.submessage(te));
+            while (!te.eof()) {
+                REQUIRE(te.tag(f, w));
+                if (f == 1 && w == 2) {  // touch_location
+                    pb::Reader loc(nullptr, 0);
+                    REQUIRE(te.submessage(loc));
+                    while (!loc.eof()) {
+                        REQUIRE(loc.tag(f, w));
+                        if (f == 1) REQUIRE(loc.u32(t.x));
+                        else if (f == 2) REQUIRE(loc.u32(t.y));
+                        else REQUIRE(loc.skip(w));
+                    }
+                } else if (f == 3 && w == 0) {
+                    REQUIRE(te.u32(t.action));
+                } else {
+                    REQUIRE(te.skip(w));
+                }
+            }
+        } else {
+            REQUIRE(r.skip(w));
+        }
+    }
+    return t;
+}
+
+}  // namespace
+
+// Dongle unplug / re-cycle (the owner calls disconnect()): the projection resets the
+// UI exactly once — setConnected(false) + a cleared frame, so the app drops the
+// frozen frame and re-arms auto-show — and unbinds, so touch/focus/keys no-op.
+TEST(AaProjection, DisconnectResetsOnceAndUnbinds) {
+    Rig rig;
+    rig.up();
+    rig.videoFrame();
+    CHECK(rig.proj.connected());
+    CHECK_EQ(rig.framesShown, 1);
+
+    rig.proj.disconnect();
+    CHECK(!rig.proj.connected());
+    CHECK_EQ(rig.connectedFalse, 1);
+    CHECK_EQ(rig.framesCleared, 1);
+    CHECK(!rig.proj.forwardTouch(10, 10, TouchAction::Press, 1));
+    CHECK(!rig.proj.setFocus(true));
+    CHECK(!rig.proj.sendMediaKey(carsh::aa::MediaKey::PlayPause, 1));
+
+    // Idempotent: the driver may call it again (and after onShutdown).
+    rig.proj.disconnect();
+    CHECK_EQ(rig.connectedFalse, 1);
+    CHECK_EQ(rig.framesCleared, 1);
+
+    // A new session re-binds and comes back up.
+    FakeAaTransport hu2;
+    AaMessenger msger2(hu2);
+    FakeAaCrypto crypto2(2);
+    AaConnection conn2(msger2, crypto2, rig.proj.callbacks());
+    rig.proj.setConnection(&conn2);
+    driveToRunning(conn2, hu2);
+    openChannel(conn2, hu2, ChannelId::Input);
+    CHECK(rig.proj.connected());
+    CHECK(rig.proj.forwardTouch(10, 10, TouchAction::Press, 2));
+}
+
+// A disconnect before any session came up (e.g. unplugged mid-handshake) must not
+// fire the reset hooks — the app would otherwise yank the user off their tab.
+TEST(AaProjection, DisconnectWithoutSessionFiresNoHooks) {
+    Rig rig;
+    rig.proj.setConnection(&rig.conn);
+    rig.conn.start();
+    rig.proj.disconnect();
+    CHECK_EQ(rig.connectedFalse, 0);
+    CHECK_EQ(rig.framesCleared, 0);
+    CHECK(!rig.proj.setFocus(true));
+}
+
+// After the phone's SHUTDOWN_REQUEST, a frame that finishes decoding late (AUs still
+// queued for the decode core) must not reach the screen — it would re-freeze the AA
+// tab and re-trigger the app's auto-show on a dead session.
+TEST(AaProjection, LateFrameAfterShutdownIsDropped) {
+    Rig rig;
+    rig.up();
+    rig.videoFrame();
+    phoneSend(rig.hu, ChannelId::Control, EncryptionType::Encrypted, 0x000F, {});
+    REQUIRE(rig.conn.poll(0));
+    CHECK_EQ(rig.framesShown, 1);
+    CHECK_EQ(rig.framesCleared, 1);
+
+    uint8_t px[3] = {1, 2, 3};
+    carsh::aa::DecodedFrame late;
+    late.width = 1;
+    late.height = 1;
+    late.pixels = px;
+    late.pixelsLen = sizeof(px);
+    rig.proj.onFrame(late);  // what the decode core would deliver
+    CHECK_EQ(rig.framesShown, 1);
+    // ...so the owner's later disconnect() has nothing left to clear.
+    rig.proj.disconnect();
+    CHECK_EQ(rig.connectedFalse, 1);
+    CHECK_EQ(rig.framesCleared, 1);
+}
+
+// The app's disconnect hook switches tabs, which drops video focus (setFocus(false)).
+// That must NOT go out to the phone that just shut down.
+TEST(AaProjection, ShutdownSendsNothingAfterTheResponse) {
+    Rig rig;
+    bool focusSent = true;
+    rig.onSetConnected = [&](bool v) {
+        if (!v) focusSent = rig.proj.setFocus(false);
+    };
+    rig.up();
+    rig.hu.clearSent();
+    phoneSend(rig.hu, ChannelId::Control, EncryptionType::Encrypted, 0x000F, {});
+    REQUIRE(rig.conn.poll(0));
+    CHECK(!focusSent);
+    FakeAaTransport t;
+    t.pushRx(rig.hu.sent());
+    AaMessenger m(t);
+    AaMessage msg;
+    int sent = 0;
+    while (m.receive(msg, 0)) ++sent;
+    CHECK_EQ(sent, 1);  // only the SHUTDOWN_RESPONSE
+}
+
+// A swipe streamed as PRESS, DRAG..., RELEASE reaches the phone as those actions in
+// order (touch_action = 0, 2, 2, 1), each at its own point.
+TEST(AaProjection, DragStreamsEndToEnd) {
+    Rig rig;
+    rig.up();
+    rig.hu.clearSent();
+    CHECK(rig.proj.forwardTouch(400, 380, TouchAction::Press, 1000));
+    CHECK(rig.proj.forwardTouch(400, 300, TouchAction::Drag, 17000));
+    CHECK(rig.proj.forwardTouch(400, 200, TouchAction::Drag, 33000));
+    CHECK(rig.proj.forwardTouch(400, 100, TouchAction::Release, 50000));
+
+    std::vector<Touch> got;
+    FakeAaTransport t;
+    t.pushRx(rig.hu.sent());
+    AaMessenger m(t);
+    AaMessage msg;
+    while (m.receive(msg, 0)) {
+        REQUIRE(msg.payload.size() >= 2);
+        const uint16_t id = static_cast<uint16_t>((msg.payload[0] << 8) | msg.payload[1]);
+        if (msg.channel != ChannelId::Input ||
+            id != static_cast<uint16_t>(InputMsgId::InputEventIndication))
+            continue;
+        got.push_back(decodeTouch(std::vector<uint8_t>(msg.payload.begin() + 2,
+                                                       msg.payload.end())));
+    }
+    REQUIRE(got.size() == 4);
+    const uint32_t actions[] = {0, 2, 2, 1};
+    const uint32_t ys[] = {380, 300, 200, 100};
+    for (size_t i = 0; i < 4; ++i) {
+        CHECK_EQ(got[i].action, actions[i]);
+        CHECK_EQ(got[i].x, 400u);
+        CHECK_EQ(got[i].y, ys[i]);
+    }
 }

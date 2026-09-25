@@ -58,6 +58,7 @@ public:
     // that would otherwise parse, so that exact code path is host-exercised.
     void setForceRawCert(bool v) { forceRawCert_ = v; }
 
+    // The most recent mbedTLS error code (init, handshake or record), for telemetry.
     int lastError() const { return lastError_; }
 
     // IAaCrypto.
@@ -65,6 +66,10 @@ public:
     bool handshakeDone() const override { return handshakeDone_; }
     std::vector<uint8_t> encrypt(const uint8_t* plain, size_t len) override;
     std::vector<uint8_t> decrypt(const uint8_t* cipher, size_t len) override;
+    // Sticky: a fatal handshake error or a record that failed to decrypt/authenticate
+    // (bad MAC after a lost/corrupted record, a fatal alert, close_notify). The mbedTLS
+    // context is unusable afterwards, so encrypt/decrypt then no-op.
+    bool failed() const override { return failed_; }
 
 private:
     bool loadOwnCert(const unsigned char* certDer, size_t certLen, const char* keyPem,
@@ -78,6 +83,7 @@ private:
     bool forceRawCert_ = false;
     bool inited_ = false;
     bool handshakeDone_ = false;
+    bool failed_ = false;
     int lastError_ = 0;
 
     carsh::aa::AaMemBio bio_;

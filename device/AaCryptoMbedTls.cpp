@@ -144,7 +144,7 @@ bool AaCryptoMbedTls::initWith(const unsigned char* certDer, size_t certLen,
 }
 
 std::vector<uint8_t> AaCryptoMbedTls::handshakeStep(const uint8_t* in, size_t len) {
-    if (!inited_) return {};
+    if (!inited_ || failed_) return {};
     if (in != nullptr && len > 0) bio_.pushIn(in, len);
 
     if (!handshakeDone_) {
@@ -152,7 +152,8 @@ std::vector<uint8_t> AaCryptoMbedTls::handshakeStep(const uint8_t* in, size_t le
         if (ret == 0) {
             handshakeDone_ = true;
         } else if (ret != MBEDTLS_ERR_SSL_WANT_READ && ret != MBEDTLS_ERR_SSL_WANT_WRITE) {
-            lastError_ = ret;  // fatal handshake failure
+            lastError_ = ret;  // fatal handshake failure — the context is now unusable
+            failed_ = true;
         }
     }
     // Whatever mbedTLS queued this step (ClientHello, key exchange + Finished, …) is
@@ -161,7 +162,7 @@ std::vector<uint8_t> AaCryptoMbedTls::handshakeStep(const uint8_t* in, size_t le
 }
 
 std::vector<uint8_t> AaCryptoMbedTls::encrypt(const uint8_t* plain, size_t len) {
-    if (!handshakeDone_) return {};
+    if (!handshakeDone_ || failed_) return {};
     size_t off = 0;
     while (off < len) {
         int ret = mbedtls_ssl_write(&ssl_, plain + off, len - off);
@@ -169,7 +170,8 @@ std::vector<uint8_t> AaCryptoMbedTls::encrypt(const uint8_t* plain, size_t len) 
             if (ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE) {
                 continue;  // BIO never blocks; retry to make progress
             }
-            lastError_ = ret;
+            lastError_ = ret;  // fatal: mbedTLS marks the context unusable
+            failed_ = true;
             return {};
         }
         off += static_cast<size_t>(ret);
@@ -178,7 +180,7 @@ std::vector<uint8_t> AaCryptoMbedTls::encrypt(const uint8_t* plain, size_t len) 
 }
 
 std::vector<uint8_t> AaCryptoMbedTls::decrypt(const uint8_t* cipher, size_t len) {
-    if (!handshakeDone_) return {};
+    if (!handshakeDone_ || failed_) return {};
     bio_.pushIn(cipher, len);
 
     std::vector<uint8_t> out;
@@ -190,8 +192,13 @@ std::vector<uint8_t> AaCryptoMbedTls::decrypt(const uint8_t* cipher, size_t len)
             continue;  // drain any further buffered records
         }
         if (ret == MBEDTLS_ERR_SSL_WANT_READ || ret == 0) break;  // no more input
+        // Anything else is fatal for the session (bad MAC after a lost/corrupted
+        // record, a fatal alert, the peer's close_notify): mbedTLS leaves the context
+        // unusable. Report it — without this a single lost record made every later
+        // decrypt return empty while the connection carried on "Running" forever.
         lastError_ = ret;
-        break;
+        failed_ = true;
+        return {};
     }
     return out;
 }

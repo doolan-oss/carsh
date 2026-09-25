@@ -39,7 +39,10 @@ public:
     // decrypted INDIVIDUALLY and their plaintext concatenated — this is how aasdk does
     // it; a multi-frame message is NOT one big ciphertext blob, each frame is its own
     // self-contained TLS record(s). Without this a fragmented (large keyframe) message
-    // fails to decrypt and desyncs the stream. Returns empty on a decrypt error.
+    // fails to decrypt and desyncs the stream. Returns empty on a decrypt error (the
+    // owner detects that via IAaCrypto::failed()). It is called for EVERY encrypted
+    // frame, in arrival order, including frames that are then dropped, so the TLS
+    // record sequence never skips a record.
     void setDecryptor(std::function<std::vector<uint8_t>(const uint8_t*, size_t)> d) {
         decryptor_ = std::move(d);
     }
@@ -64,6 +67,11 @@ public:
     bool sendRaw(ChannelId channel, EncryptionType enc, MessageType msgType,
                  const uint8_t* payload, size_t len);
 
+    // Frames/messages discarded by reassembly (unknown channel, orphan MIDDLE/LAST,
+    // abandoned or oversized message, empty plaintext). Diagnostic only — a rising
+    // count on a clean link means the byte stream is being corrupted or truncated.
+    uint32_t droppedFrames() const { return droppedFrames_; }
+
 private:
     struct Reasm {
         std::vector<uint8_t> buf;       // accumulated payload (plaintext if decrypted)
@@ -79,11 +87,14 @@ private:
                       MessageType msgType, EncryptionType enc,
                       uint16_t framePayloadSize, size_t hdrLen,
                       AaMessage& out, bool& produced);
+    // Abandon the message being reassembled in `r` (and free its buffer).
+    void dropMessage(Reasm& r);
 
     IAaTransport& tp_;
     std::function<std::vector<uint8_t>(const uint8_t*, size_t)> decryptor_;
     std::array<Reasm, static_cast<size_t>(kMaxChannel) + 1> reasm_{};
     std::vector<uint8_t> rxAcc_;  // un-parsed RX bytes carried across reads
+    uint32_t droppedFrames_ = 0;
 };
 
 }  // namespace carsh::aa

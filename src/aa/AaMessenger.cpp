@@ -42,18 +42,36 @@ void AaMessenger::processFrame(const uint8_t* raw, ChannelId channel,
                                EncryptionType enc, uint16_t framePayloadSize,
                                size_t hdrLen, AaMessage& out, bool& produced) {
     produced = false;
+    const uint8_t* payload = raw + hdrLen;
+
+    // TLS FIRST, drop decisions second. ENCRYPTED frames are decrypted INDIVIDUALLY
+    // (aasdk model) — each frame is its own complete TLS record(s); reassembling
+    // ciphertext and decrypting once corrupts multi-frame (large keyframe) messages.
+    // TLS records carry an implicit sequence number, so EVERY encrypted frame must be
+    // fed to the decryptor in arrival order — even one we are about to drop (unknown
+    // channel, orphan MIDDLE/LAST, oversized message). Skipping a record's decrypt
+    // desyncs the sequence and every later record then fails its MAC: one dropped
+    // frame used to wedge the whole session. Only the plaintext is discarded.
+    const bool decrypting = (enc == EncryptionType::Encrypted) && decryptor_;
+    std::vector<uint8_t> plain;
+    if (decrypting) plain = decryptor_(payload, framePayloadSize);
+    const uint8_t* chunk = decrypting ? plain.data() : payload;
+    const size_t chunkLen = decrypting ? plain.size() : framePayloadSize;
 
     const int ch = static_cast<int>(channel);
-    if (ch > kMaxChannel) return;  // unknown channel — skip
+    if (ch > kMaxChannel) {  // unknown channel — skip (after decrypt, above)
+        ++droppedFrames_;
+        return;
+    }
 
     const bool isFirst = (frameType == FrameType::First);
-    const uint8_t* payload = raw + hdrLen;
     Reasm& r = reasm_[static_cast<size_t>(ch)];
 
     if (isFirst || frameType == FrameType::Bulk) {
         // Start a new message. Reassembly is FRAME-TYPE driven (accumulate until LAST/
         // BULK), like aasdk — NOT size driven, since the FIRST frame's total_size is the
         // ciphertext sum which doesn't match the decrypted plaintext length.
+        if (r.active) ++droppedFrames_;  // an unfinished message is abandoned
         r.buf.clear();
         r.active = true;
         r.decrypted = false;
@@ -61,40 +79,52 @@ void AaMessenger::processFrame(const uint8_t* raw, ChannelId channel,
         r.encryption = enc;
         if (isFirst) {
             const uint32_t totalSize = readBe32(raw + 4);
-            if (totalSize > kMaxMessageSize) {  // implausible — drop
-                r.active = false;
+            if (totalSize > kMaxMessageSize) {  // implausible — drop the whole message
+                dropMessage(r);
                 return;
             }
             r.buf.reserve(totalSize);  // hint only
         }
     }
 
-    if (!r.active) return;  // MIDDLE/LAST with no active message — drop
-
-    // Append this frame's payload. ENCRYPTED frames are decrypted INDIVIDUALLY (aasdk
-    // model) — each frame is its own complete TLS record(s); reassembling ciphertext and
-    // decrypting once corrupts multi-frame (large keyframe) messages and desyncs the TLS
-    // stream. The decrypted plaintext chunks are concatenated into the message.
-    if (enc == EncryptionType::Encrypted && decryptor_) {
-        std::vector<uint8_t> plain = decryptor_(payload, framePayloadSize);
-        r.buf.insert(r.buf.end(), plain.begin(), plain.end());
-        r.decrypted = true;
-    } else {
-        r.buf.insert(r.buf.end(), payload, payload + framePayloadSize);
+    if (!r.active) {  // MIDDLE/LAST with no active message — drop (after decrypt)
+        ++droppedFrames_;
+        return;
     }
+
+    // Bound the reassembly buffer. kMaxMessageSize was only checked against FIRST's
+    // DECLARED total, so a peer (or a desynced stream) that kept sending MIDDLE frames
+    // grew r.buf without limit until the heap ran out. Drop the message instead; its
+    // remaining frames are then orphans (still decrypted above, then discarded).
+    if (r.buf.size() + chunkLen > kMaxMessageSize) {
+        dropMessage(r);
+        return;
+    }
+    r.buf.insert(r.buf.end(), chunk, chunk + chunkLen);
+    if (decrypting) r.decrypted = true;
 
     const bool complete = (frameType == FrameType::Bulk) || (frameType == FrameType::Last);
     if (!complete) return;
+
+    // Plaintext (PLAIN, or ENCRYPTED-and-decrypted) carries the 2-byte message id; a
+    // still-ciphertext payload (no decryptor) keeps id=0 for an upstream decrypt.
+    const bool havePlaintext = (r.encryption == EncryptionType::Plain) || r.decrypted;
+    if (havePlaintext && r.buf.size() < 2) {
+        // No room for a message id (e.g. the decrypt failed and produced nothing). It
+        // used to be surfaced as msgId 0 — which on an AV channel reads as a malformed
+        // MEDIA_WITH_TIMESTAMP and drew a spurious ack — so drop it instead.
+        r.buf.clear();
+        r.active = false;
+        ++droppedFrames_;
+        return;
+    }
 
     out.channel = channel;
     out.msgType = r.msgType;
     out.encryption = r.encryption;
     out.decrypted = r.decrypted;
 
-    // Plaintext (PLAIN, or ENCRYPTED-and-decrypted) carries the 2-byte message id; a
-    // still-ciphertext payload (no decryptor) keeps id=0 for an upstream decrypt.
-    const bool havePlaintext = (r.encryption == EncryptionType::Plain) || r.decrypted;
-    if (havePlaintext && r.buf.size() >= 2) {
+    if (havePlaintext) {
         out.messageId = readBe16(r.buf.data());
         out.payload.assign(r.buf.begin() + 2, r.buf.end());
     } else {
@@ -105,6 +135,15 @@ void AaMessenger::processFrame(const uint8_t* raw, ChannelId channel,
     r.buf.clear();
     r.active = false;
     produced = true;
+}
+
+void AaMessenger::dropMessage(Reasm& r) {
+    // Release the storage too: a dropped message is by definition oversized, and
+    // keeping up to kMaxMessageSize of capacity parked per channel is waste.
+    std::vector<uint8_t>().swap(r.buf);
+    r.active = false;
+    r.decrypted = false;
+    ++droppedFrames_;
 }
 
 bool AaMessenger::receive(AaMessage& out, uint32_t timeoutMs) {
