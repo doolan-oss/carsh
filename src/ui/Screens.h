@@ -25,6 +25,7 @@ public:
         std::string title, artist, album;
         uint64_t positionMs = 0, durationMs = 0;
         bool playing = false;
+        std::string source;  // active-source badge ("BLUETOOTH"); empty = local/hidden
     };
 
     explicit NowPlayingScreen(Rect c)
@@ -41,6 +42,7 @@ public:
         play_.setLabel(s.playing ? "||" : ">");
     }
     void setArt(const library::AsciiArt& a) { art_ = a; hasArt_ = true; }
+    void clearArt() { hasArt_ = false; }  // no art for this track/source -> empty panel
 
     std::function<void()> onPrev, onPlayPause, onNext;
 
@@ -54,6 +56,13 @@ public:
                 for (int col = 0; col < art_.cols; ++col)
                     c.drawChar(ax + col * 8 * scale, ay + r * 8 * scale,
                                art_.at(r, col), tint, 0, scale);
+        }
+        // Active-source badge (top-right), e.g. "BLUETOOTH" when the phone owns the
+        // output; empty for the local player.
+        if (!state_.source.empty()) {
+            int sw = int(state_.source.size()) * kCellW;
+            c.drawText(content_.x + content_.w - sw - 8, content_.y + 8, state_.source,
+                       th.accent);
         }
         // Metadata.
         int tx = content_.x + 400, ty = content_.y + 24;
@@ -101,6 +110,35 @@ public:
 private:
     const char* name_;
     ListView list_;
+};
+
+// --- Queue ------------------------------------------------------------------
+// The play queue: a list of "artist - title" rows with the now-playing row marked
+// (ListView::setCurrent), tap-to-jump, and a CLEAR button. Pure-widget like
+// DevicesScreen; the app rebuilds the rows from the live queue and wires intents.
+class QueueScreen : public Screen {
+public:
+    explicit QueueScreen(Rect c)
+        : Screen(c),
+          list_({c.x + 8, c.y + 8, c.w - 16, c.h - 80}),
+          clear_({c.x + 8, c.y + c.h - 64, 160, 56}, "CLEAR",
+                 [this] { if (onClear) onClear(); }) {
+        widgets_ = {&list_, &clear_};
+        list_.setOnSelect([this](int i) { if (onSelect) onSelect(i); });
+    }
+    const char* name() const override { return "Q"; }
+
+    void setItems(std::vector<std::string> rows) { list_.setItems(std::move(rows)); }
+    // Mark the now-playing row (-1 = nothing playing from this queue).
+    void setCurrent(int i) { list_.setCurrent(i); }
+    ListView& list() { return list_; }
+
+    std::function<void(int)> onSelect;  // tap a row -> jump to it
+    std::function<void()> onClear;      // CLEAR pressed
+
+private:
+    ListView list_;
+    Button clear_;
 };
 
 // --- 3. Search --------------------------------------------------------------

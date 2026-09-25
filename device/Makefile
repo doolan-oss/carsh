@@ -28,6 +28,7 @@ OBJS = \
 	$(CARSHTOP)/src/ui/Font.o \
 	$(CARSHTOP)/src/library/Database.o \
 	$(CARSHTOP)/src/library/Indexer.o \
+	$(CARSHTOP)/src/library/Art.o \
 	$(CARSHTOP)/src/decode/DrDecoders.o \
 	$(CARSHTOP)/src/player/PlayerController.o \
 	$(CARSHTOP)/src/ota/OtaManager.o \

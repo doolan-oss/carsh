@@ -123,6 +123,17 @@ TEST(LibraryBrowser, BackUnwindsLevels) {
     CHECK(b.level() == LibraryBrowser::Level::Artists);
 }
 
+TEST(LibraryBrowser, FirstRowForLetter) {
+    Database db = makeLib();
+    LibraryBrowser b(db);  // Artists: Björk(0), Pink Floyd(1), Queen(2)
+    CHECK_EQ(b.firstRowForLetter('B'), 0);
+    CHECK_EQ(b.firstRowForLetter('b'), 0);   // case-insensitive
+    CHECK_EQ(b.firstRowForLetter('P'), 1);   // Björk normalizes to "bjork"
+    CHECK_EQ(b.firstRowForLetter('Q'), 2);
+    CHECK_EQ(b.firstRowForLetter('Z'), -1);  // no match
+    CHECK_EQ(b.firstRowForLetter('#'), -1);  // no non-alpha-leading row
+}
+
 TEST(LibraryBrowser, OutOfRangeSelectIgnored) {
     Database db = makeLib();
     LibraryBrowser b(db);
