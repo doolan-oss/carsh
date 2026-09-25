@@ -91,17 +91,24 @@ inline BootRecord rollback(const BootRecord& r) {
 }
 
 // boot_slot.bin: fixed 16-byte little-endian record (magic + fields).
+inline constexpr std::size_t kBootRecordLen = 16;
+
+// Fixed-buffer form (no allocation): the chainloader kernel uses this so it can
+// stay a minimal Circle app; the vector form below wraps it for everyone else.
+inline void serializeBootRecord(const BootRecord& r,
+                                uint8_t out[kBootRecordLen]) {
+    out[0] = 'B'; out[1] = 'S'; out[2] = 'L'; out[3] = '1';
+    out[4] = r.activeSlot;
+    out[5] = r.trying ? 1 : 0;
+    out[6] = r.triesLeft;
+    out[7] = r.healthy ? 1 : 0;
+    for (int i = 0; i < 4; ++i) out[8 + i] = uint8_t(r.versionA >> (8 * i));
+    for (int i = 0; i < 4; ++i) out[12 + i] = uint8_t(r.versionB >> (8 * i));
+}
+
 inline std::vector<uint8_t> serializeBootRecord(const BootRecord& r) {
-    std::vector<uint8_t> v = {'B', 'S', 'L', '1'};
-    v.push_back(r.activeSlot);
-    v.push_back(r.trying ? 1 : 0);
-    v.push_back(r.triesLeft);
-    v.push_back(r.healthy ? 1 : 0);
-    auto put = [&](uint32_t x) {
-        for (int i = 0; i < 4; ++i) v.push_back(uint8_t(x >> (8 * i)));
-    };
-    put(r.versionA);
-    put(r.versionB);
+    std::vector<uint8_t> v(kBootRecordLen);
+    serializeBootRecord(r, v.data());
     return v;
 }
 

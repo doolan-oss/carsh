@@ -159,3 +159,20 @@ Remaining hardware work (see ../HARDWARE_TODO.md): I2S DAC HAT (PWM jack works
 today), BTstack on a real radio (USB ACL path + Realtek firmware blob — H6),
 WiFi, and the OTA flash write + chainloader. Backends that build but await their
 peripheral: `CircleSoundDevice` (I2S), `CircleFlashTarget` (OTA slot write).
+
+## Serial OTA dev loop (no card swap)
+
+Once per card: install the A/B chainloader (`device/chainloader/README.md`).
+Once per bench: `scripts/carsh_ota.py keygen` (writes `device/OtaPushKey.h`),
+then rebuild the image so it trusts your key. After that the loop is:
+
+```sh
+cd device && make                    # build the app image
+../scripts/carsh_ota.py flash        # sign + push over /dev/ttyACM0, reboot, watch
+```
+
+The push travels the same USB-C console the log rides on (PushProtocol framing,
+CRC-32 per packet + whole-blob, Ed25519-signed .carup). The kernel stages it to
+the inactive slot (`kernel8-A/B.img`), arms a 3-boot trial in `boot_slot.bin`,
+and reboots; the chainloader rolls back automatically if the new image never
+reaches the UI loop. Bench validation checklist: HARDWARE_TODO.md H7b.
