@@ -85,6 +85,13 @@ public:
     // xHCI Transfer() timeout (the dongle NAKed); less = a transfer error.
     unsigned lastOutBlockedMs() const { return m_lastOutBlockedMs; }
 
+    // Task context, before a new AaMessenger/AaConnection starts on this transport:
+    // a transport that already carried a session drops the bytes the old session
+    // left in the RX ring (AaBulkLink::beginSession — IRQ-safe, consumer side only).
+    // Returns the bytes discarded; sessions() counts the sessions begun here.
+    unsigned beginSession() { return static_cast<unsigned>(m_link.beginSession()); }
+    unsigned sessions() const { return m_link.sessions(); }
+
     // IAaTransport.
     int read(uint8_t* buf, size_t len, uint32_t timeoutMs) override;
     int write(const uint8_t* data, size_t len, uint32_t timeoutMs) override;
@@ -142,14 +149,17 @@ extern "C" CUSBFunction* carshCreateAndroidAutoDevice(CUSBFunction* pParent, con
 // AOA mode-switch on a pre-switch device (reqs 51/52/53 + AA identity strings).
 bool aoaStartAccessory(CUSBDevice* pDevice);
 
-// Recovery for a dead link: make the dongle drop off the bus and re-enumerate, by
-// removing its USB device (on a hub port: CLEAR_FEATURE(PORT_ENABLE) + delete) and
-// rescanning the bus (SET_FEATURE(PORT_RESET) on the still-connected port, then the
-// normal enumerate -> factory -> AOA path). TASK context only — the UI loop, the same
-// task that runs UpdatePlugAndPlay(). On success pDongle has been DELETED (its
+// Recovery after a link fault or a failed session: make the dongle drop off the bus
+// and re-enumerate, by removing its USB device (on a hub port:
+// CLEAR_FEATURE(PORT_ENABLE) + delete) and rescanning the bus
+// (SET_FEATURE(PORT_RESET) on the still-connected port, then the normal enumerate
+// -> factory -> AOA path). TASK context only — the UI loop, the same task that runs
+// UpdatePlugAndPlay(). On success pDongle has been DELETED (its
 // removed-handlers ran) before this returns; the caller must drop every pointer to it
 // first. Blocks for the port reset + enumeration (a few hundred ms). Returns false if
-// Circle could not remove the device (it then still exists, link still dead).
+// Circle could not remove the device (the hub refused to disable the port): it then
+// still exists, its link (dead or alive) and RX ring untouched — see the fallback in
+// CircleAaDriver::forceReenumerate.
 bool aoaForceReenumerate(CAndroidAutoDevice* pDongle);
 // Rung-1 first-light: log VID/PID/class + endpoints to the serial.
 void aoaDumpDeviceDescriptor(CUSBDevice* pDevice);

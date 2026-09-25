@@ -3,7 +3,9 @@
 // transfer is never asked for its length, latches the link dead and is never
 // re-posted; an RX overflow or a failed bulk-OUT is just as fatal; a dead link
 // refuses read()/write() so the AA stack sees "disconnect". A LinkTransport wrapper
-// mirrors the device glue so AaMessenger/AaConnection can be driven over it.
+// mirrors the device glue so AaMessenger/AaConnection can be driven over it. A new
+// session on a link that already carried one never parses the old session's bytes
+// (the driver's re-bind of a transport Circle could not remove).
 #include "aa/AaBulkLink.h"
 
 #include <atomic>
@@ -16,6 +18,7 @@
 #include "aa/AaConnection.h"
 #include "aa/AaMessenger.h"
 #include "aa/FakeAaCrypto.h"
+#include "aa/FakeAaTransport.h"
 #include "aa/IAaTransport.h"
 
 using carsh::aa::AaBulkLink;
@@ -268,5 +271,152 @@ TEST(AaBulkLink, SpscStressKeepsOrder) {
     producer.join();
     CHECK(!bad.load());
     CHECK_EQ(got, kTotal);
+    CHECK(!link.dead());
+}
+
+// The driver re-binds a transport Circle could not remove (forceReenumerate's
+// fallback): the new session must start from an empty ring. The first session on a
+// link keeps what's there (the proven path is untouched); later ones discard.
+TEST(AaBulkLink, BeginSessionFlushesOnlyAReusedLink) {
+    AaBulkLink<64> link;
+    const auto a = seq(5, 1);
+    CHECK(link.onInComplete(true, a.data(), a.size()));
+    CHECK_EQ(link.beginSession(), size_t(0));  // first session: nothing dropped
+    CHECK_EQ(link.sessions(), 1u);
+    CHECK_EQ(link.ringUsed(), size_t(5));
+    uint8_t out[64];
+    CHECK_EQ(link.read(out, 2), 2);  // the session reads some ...
+    const auto b = seq(7, 100);
+    CHECK(link.onInComplete(true, b.data(), b.size()));  // ... and more arrives
+
+    CHECK_EQ(link.beginSession(), size_t(3 + 7));  // re-bind: the leftovers go
+    CHECK_EQ(link.sessions(), 2u);
+    CHECK_EQ(link.ringUsed(), size_t(0));
+    CHECK_EQ(link.read(out, sizeof out), 0);
+    CHECK_EQ(link.rxBytes(), uint32_t(12));  // cumulative telemetry is kept
+
+    // What arrives afterwards is the new session's, in order, and the whole ring is
+    // free again (no phantom occupancy after the flush).
+    const auto c = seq(link.kCapacity, 200);
+    REQUIRE(link.onInComplete(true, c.data(), c.size()));
+    REQUIRE(link.read(out, sizeof out) == static_cast<int>(link.kCapacity));
+    for (size_t i = 0; i < link.kCapacity; ++i) CHECK_EQ(int(out[i]), int(c[i]));
+    CHECK_EQ(link.beginSession(), size_t(0));  // third session, empty ring
+    CHECK(!link.dead());
+}
+
+// A flush never revives a dead link: the fault latch is sticky for the transport.
+TEST(AaBulkLink, FlushKeepsTheDeadLatch) {
+    AaBulkLink<64> link;
+    const auto a = seq(9);
+    CHECK(link.onInComplete(true, a.data(), a.size()));
+    link.beginSession();
+    CHECK(!link.onInComplete(false, nullptr, 0));
+    CHECK_EQ(link.beginSession(), size_t(9));
+    CHECK(link.dead());
+    CHECK(link.fault() == AaLinkFault::InError);
+    uint8_t out[16];
+    CHECK_EQ(link.read(out, sizeof out), -1);
+    CHECK(!link.writable());
+}
+
+// The reviewer's failure mode: the old session left half a frame in the ring. Without
+// the flush, the next session's messenger reads it as the start of a frame header and
+// the phone's first real frame is misparsed; with it, that frame arrives intact.
+TEST(AaBulkLink, ReboundSessionParsesOnlyItsOwnBytes) {
+    // What the phone sends the NEW session: one plain control frame.
+    carsh::host::FakeAaTransport encoder;
+    carsh::aa::AaMessenger enc(encoder);
+    const uint8_t body[4] = {0x00, 0x01, 0x00, 0x07};
+    REQUIRE(enc.send(carsh::aa::ChannelId::Control, carsh::aa::EncryptionType::Plain,
+                     carsh::aa::MessageType::Specific, 0x0002, body, sizeof body));
+    const std::vector<uint8_t> fresh = encoder.sent();
+    const uint8_t stale[3] = {0x03, 0x0b, 0x40};  // the old session's torn tail
+
+    auto runSecondSession = [&](bool flush, carsh::aa::AaMessage& got) {
+        LinkTransport<4096> t;
+        t.link.beginSession();
+        {
+            carsh::aa::AaMessenger first(t);  // session 1 over the link, then freed
+            carsh::aa::AaMessage m;
+            CHECK(!first.receive(m, 0));
+        }
+        REQUIRE(t.link.onInComplete(true, stale, sizeof stale));
+        if (flush) CHECK_EQ(t.link.beginSession(), sizeof stale);
+        carsh::aa::AaMessenger second(t);
+        REQUIRE(t.link.onInComplete(true, fresh.data(), fresh.size()));
+        return second.receive(got, 0);
+    };
+
+    carsh::aa::AaMessage got;
+    REQUIRE(runSecondSession(true, got));
+    CHECK(got.channel == carsh::aa::ChannelId::Control);
+    CHECK_EQ(got.messageId, uint16_t(0x0002));
+    CHECK(got.payload == std::vector<uint8_t>(body, body + sizeof body));
+
+    // Control: the same bytes without the flush do not yield that frame.
+    carsh::aa::AaMessage bad;
+    const bool parsed = runSecondSession(false, bad);
+    CHECK(!parsed || bad.messageId != 0x0002 ||
+          bad.payload != std::vector<uint8_t>(body, body + sizeof body));
+}
+
+// The flush against a live producer (a healthy link keeps its bulk-IN requests posted
+// while the driver re-binds): it drops exactly what it reports, never tears a
+// transfer, and the bytes after it continue in order.
+TEST(AaBulkLink, FlushRacingTheProducerStaysConsistent) {
+    static AaBulkLink<4096> link;
+    constexpr uint32_t kTotal = 2u * 1024 * 1024;
+    std::atomic<bool> bad{false};
+    std::atomic<bool> done{false};
+    std::thread producer([&] {
+        uint32_t sent = 0;
+        uint8_t chunk[700];
+        uint32_t k = 0;
+        while (sent < kTotal) {
+            const size_t n = 1 + (k++ * 131) % sizeof chunk;
+            const size_t take = n < kTotal - sent ? n : kTotal - sent;
+            if (link.kCapacity - link.ringUsed() < take) {
+                std::this_thread::yield();
+                continue;
+            }
+            for (size_t i = 0; i < take; ++i) chunk[i] = static_cast<uint8_t>(sent + i);
+            if (!link.onInComplete(true, chunk, take)) {
+                bad.store(true);
+                break;
+            }
+            sent += static_cast<uint32_t>(take);
+        }
+        done.store(true);
+    });
+    uint32_t pos = 0;  // stream offset of the next byte the consumer will see
+    uint32_t dropped = 0;
+    uint8_t buf[997];
+    unsigned iter = 0;
+    while (!bad.load() && (pos < kTotal)) {
+        if (++iter % 7 == 0) {
+            const size_t d = link.beginSession();  // flush (after the first call)
+            pos += static_cast<uint32_t>(d);
+            dropped += static_cast<uint32_t>(d);
+            continue;
+        }
+        const int n = link.read(buf, sizeof buf);
+        if (n < 0) {
+            bad.store(true);
+            break;
+        }
+        for (int i = 0; i < n; ++i) {
+            if (buf[i] != static_cast<uint8_t>(pos + static_cast<uint32_t>(i))) bad.store(true);
+        }
+        pos += static_cast<uint32_t>(n);
+        if (n == 0) {
+            if (done.load() && link.ringUsed() == 0) break;
+            std::this_thread::yield();
+        }
+    }
+    producer.join();
+    CHECK(!bad.load());
+    CHECK_EQ(pos, kTotal);  // read + dropped account for every byte, exactly once
+    CHECK(dropped > 0u);
     CHECK(!link.dead());
 }

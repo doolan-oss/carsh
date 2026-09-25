@@ -7,6 +7,8 @@
 #include "aa/AaProjection.h"
 
 #include <functional>
+#include <type_traits>
+#include <utility>
 #include <vector>
 
 #include "Test.h"
@@ -27,6 +29,7 @@ using carsh::aa::AvMsgId;
 using carsh::aa::ChannelId;
 using carsh::aa::EncryptionType;
 using carsh::aa::InputMsgId;
+using carsh::aa::MediaKey;
 using carsh::aa::MessageType;
 using carsh::aa::TouchAction;
 using carsh::host::FakeAaCrypto;
@@ -388,4 +391,52 @@ TEST(AaProjection, DragStreamsEndToEnd) {
         CHECK_EQ(got[i].x, 400u);
         CHECK_EQ(got[i].y, ys[i]);
     }
+}
+
+// Review T10: a media key must carry the caller's 64-bit µs stamp. sendMediaKey has no
+// default timestamp any more, so a call that forgets it no longer compiles — the
+// zero-stamped keys can't come back silently.
+namespace {
+template <class P, class = void>
+struct MediaKeyWithoutStamp : std::false_type {};
+template <class P>
+struct MediaKeyWithoutStamp<
+    P, std::void_t<decltype(std::declval<P&>().sendMediaKey(MediaKey::PlayPause))>>
+    : std::true_type {};
+}  // namespace
+static_assert(!MediaKeyWithoutStamp<AaProjection>::value,
+              "AaProjection::sendMediaKey must require a timestamp");
+
+TEST(AaProjection, MediaKeyCarriesTheCallersStamp) {
+    Rig rig;
+    rig.up();
+    rig.hu.clearSent();
+    const uint64_t stamp = 0x100000007ULL;  // past 2^32 µs (~71.6 min of uptime)
+    REQUIRE(rig.proj.sendMediaKey(MediaKey::Next, stamp));
+
+    std::vector<uint64_t> stamps;
+    FakeAaTransport t;
+    t.pushRx(rig.hu.sent());
+    AaMessenger m(t);
+    AaMessage msg;
+    while (m.receive(msg, 0)) {
+        REQUIRE(msg.payload.size() >= 2);
+        const uint16_t id = static_cast<uint16_t>((msg.payload[0] << 8) | msg.payload[1]);
+        if (msg.channel != ChannelId::Input ||
+            id != static_cast<uint16_t>(InputMsgId::InputEventIndication))
+            continue;
+        pb::Reader r(msg.payload.data() + 2, msg.payload.size() - 2);
+        uint32_t f;
+        uint8_t w;
+        uint64_t ts = 0;
+        while (!r.eof()) {
+            REQUIRE(r.tag(f, w));
+            if (f == 1 && w == 0) REQUIRE(r.varint(ts));  // InputEventIndication.timestamp
+            else REQUIRE(r.skip(w));
+        }
+        stamps.push_back(ts);
+    }
+    REQUIRE(stamps.size() == 2);  // button down + up
+    CHECK_EQ(stamps[0], stamp);
+    CHECK_EQ(stamps[1], stamp);
 }

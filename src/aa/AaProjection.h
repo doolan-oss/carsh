@@ -12,8 +12,9 @@
 //   AA tab focus     --> setFocus()      --> AaConnection::sendVideoFocus
 //
 // Session end: the phone's SHUTDOWN_REQUEST (or any other path into
-// AaState::Shutdown) arrives as onShutdown; a dongle unplug / USB re-cycle / TLS
-// death is reported by the owner calling disconnect(). Either way the projection
+// AaState::Shutdown — AaConnection::shutdownReason() says which) arrives as
+// onShutdown; a dongle unplug / USB re-cycle / link fault is reported by the owner
+// calling disconnect(). Either way the projection
 // drops its connection and runs reset() — setConnected(false) + a cleared frame — so
 // the UI never sits on a frozen frame and the app's auto-show latch re-arms.
 //
@@ -100,8 +101,11 @@ public:
     }
 
     // From the player UI: drive AA media playback (play/pause/next/prev) by sending a
-    // media key over the input channel. False if not projecting.
-    bool sendMediaKey(MediaKey key, uint64_t timestampUs = 0) {
+    // media key over the input channel. timestampUs is the same monotonic 64-bit µs
+    // clock as forwardTouch's; it is deliberately NOT defaulted, so a zero-stamped key
+    // (review T10) can't creep back in through a call that forgot it. False if not
+    // projecting.
+    bool sendMediaKey(MediaKey key, uint64_t timestampUs) {
         if (conn_ == nullptr) return false;
         return conn_->sendMediaKey(key, timestampUs);
     }

@@ -13,10 +13,13 @@
 // AaState::Shutdown (phone SHUTDOWN_REQUEST, version reject, fatal TLS error), or
 // when the transport itself disappears. Every end calls AaProjection::disconnect()
 // (screen back to the placeholder, auto-show latch re-armed) before the connection
-// is freed. If the dongle doesn't re-cycle by itself within a grace period, the
-// driver forces a USB re-enumeration (aoaForceReenumerate), bounded by
-// AaLinkSupervisor's retry budget; when that is spent it logs
-// "AA link lost — replug dongle" and waits for a replug.
+// is freed. A phone Exit (AaShutdownReason::PhoneRequest) stops there: nothing is
+// forced, so projection does not relaunch behind the user's back — the dongle
+// re-cycles by itself when the phone leaves, or the user replugs it. After a fault,
+// if the dongle doesn't re-cycle by itself within a grace period, the driver forces
+// a USB re-enumeration (aoaForceReenumerate), bounded by AaLinkSupervisor's retry
+// budget; when that is spent it logs "AA link lost — replug dongle" and waits for a
+// replug.
 #ifndef _carsh_circle_aa_driver_h
 #define _carsh_circle_aa_driver_h
 
@@ -54,6 +57,8 @@ private:
     void unwatchTransport();
     void forceReenumerate();
     void logLinkFault();
+    // The "uaa1 gone ..." line for a consumed removal, whatever phase it arrives in.
+    void logTransportGone(uint64_t nowMs);
 
     // CDevice removed-handler on the bound transport: runs inside Circle's device
     // teardown (UpdatePlugAndPlay, or our own forced removal) — task context.

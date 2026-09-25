@@ -1,8 +1,8 @@
 // AaLinkSupervisor — the Android Auto driver's session-end and recovery policy, kept
 // platform-independent so it is host-tested (tests/aa/AaLinkSupervisor_test.cpp).
 // device/CircleAaDriver reports what it sees (a transport bound or gone, the link
-// dead, the connection's state) and carries out the Action returned; the supervisor
-// owns only the timing and the retry budget.
+// dead, the connection's state and shutdown reason) and carries out the Action
+// returned; the supervisor owns only the timing and the retry budget.
 //
 // Policy (review A3/A4/A7/A9):
 //  * A session ends when the transport's link latches dead (any bulk-IN/OUT fault,
@@ -10,12 +10,20 @@
 //    SHUTDOWN_REQUEST — already answered — a version reject, or an unrecoverable TLS
 //    failure). -> EndSession: the driver drops the connection and resets the
 //    projection at once, so the UI never sits on a frozen AA frame.
-//  * The dongle normally re-cycles its USB link by itself when a session ends. It gets
-//    graceMs to do that; a transport change cancels everything below. If it doesn't,
-//    -> ForceReenumerate: the driver removes the dongle's USB device and rescans the
-//    bus, which port-resets it. It re-enumerates (PTP -> AOA switch, or straight back
-//    into accessory mode) and the next "uaa1" starts a fresh session. There is no
-//    in-place endpoint recovery; CircleAoaTransport.cpp explains why.
+//  * The phone's own SHUTDOWN_REQUEST (AaShutdownReason::PhoneRequest: the user chose
+//    Exit) is NOT a fault: the session ends and nothing is forced (phase Exited).
+//    Forcing a re-enumeration would restart AA and relaunch projection seconds after
+//    the user left it. A wireless dongle re-cycles its USB by itself when the phone
+//    leaves, and a replug always works; either brings a fresh transport and session.
+//    It takes precedence over a link that dies on the same tick (the dongle dropping
+//    its USB link as it re-cycles is a consequence of the exit, not a fault).
+//  * After a fault (dead link, version reject, TLS failure) the dongle normally
+//    re-cycles its USB link by itself too. It gets graceMs to do that; a transport
+//    change cancels everything below. If it doesn't, -> ForceReenumerate: the driver
+//    removes the dongle's USB device and rescans the bus, which port-resets it. It
+//    re-enumerates (PTP -> AOA switch, or straight back into accessory mode) and the
+//    next "uaa1" starts a fresh session. There is no in-place endpoint recovery;
+//    CircleAoaTransport.cpp explains why.
 //  * At most maxForced forced re-enumerations in a row without a session reaching
 //    Running. After that -> GiveUp, once ("AA link lost — replug dongle"), and stay
 //    idle until a transport comes up on its own (replug, or the dongle re-cycling).
@@ -23,9 +31,16 @@
 //    (same log line): the dongle did not re-enumerate.
 // The budget refills when a session reaches Running, or when a transport comes up
 // that we did not force (the dongle re-cycled by itself, or the user replugged it).
+//
+// Every transport removal is reported, not only one that cuts a live session:
+// goneKind() says what a removal means from the phase it arrives in, so the bench log
+// shows whether the dongle re-cycled by itself after an Exit or a fault (the [hw]
+// premise of the Exit policy) rather than staying silent once the session is freed.
 #pragma once
 
 #include <cstdint>
+
+#include "aa/AaConnection.h"  // AaShutdownReason
 
 namespace carsh::aa {
 
@@ -44,7 +59,10 @@ public:
     enum class Phase {
         NoTransport,  // no "uaa1" bound (not plugged, re-cycling, or being re-enumerated)
         Session,      // bound; the AaConnection is live
-        Ended,        // session torn down, transport still bound — grace period running
+        Ended,        // session torn down after a fault, transport still bound — grace
+                      // period running, then a forced re-enumeration
+        Exited,       // the phone ended the session (user Exit), transport still bound —
+                      // nothing forced; idle until the transport goes / comes back
         GaveUp,       // retry budget spent; idle until a transport comes up on its own
     };
 
@@ -56,7 +74,26 @@ public:
         DongleLost,        // forced, but nothing came back: same log line (once)
     };
 
-    enum class EndCause { None, LinkDead, Shutdown };
+    enum class EndCause {
+        None,
+        LinkDead,   // the transport latched a bulk-IN/OUT fault
+        Shutdown,   // the connection shut down on a fault (version reject, TLS failure)
+        PhoneExit,  // the phone's SHUTDOWN_REQUEST: the user chose Exit
+    };
+
+    // What the bound transport's removal means (goneKind(), asked before
+    // onTransportGone()). Circle does not log hub connects/disconnects, so the
+    // driver's "uaa1 gone" line is the only trace of the dongle re-cycling.
+    enum class GoneKind {
+        LiveSession,  // cut a live session: unplugged, or the dongle re-cycled mid-session
+        AfterExit,    // after the phone's Exit: the dongle re-cycled by itself (or was
+                      // unplugged) — nothing had been forced
+        AfterFault,   // after a fault ended the session, before any forced
+                      // re-enumeration: the dongle re-cycled by itself (or was unplugged)
+        Forced,       // the removal a ForceReenumerate performed
+        AfterGiveUp,  // after GiveUp: the dongle re-cycled by itself, or was unplugged
+        NotBound,     // nothing was bound (not expected; reported, not acted on)
+    };
 
     AaLinkSupervisor() = default;
     explicit AaLinkSupervisor(const Config& cfg) : cfg_(cfg) {}
@@ -73,9 +110,12 @@ public:
     // removal a ForceReenumerate performed).
     void onTransportGone() { phase_ = Phase::NoTransport; }
 
-    // Once per driver tick. linkDead / shutdown / running describe the bound
-    // transport and its connection (all false when nothing is bound).
-    Action update(uint64_t nowMs, bool linkDead, bool shutdown, bool running) {
+    // Once per driver tick. linkDead is the bound transport's latch (false only when
+    // nothing is bound — it stays true on a bound transport after its session ended,
+    // which Ended/Exited/GaveUp ignore). shutdown / running describe the live
+    // connection (AaShutdownReason::None / false once it has been freed); shutdown is
+    // its shutdownReason() — None while it is not in AaState::Shutdown.
+    Action update(uint64_t nowMs, bool linkDead, AaShutdownReason shutdown, bool running) {
         switch (phase_) {
             case Phase::NoTransport:
                 if (awaitingReturn_ && nowMs - forcedAtMs_ >= cfg_.returnTimeoutMs) {
@@ -85,7 +125,13 @@ public:
                 return Action::None;
             case Phase::Session:
                 if (running) forced_ = 0;  // a healthy session refills the budget
-                if (linkDead || shutdown) {
+                if (shutdown == AaShutdownReason::PhoneRequest) {
+                    cause_ = EndCause::PhoneExit;  // wins over a link dying alongside
+                    phase_ = Phase::Exited;
+                    endedAtMs_ = nowMs;  // only for msSinceEnd(): Exited never times out
+                    return Action::EndSession;
+                }
+                if (linkDead || shutdown != AaShutdownReason::None) {
                     cause_ = linkDead ? EndCause::LinkDead : EndCause::Shutdown;
                     phase_ = Phase::Ended;
                     endedAtMs_ = nowMs;
@@ -103,10 +149,32 @@ public:
                 }
                 phase_ = Phase::GaveUp;
                 return Action::GiveUp;
+            case Phase::Exited:  // a later link fault on the idle transport changes nothing
             case Phase::GaveUp:
                 return Action::None;
         }
         return Action::None;
+    }
+
+    // What a removal of the bound transport means right now. Ask it when the removal
+    // is noticed, BEFORE onTransportGone() (which resets the phase).
+    GoneKind goneKind() const {
+        switch (phase_) {
+            case Phase::Session: return GoneKind::LiveSession;
+            case Phase::Exited: return GoneKind::AfterExit;
+            case Phase::Ended: return GoneKind::AfterFault;
+            case Phase::GaveUp: return GoneKind::AfterGiveUp;
+            case Phase::NoTransport:
+                return awaitingReturn_ ? GoneKind::Forced : GoneKind::NotBound;
+        }
+        return GoneKind::NotBound;
+    }
+
+    // ms from the last session's end (EndSession) to nowMs — for the removal log after
+    // an Exit or a fault. 0 when no session has ended since the last bind.
+    uint64_t msSinceEnd(uint64_t nowMs) const {
+        if (cause_ == EndCause::None || nowMs < endedAtMs_) return 0;
+        return nowMs - endedAtMs_;
     }
 
     Phase phase() const { return phase_; }
