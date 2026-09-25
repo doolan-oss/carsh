@@ -1,12 +1,13 @@
 // BtStackGlue.cpp — the BTstack integration, entirely gated behind
-// CARSH_HAVE_BTSTACK. Without the flag it provides trivial stubs so the device
-// image links today. With the flag (and the BTstack source on the include path
-// + the BCM/CYW firmware on SD), this becomes the A2DP sink + AVRCP CT/TG bridge.
+// CARSH_HAVE_BTSTACK. Without the flag it provides trivial stubs so the default
+// device image links without BTstack. With the flag (third_party/btstack + the
+// rtlbt firmware on SD) this is the A2DP sink + AVRCP CT/TG bridge over a USB
+// Realtek dongle.
 //
-// This is a SCAFFOLD with the real BTstack call structure and TODO markers — it
-// is not claimed working; complete it at the bench against a controller. The
-// reference is BTstack's port/raspi (UART transport + btstack_chipset_bcm
-// firmware download) and example/a2dp_sink_demo.c / avrcp_*.
+// The profile setup mirrors BTstack v1.6.1 example/a2dp_sink_demo.c: the same
+// init order, all three AVRCP packet handlers (avrcp + controller + target) and
+// the A2DP sink / AVRCP CT / AVRCP TG / Device ID SDP records. What has been
+// validated on the bench is tracked in STATUS.md and HARDWARE_TODO H6.
 #include "BtStackGlue.h"
 
 #include "CircleBluetooth.h"
@@ -28,17 +29,18 @@ uint32_t btGlueA2dpSampleRate() { return 0; }
 #else
 // ---------------------------------------------------------------------------
 // Live build: BTstack present (CARSH_HAVE_BTSTACK). Classic-only A2DP sink +
-// AVRCP CT/TG over the Circle USB HCI transport, modelled on BTstack's
-// example/a2dp_sink_demo.c + avrcp examples. The HCI command/event path is real;
-// the A2DP **media** path depends on the USB ACL bulk transfer that Circle's
-// CUSBBluetoothDevice does not yet expose (TODO(hw), see CircleHciTransport.h),
-// so audio cannot actually flow until that gap is closed at the bench.
+// AVRCP CT/TG over the Circle USB HCI transport (CircleHciTransport: HCI
+// commands/events plus the ACL bulk path added by
+// scripts/patches/usbbluetooth-acl.patch).
 #include "CircleHciTransport.h"
-#include "bt/NowPlaying.h"  // platform-independent AVRCP metadata assembly
+#include "bt/LinkTracker.h"  // platform-independent connection bookkeeping
+#include "bt/NowPlaying.h"   // platform-independent AVRCP metadata assembly
 
 #include <circle/logger.h>  // bench bring-up diagnostics over the serial log
+#include <cstddef>
 #include <cstdio>           // fopen self-test: does newlib reach the SD card?
 #include <cstdarg>          // route BTstack log_info/log_error to the serial log
+#include <cstring>          // memset of the SDP record buffers
 
 // BTstack is C; include its headers with C linkage. Specific headers only (NOT
 // the umbrella btstack.h, which drags in BLE/mesh we don't build).
@@ -47,15 +49,19 @@ extern "C" {
 #include "btstack_run_loop.h"
 #include "btstack_run_loop_embedded.h"
 #include "btstack_event.h"
+#include "btstack_util.h"
+#include "bluetooth_company_id.h"
 #include "hci.h"
 #include "gap.h"
 #include "l2cap.h"
 #include "classic/sdp_server.h"
-#include "classic/avdtp_util.h"  // avdtp_local_seid()
+#include "classic/sdp_util.h"     // de_get_len(): SDP record size check
+#include "classic/avdtp_util.h"   // avdtp_local_seid(); pulls in avdtp.h
 #include "classic/a2dp_sink.h"
 #include "classic/avrcp.h"
 #include "classic/avrcp_controller.h"
 #include "classic/avrcp_target.h"
+#include "classic/device_id_server.h"
 #include "classic/btstack_sbc.h"
 #include "classic/btstack_sbc_bluedroid.h"
 #include "btstack_chipset_realtek.h"
@@ -91,10 +97,13 @@ btstack_packet_callback_registration_t g_hciEventCb;
 // the stream's rate. Defaults to the most common A2DP rate until the first frame.
 uint32_t g_btSampleRate = 44100;
 
-// Active connection identifiers, learned from BTstack connection events.
-uint16_t g_a2dpCid = 0;
-uint16_t g_avrcpCid = 0;
-uint8_t  g_localSeid = 0;
+// Which ACL link is the connected phone, its A2DP/AVRCP channel ids, and the
+// one-shot report of a user connect's outcome. BTstack delivers these facts as
+// separate HCI / A2DP / AVRCP events; the handlers below only extract fields and
+// feed them here (host-tested in tests/bt/LinkTracker_test).
+carsh::bt::LinkTracker g_link;
+
+uint8_t g_localSeid = 0;
 
 // Accumulates the per-attribute AVRCP now-playing subevents into one metadata
 // (host-tested in tests/bt/BtParse_test).
@@ -108,6 +117,26 @@ btstack_sbc_decoder_bluedroid_t g_sbcContext;
 // the demo's media_sbc_codec_capabilities.
 uint8_t g_sbcCapabilities[] = {0xFF, 0xFF, 2, 53};
 uint8_t g_sbcConfiguration[4];
+
+// SDP service records. Phones decide whether to open AVRCP to an A2DP sink (and
+// which profiles to auto-connect) from these, so without them AVRCP never comes
+// up. sdp_register_service() keeps a pointer into each buffer, so they must be
+// static. Sizes are a2dp_sink_demo.c's; the carsh names below are no longer than
+// the BTstack defaults those sizes were chosen for, and each record's encoded
+// length is checked after it is built.
+uint8_t g_sdpA2dpSink[150];
+uint8_t g_sdpAvrcpController[200];
+uint8_t g_sdpAvrcpTarget[150];
+uint8_t g_sdpDeviceId[100];
+const char kSdpProvider[] = "carsh";
+
+// HU-initiated AVRCP. After A2DP signaling comes up, give the phone a moment to
+// open AVRCP itself (it usually does once it sees our AVRCP records), and only
+// connect from our side if it hasn't — avoiding an AVCTP connect collision in the
+// common case. BTstack resolves a collision anyway; this just avoids the retry.
+constexpr uint32_t kAvrcpConnectDelayMs = 1500;
+btstack_timer_source_t g_avrcpConnectTimer;
+bd_addr_t g_avrcpConnectAddr;
 
 // Realtek firmware (RTL8761B etc.) lives on the SD boot partition; BTstack loads
 // the matching rtlbt blob by USB product id during HCI bring-up (R3).
@@ -145,22 +174,78 @@ void a2dpMediaHandler(uint8_t /*seid*/, uint8_t* packet, uint16_t size) {
                                    static_cast<uint16_t>(size - kMediaHeader));
 }
 
-// A2DP control events: stream open/close. TODO(hw): on SBC config event, call
-// a2dp_sink_set_config_sbc / a2dp_sink_start_stream_accept against the negotiated
-// SEIDs (the demo's STREAM_ENDPOINT_CONFIGURATION_SBC handling).
+// Deferred HU-side AVRCP connect (see kAvrcpConnectDelayMs).
+void avrcpConnectTimerHandler(btstack_timer_source_t*) {
+    const carsh::bt::BdAddr a = toBdAddr(g_avrcpConnectAddr);
+    // The phone opened AVRCP itself, A2DP went away, or the link dropped.
+    if (!g_link.shouldInitiateAvrcp(a)) return;
+    uint16_t cid = 0;
+    uint8_t status = avrcp_connect(g_avrcpConnectAddr, &cid);
+    if (status == ERROR_CODE_SUCCESS) {
+        g_link.avrcpConnectStarted(a);
+        CLogger::Get()->Write(FromBt, LogNotice, "AVRCP: connecting to %s",
+                              bd_addr_to_str(g_avrcpConnectAddr));
+    } else {
+        CLogger::Get()->Write(FromBt, LogWarning, "AVRCP: connect to %s refused (0x%02x)",
+                              bd_addr_to_str(g_avrcpConnectAddr), status);
+    }
+}
+
+void scheduleAvrcpConnect(const bd_addr_t addr) {
+    btstack_run_loop_remove_timer(&g_avrcpConnectTimer);
+    bd_addr_copy(g_avrcpConnectAddr, addr);
+    btstack_run_loop_set_timer_handler(&g_avrcpConnectTimer, &avrcpConnectTimerHandler);
+    btstack_run_loop_set_timer(&g_avrcpConnectTimer, kAvrcpConnectDelayMs);
+    btstack_run_loop_add_timer(&g_avrcpConnectTimer);
+}
+
+// A2DP sink events. BTstack's sink accepts the phone's SBC configuration by
+// itself; the decoder parses the SBC frame headers, so the configuration
+// subevents need no handling here. What matters is connection state: which link
+// has A2DP, and whether a user connect reached a stream or failed on the way.
 void a2dpPacketHandler(uint8_t type, uint16_t, uint8_t* packet, uint16_t) {
     if (type != HCI_EVENT_PACKET) return;
     if (hci_event_packet_get_type(packet) != HCI_EVENT_A2DP_META) return;
     uint8_t sub = hci_event_a2dp_meta_get_subevent_code(packet);
+    bd_addr_t addr;
     switch (sub) {
-        case A2DP_SUBEVENT_STREAM_ESTABLISHED:
-            g_a2dpCid = a2dp_subevent_stream_established_get_a2dp_cid(packet);
-            CLogger::Get()->Write(FromBt, LogNotice, "A2DP stream ESTABLISHED (cid 0x%04x)",
-                                  g_a2dpCid);
+        case A2DP_SUBEVENT_SIGNALING_CONNECTION_ESTABLISHED: {
+            // Both directions. On an outgoing failure (page timeout, SDP or L2CAP
+            // refused) BTstack reports it here, then again as a failed
+            // STREAM_ESTABLISHED; the tracker reports the connect failure once.
+            uint8_t status = a2dp_subevent_signaling_connection_established_get_status(packet);
+            uint16_t cid = a2dp_subevent_signaling_connection_established_get_a2dp_cid(packet);
+            a2dp_subevent_signaling_connection_established_get_bd_addr(packet, addr);
+            CLogger::Get()->Write(FromBt, LogNotice,
+                                  "A2DP signaling %s (status 0x%02x, cid 0x%04x) %s",
+                                  status == ERROR_CODE_SUCCESS ? "up" : "FAILED", status, cid,
+                                  bd_addr_to_str(addr));
+            g_link.a2dpSignalingEstablished(status, cid, toBdAddr(addr));
+            // Bring up AVRCP (metadata + transport keys) for the connected phone.
+            if (status == ERROR_CODE_SUCCESS && g_link.connected() &&
+                g_link.connectedAddress() == toBdAddr(addr)) {
+                scheduleAvrcpConnect(addr);
+            }
             break;
+        }
+        case A2DP_SUBEVENT_STREAM_ESTABLISHED: {
+            uint8_t status = a2dp_subevent_stream_established_get_status(packet);
+            a2dp_subevent_stream_established_get_bd_addr(packet, addr);
+            CLogger::Get()->Write(FromBt, LogNotice, "A2DP stream %s (status 0x%02x, cid 0x%04x)",
+                                  status == ERROR_CODE_SUCCESS ? "ESTABLISHED" : "FAILED",
+                                  status, a2dp_subevent_stream_established_get_a2dp_cid(packet));
+            g_link.a2dpStreamEstablished(status, toBdAddr(addr));
+            break;
+        }
         case A2DP_SUBEVENT_STREAM_RELEASED:
-            g_a2dpCid = 0;
+            // Only the media stream; the signaling channel (and the phone) can
+            // still be up — e.g. the phone closes the stream to reconfigure.
             CLogger::Get()->Write(FromBt, LogNotice, "A2DP stream released");
+            break;
+        case A2DP_SUBEVENT_SIGNALING_CONNECTION_RELEASED:
+            CLogger::Get()->Write(FromBt, LogNotice, "A2DP signaling released");
+            g_link.a2dpSignalingReleased(
+                a2dp_subevent_signaling_connection_released_get_a2dp_cid(packet));
             break;
         default:
             CLogger::Get()->Write(FromBt, LogNotice, "A2DP event 0x%02x", sub);
@@ -168,33 +253,75 @@ void a2dpPacketHandler(uint8_t type, uint16_t, uint8_t* packet, uint16_t) {
     }
 }
 
-// AVRCP controller events: connection + now-playing metadata.
+// AVRCP connection events (avrcp_register_packet_handler): CONNECTION_ESTABLISHED
+// / CONNECTION_RELEASED only. Controller and target events have their own
+// handlers below.
 void avrcpPacketHandler(uint8_t type, uint16_t, uint8_t* packet, uint16_t) {
     if (type != HCI_EVENT_PACKET) return;
     if (hci_event_packet_get_type(packet) != HCI_EVENT_AVRCP_META) return;
-    using carsh::bt::AvrcpAttr;
     switch (hci_event_avrcp_meta_get_subevent_code(packet)) {
-        case AVRCP_SUBEVENT_CONNECTION_ESTABLISHED:
-            g_avrcpCid = avrcp_subevent_connection_established_get_avrcp_cid(packet);
+        case AVRCP_SUBEVENT_CONNECTION_ESTABLISHED: {
+            uint8_t status = avrcp_subevent_connection_established_get_status(packet);
+            uint16_t cid = avrcp_subevent_connection_established_get_avrcp_cid(packet);
+            bd_addr_t addr;
+            avrcp_subevent_connection_established_get_bd_addr(packet, addr);
+            g_link.avrcpEstablished(status, cid, toBdAddr(addr));
+            if (status != ERROR_CODE_SUCCESS) {
+                CLogger::Get()->Write(FromBt, LogWarning, "AVRCP: connection to %s failed (0x%02x)",
+                                      bd_addr_to_str(addr), status);
+                break;
+            }
+            CLogger::Get()->Write(FromBt, LogNotice, "AVRCP: connected to %s (cid 0x%04x)",
+                                  bd_addr_to_str(addr), cid);
+            if (cid != g_link.avrcpCid()) break;  // not the connected phone's AVRCP
             // Subscribe to playback-status + track-changed notifications and pull the
             // current track's attributes, so the now-playing subevents below start
             // arriving and refresh on every change. Without this the controller is
             // connected but the phone never volunteers metadata. [hw] bench check.
             avrcp_controller_enable_notification(
-                g_avrcpCid, AVRCP_NOTIFICATION_EVENT_PLAYBACK_STATUS_CHANGED);
+                cid, AVRCP_NOTIFICATION_EVENT_PLAYBACK_STATUS_CHANGED);
             avrcp_controller_enable_notification(
-                g_avrcpCid, AVRCP_NOTIFICATION_EVENT_TRACK_CHANGED);
-            avrcp_controller_get_now_playing_info(g_avrcpCid);
+                cid, AVRCP_NOTIFICATION_EVENT_TRACK_CHANGED);
+            avrcp_controller_get_now_playing_info(cid);
             break;
-        case AVRCP_SUBEVENT_CONNECTION_RELEASED:
-            g_avrcpCid = 0;
-            g_nowPlaying.reset();
+        }
+        case AVRCP_SUBEVENT_CONNECTION_RELEASED: {
+            uint16_t cid = avrcp_subevent_connection_released_get_avrcp_cid(packet);
+            CLogger::Get()->Write(FromBt, LogNotice, "AVRCP: released (cid 0x%04x)", cid);
+            if (cid == g_link.avrcpCid()) g_nowPlaying.reset();
+            g_link.avrcpReleased(cid);
             break;
+        }
+        default:
+            break;
+    }
+}
+
+// Publish the assembled now-playing metadata (once any text is known). Called on
+// every attribute, not only on NOW_PLAYING_INFO_DONE: BTstack v1.6.1 never emits
+// INFO_DONE for a single-packet GetElementAttributes response — its parser counts
+// the attribute bytes against a length that also includes the NumAttributes byte
+// (avrcp_controller.c list_size vs list_offset) — so waiting for DONE would leave
+// Now Playing on its placeholder. A title/artist/album burst costs a few copies.
+void publishNowPlaying() {
+    if (g_owner && g_nowPlaying.hasText()) g_owner->deliverMetadata(g_nowPlaying.metadata());
+}
+
+// AVRCP controller events (avrcp_controller_register_packet_handler): the phone's
+// notifications and now-playing metadata. BTstack calls this handler without a
+// NULL check once AVRCP is up, so it must be registered before power-on.
+void avrcpControllerPacketHandler(uint8_t type, uint16_t, uint8_t* packet, uint16_t) {
+    if (type != HCI_EVENT_PACKET) return;
+    if (hci_event_packet_get_type(packet) != HCI_EVENT_AVRCP_META) return;
+    const uint16_t cid = g_link.avrcpCid();
+    if (cid == 0) return;  // no AVRCP to the connected phone (yet)
+    using carsh::bt::AvrcpAttr;
+    switch (hci_event_avrcp_meta_get_subevent_code(packet)) {
         case AVRCP_SUBEVENT_NOTIFICATION_TRACK_CHANGED:
             // New track: drop the previous track's attributes and re-query this
             // track's metadata (the fresh attributes arrive via the subevents below).
             g_nowPlaying.reset();
-            if (g_avrcpCid) avrcp_controller_get_now_playing_info(g_avrcpCid);
+            avrcp_controller_get_now_playing_info(cid);
             break;
         // Now-playing attributes arrive one subevent at a time; accumulate them
         // (the value bytes are length-delimited, not NUL-terminated). The
@@ -204,22 +331,26 @@ void avrcpPacketHandler(uint8_t type, uint16_t, uint8_t* packet, uint16_t) {
                 uint8_t(AvrcpAttr::Title),
                 (const char*)avrcp_subevent_now_playing_title_info_get_value(packet),
                 avrcp_subevent_now_playing_title_info_get_value_len(packet));
+            publishNowPlaying();
             break;
         case AVRCP_SUBEVENT_NOW_PLAYING_ARTIST_INFO:
             g_nowPlaying.setAttribute(
                 uint8_t(AvrcpAttr::Artist),
                 (const char*)avrcp_subevent_now_playing_artist_info_get_value(packet),
                 avrcp_subevent_now_playing_artist_info_get_value_len(packet));
+            publishNowPlaying();
             break;
         case AVRCP_SUBEVENT_NOW_PLAYING_ALBUM_INFO:
             g_nowPlaying.setAttribute(
                 uint8_t(AvrcpAttr::Album),
                 (const char*)avrcp_subevent_now_playing_album_info_get_value(packet),
                 avrcp_subevent_now_playing_album_info_get_value_len(packet));
+            publishNowPlaying();
             break;
         case AVRCP_SUBEVENT_NOW_PLAYING_SONG_LENGTH_MS_INFO:
             g_nowPlaying.setDurationMs(
                 avrcp_subevent_now_playing_song_length_ms_info_get_song_length(packet));
+            publishNowPlaying();
             break;
         case AVRCP_SUBEVENT_NOTIFICATION_PLAYBACK_STATUS_CHANGED:
             g_nowPlaying.setPlaybackStatus(
@@ -227,18 +358,50 @@ void avrcpPacketHandler(uint8_t type, uint16_t, uint8_t* packet, uint16_t) {
             if (g_owner) g_owner->deliverMetadata(g_nowPlaying.metadata());
             break;
         case AVRCP_SUBEVENT_NOW_PLAYING_INFO_DONE:
-            // All attributes for this track delivered — publish the assembled set.
-            if (g_owner && g_nowPlaying.hasText()) {
-                g_owner->deliverMetadata(g_nowPlaying.metadata());
-            }
+            publishNowPlaying();  // multi-packet responses do end with DONE
+            break;
+        default:
+            break;  // OPERATION_START/COMPLETE, NOTIFICATION_STATE, ...: nothing to do
+    }
+}
+
+// AVRCP target events (avrcp_target_register_packet_handler): the phone acting as
+// controller toward carsh. carsh's TG is a Category-2 monitor/amplifier and does
+// not advertise absolute volume (no avrcp_target_support_event), so phones keep
+// scaling their own volume and carsh's volume rail stays the one master. BTstack
+// asserts on a missing handler for any of these, so it must exist even though
+// there is little to do.
+void avrcpTargetPacketHandler(uint8_t type, uint16_t, uint8_t* packet, uint16_t) {
+    if (type != HCI_EVENT_PACKET) return;
+    if (hci_event_packet_get_type(packet) != HCI_EVENT_AVRCP_META) return;
+    switch (hci_event_avrcp_meta_get_subevent_code(packet)) {
+        case AVRCP_SUBEVENT_PLAY_STATUS_QUERY:
+            // BTstack waits for the app to answer GetPlayStatus. carsh is not the
+            // player: answer "stopped, length/position unknown" (0xFFFFFFFF) so the
+            // phone doesn't sit out its command timeout.
+            avrcp_target_play_status(avrcp_subevent_play_status_query_get_avrcp_cid(packet),
+                                     0xFFFFFFFFu, 0xFFFFFFFFu, AVRCP_PLAYBACK_STATUS_STOPPED);
+            break;
+        case AVRCP_SUBEVENT_NOTIFICATION_VOLUME_CHANGED:
+            // SetAbsoluteVolume (BTstack has already accepted it). Logged only.
+            CLogger::Get()->Write(
+                FromBt, LogDebug, "AVRCP TG: phone set absolute volume %u",
+                avrcp_subevent_notification_volume_changed_get_absolute_volume(packet));
+            break;
+        case AVRCP_SUBEVENT_OPERATION:
+            // Pass-through key from the phone (BTstack has already accepted it).
+            CLogger::Get()->Write(FromBt, LogDebug, "AVRCP TG: operation 0x%02x %s",
+                                  avrcp_subevent_operation_get_operation_id(packet),
+                                  avrcp_subevent_operation_get_button_pressed(packet)
+                                      ? "pressed" : "released");
             break;
         default:
             break;
     }
 }
 
-// HCI events: connect/disconnect of the Classic link (the stable address
-// ProfileManager keys on, R10).
+// HCI events: the Classic ACL link lifecycle (the stable address ProfileManager
+// keys on, R10) + GAP inquiry results.
 void hciPacketHandler(uint8_t type, uint16_t, uint8_t* packet, uint16_t) {
     if (type != HCI_EVENT_PACKET) return;
     switch (hci_event_packet_get_type(packet)) {
@@ -264,17 +427,31 @@ void hciPacketHandler(uint8_t type, uint16_t, uint8_t* packet, uint16_t) {
                                   hci_event_command_complete_get_command_opcode(packet));
             break;
         case HCI_EVENT_CONNECTION_COMPLETE: {
+            // Also delivered for FAILED pages (e.g. 0x04 Page Timeout): BTstack
+            // frees the link and no Disconnection Complete follows. Only a status-0
+            // ACL link is a connected phone; the tracker turns a failure of the
+            // user's connect into onConnectFailed.
+            if (hci_event_connection_complete_get_link_type(packet) != HCI_LINK_TYPE_ACL) break;
             bd_addr_t addr;
             hci_event_connection_complete_get_bd_addr(packet, addr);
-            CLogger::Get()->Write(FromBt, LogNotice, "ACL link connected (status %u)",
-                                  hci_event_connection_complete_get_status(packet));
-            if (g_owner) g_owner->deliverConnected(toBdAddr(addr));
+            uint8_t status = hci_event_connection_complete_get_status(packet);
+            uint16_t handle = hci_event_connection_complete_get_connection_handle(packet);
+            CLogger::Get()->Write(FromBt, LogNotice, "ACL link %s %s (status 0x%02x, handle 0x%04x)",
+                                  status == ERROR_CODE_SUCCESS ? "up to" : "FAILED to",
+                                  bd_addr_to_str(addr), status, handle);
+            g_link.aclConnectionComplete(status, handle, toBdAddr(addr));
             break;
         }
-        case HCI_EVENT_DISCONNECTION_COMPLETE:
-            CLogger::Get()->Write(FromBt, LogNotice, "ACL link disconnected");
-            if (g_owner) g_owner->deliverDisconnected();
+        case HCI_EVENT_DISCONNECTION_COMPLETE: {
+            uint8_t status = hci_event_disconnection_complete_get_status(packet);
+            uint16_t handle = hci_event_disconnection_complete_get_connection_handle(packet);
+            uint8_t reason = hci_event_disconnection_complete_get_reason(packet);
+            CLogger::Get()->Write(FromBt, LogNotice,
+                                  "ACL link down (status 0x%02x, handle 0x%04x, reason 0x%02x)",
+                                  status, handle, reason);
+            g_link.aclDisconnectionComplete(status, handle, reason);
             break;
+        }
         case GAP_EVENT_INQUIRY_RESULT: {
             // A device found during a scan -> the scan/connect UI's cache.
             carsh::bt::DiscoveredDevice d;
@@ -303,6 +480,58 @@ void hciPacketHandler(uint8_t type, uint16_t, uint8_t* packet, uint16_t) {
     }
 }
 
+// Build one SDP record into its static buffer and register it. Logs (rather than
+// asserts) so a bad record is visible on the serial console at bring-up.
+void registerSdpRecord(const char* what, const uint8_t* record, std::size_t capacity) {
+    const uint32_t len = de_get_len(record);
+    if (len > capacity) {
+        CLogger::Get()->Write(FromBt, LogError, "SDP %s record overflows its buffer (%u > %u)",
+                              what, (unsigned)len, (unsigned)capacity);
+        return;
+    }
+    uint8_t status = sdp_register_service(record);
+    CLogger::Get()->Write(FromBt, status == 0 ? LogNotice : LogError,
+                          "SDP %s record %s (%u bytes, status 0x%02x)", what,
+                          status == 0 ? "registered" : "NOT registered", (unsigned)len, status);
+}
+
+// SDP records for A2DP sink, AVRCP CT, AVRCP TG and Device ID, as in
+// a2dp_sink_demo.c. Four records == MAX_NR_SERVICE_RECORD_ITEMS.
+void registerSdpRecords() {
+    // A2DP sink: carsh presents as a speaker (matches the Loudspeaker CoD below).
+    memset(g_sdpA2dpSink, 0, sizeof(g_sdpA2dpSink));
+    a2dp_sink_create_sdp_record(g_sdpA2dpSink, sdp_create_service_record_handle(),
+                                AVDTP_SINK_FEATURE_MASK_SPEAKER, "carsh Audio Sink",
+                                kSdpProvider);
+    registerSdpRecord("A2DP sink", g_sdpA2dpSink, sizeof(g_sdpA2dpSink));
+
+    // AVRCP controller: we send Category-1 (player) commands — play/pause/next/prev.
+    memset(g_sdpAvrcpController, 0, sizeof(g_sdpAvrcpController));
+    avrcp_controller_create_sdp_record(
+        g_sdpAvrcpController, sdp_create_service_record_handle(),
+        uint16_t(1u << AVRCP_CONTROLLER_SUPPORTED_FEATURE_CATEGORY_PLAYER_OR_RECORDER),
+        "carsh AVRCP Controller", kSdpProvider);
+    registerSdpRecord("AVRCP controller", g_sdpAvrcpController, sizeof(g_sdpAvrcpController));
+
+    // AVRCP target: we receive Category-2 (monitor/amplifier) commands. Phones
+    // look for this record too before opening AVRCP to a sink.
+    memset(g_sdpAvrcpTarget, 0, sizeof(g_sdpAvrcpTarget));
+    avrcp_target_create_sdp_record(
+        g_sdpAvrcpTarget, sdp_create_service_record_handle(),
+        uint16_t(1u << AVRCP_TARGET_SUPPORTED_FEATURE_CATEGORY_MONITOR_OR_AMPLIFIER),
+        "carsh AVRCP Target", kSdpProvider);
+    registerSdpRecord("AVRCP target", g_sdpAvrcpTarget, sizeof(g_sdpAvrcpTarget));
+
+    // Device ID (PnP): identifies the Bluetooth stack (BTstack by BlueKitchen,
+    // vendor id source = Bluetooth SIG) exactly as the BTstack demos do; phones
+    // use it for interop quirks. Product/version 1/1.
+    memset(g_sdpDeviceId, 0, sizeof(g_sdpDeviceId));
+    device_id_create_sdp_record(g_sdpDeviceId, sdp_create_service_record_handle(),
+                                DEVICE_ID_VENDOR_ID_SOURCE_BLUETOOTH,
+                                BLUETOOTH_COMPANY_ID_BLUEKITCHEN_GMBH, 1, 1);
+    registerSdpRecord("Device ID", g_sdpDeviceId, sizeof(g_sdpDeviceId));
+}
+
 }  // namespace
 
 bool btGlueInit(CircleBluetooth* owner) {
@@ -310,6 +539,20 @@ bool btGlueInit(CircleBluetooth* owner) {
     CLogger::Get()->Write(FromBt, LogNotice, "BT bring-up start (Realtek USB dongle)");
     hci_dump_init(&g_btDump);          // BTstack log_info/error -> serial
     hci_dump_enable_packet_log(false); // messages only, no per-packet dumps
+
+    // Connection bookkeeping -> the IBluetooth callbacks (via CircleBluetooth).
+    carsh::bt::LinkTracker::Callbacks linkCb;
+    linkCb.onConnected = [](const carsh::bt::BdAddr& a) {
+        if (g_owner) g_owner->deliverConnected(a);
+    };
+    linkCb.onDisconnected = [](const carsh::bt::BdAddr&) {
+        if (g_owner) g_owner->deliverDisconnected();
+    };
+    linkCb.onConnectFailed = [](const carsh::bt::BdAddr& a, int reason) {
+        CLogger::Get()->Write(FromBt, LogWarning, "connect failed (reason 0x%02x)", reason);
+        if (g_owner) g_owner->deliverConnectFailed(a, reason);
+    };
+    g_link.setCallbacks(linkCb);
 
     // 1. Memory pools + embedded run loop (pumped by CircleBtRunLoopTask).
     btstack_memory_init();
@@ -363,6 +606,10 @@ bool btGlueInit(CircleBluetooth* owner) {
     sdp_init();
 
     a2dp_sink_init();
+    avrcp_init();
+    avrcp_controller_init();
+    avrcp_target_init();
+
     a2dp_sink_register_packet_handler(&a2dpPacketHandler);
     a2dp_sink_register_media_handler(&a2dpMediaHandler);
     avdtp_stream_endpoint_t* ep = a2dp_sink_create_stream_endpoint(
@@ -371,19 +618,26 @@ bool btGlueInit(CircleBluetooth* owner) {
         g_sbcConfiguration, sizeof(g_sbcConfiguration));
     if (ep) g_localSeid = avdtp_local_seid(ep);
 
-    avrcp_init();
-    avrcp_controller_init();
-    avrcp_target_init();
+    // All three AVRCP handlers, as in a2dp_sink_demo.c. avrcp_register_packet_handler
+    // only carries CONNECTION_ESTABLISHED/RELEASED; controller and target events go
+    // through their own callbacks, which BTstack invokes without a NULL check (or
+    // behind btstack_assert) — leaving them unregistered halts the board on the
+    // first AVRCP notification, pass-through response or SetAbsoluteVolume.
     avrcp_register_packet_handler(&avrcpPacketHandler);
+    avrcp_controller_register_packet_handler(&avrcpControllerPacketHandler);
+    avrcp_target_register_packet_handler(&avrcpTargetPacketHandler);
+
+    // 5. SDP records (before power-on, so the first query already sees them).
+    registerSdpRecords();
 
     g_sbcDecoder = btstack_sbc_decoder_bluedroid_init_instance(&g_sbcContext);
     g_sbcDecoder->configure(&g_sbcContext, SBC_MODE_STANDARD, &sbcPcmHandler, nullptr);
 
-    // 5. HCI connect/disconnect events + GAP inquiry results.
+    // 6. HCI connect/disconnect events + GAP inquiry results.
     g_hciEventCb.callback = &hciPacketHandler;
     hci_add_event_handler(&g_hciEventCb);
 
-    // 6. Be visible as an audio device: the phone sees "carsh" in its Bluetooth
+    // 7. Be visible as an audio device: the phone sees "carsh" in its Bluetooth
     //    list (discoverable) and can connect to us as an A2DP speaker (connectable).
     //    Class of device = Audio/Video major, Loudspeaker minor + Audio service so
     //    phones present carsh as a speaker. (Re-asserted on WORKING, above.)
@@ -392,7 +646,7 @@ bool btGlueInit(CircleBluetooth* owner) {
     gap_discoverable_control(1);
     gap_connectable_control(1);
 
-    // 7. Power on; the controller reaches HCI_STATE_WORKING asynchronously.
+    // 8. Power on; the controller reaches HCI_STATE_WORKING asynchronously.
     hci_power_control(HCI_POWER_ON);
     return true;
 }
@@ -406,21 +660,21 @@ void btGlueProcess() {
 }
 
 void btGlueSendAvrcp(int command) {
-    if (g_avrcpCid == 0) return;  // no controller connection yet
+    const uint16_t cid = g_link.avrcpCid();
+    if (cid == 0) return;  // no AVRCP to the connected phone
     switch (command) {  // carsh::bt::AvrcpCommand order: 0=Play,1=Pause,2=Next,3=Prev
-        case 0: avrcp_controller_play(g_avrcpCid); break;
-        case 1: avrcp_controller_pause(g_avrcpCid); break;
-        case 2: avrcp_controller_forward(g_avrcpCid); break;
-        case 3: avrcp_controller_backward(g_avrcpCid); break;
+        case 0: avrcp_controller_play(cid); break;
+        case 1: avrcp_controller_pause(cid); break;
+        case 2: avrcp_controller_forward(cid); break;
+        case 3: avrcp_controller_backward(cid); break;
         default: break;
     }
 }
 
 void btGlueStartScan() {
+    // Results arrive in hciPacketHandler as GAP_EVENT_INQUIRY_RESULT /
+    // GAP_EVENT_INQUIRY_COMPLETE.
     gap_inquiry_start(5 /* * 1.28 s ≈ 6.4 s window */);
-    // GAP inquiry results are delivered to hciPacketHandler as GAP_EVENT_*; the
-    // parse into carsh::bt::DiscoveredDevice + deliverDeviceDiscovered is wired
-    // alongside the host-tested parser (TODO(hw): enable the GAP event branch).
 }
 
 void btGlueStopScan() {
@@ -431,14 +685,39 @@ void btGlueConnect(const unsigned char* addr6) {
     gap_inquiry_stop();  // inquiry + paging cannot run together (contract)
     bd_addr_t addr;
     for (int i = 0; i < 6; ++i) addr[i] = addr6[i];
-    uint8_t status = a2dp_sink_establish_stream(addr, &g_a2dpCid);
-    if (status != ERROR_CODE_SUCCESS && g_owner) {
-        g_owner->deliverConnectFailed(toBdAddr(addr6), status);
+    const carsh::bt::BdAddr a = toBdAddr(addr6);
+    // BTstack v1.6.1's a2dp_sink_establish_stream() dereferences an uninitialised
+    // cid (btstack_assert -> halt) when an AVDTP connection to that address already
+    // exists but is not open yet (avdtp_connect returns success without setting
+    // it) — e.g. a second CONNECT tap, or the phone connecting to us meanwhile.
+    // If one exists, that connect is already under way (or done): nothing to do.
+    if (avdtp_get_connection_for_bd_addr(addr) != nullptr) {
+        CLogger::Get()->Write(FromBt, LogNotice, "connect: A2DP to %s already up or in progress",
+                              bd_addr_to_str(addr));
+        return;
     }
+    g_link.connectRequested(a);
+    uint16_t cid = 0;
+    uint8_t status = a2dp_sink_establish_stream(addr, &cid);
+    if (status != ERROR_CODE_SUCCESS) {
+        g_link.connectRejected(a, status);  // -> deliverConnectFailed
+        return;
+    }
+    g_link.connectStarted(a, cid);
 }
 
 void btGlueDisconnect() {
-    if (g_a2dpCid) a2dp_sink_disconnect(g_a2dpCid);
+    // Drop the connected phone's ACL link. That closes A2DP *and* AVRCP (either
+    // alone would leave the link — and so connected() — up), and BTstack reports
+    // the channel releases + Disconnection Complete, which clear the state.
+    const uint16_t handle = g_link.connectedHandle();
+    if (handle != carsh::bt::LinkTracker::kNoHandle) {
+        gap_disconnect(handle);
+        return;
+    }
+    // No link yet: cancel a user connect still in flight (BTstack reports it as a
+    // failed A2DP signaling connection -> onConnectFailed).
+    if (uint16_t cid = g_link.pendingA2dpCid()) a2dp_sink_disconnect(cid);
 }
 
 uint32_t btGlueA2dpSampleRate() { return g_btSampleRate; }
