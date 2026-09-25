@@ -102,6 +102,8 @@ uint32_t g_btSampleRate = 44100;
 // separate HCI / A2DP / AVRCP events; the handlers below only extract fields and
 // feed them here (host-tested in tests/bt/LinkTracker_test).
 carsh::bt::LinkTracker g_link;
+static_assert(carsh::bt::LinkTracker::kMaxLinks >= MAX_NR_HCI_CONNECTIONS,
+              "LinkTracker must be able to track every ACL link BTstack can hold");
 
 uint8_t g_localSeid = 0;
 
