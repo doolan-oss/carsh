@@ -12,6 +12,13 @@
 // blocking bulk OUT, async bulk IN whose completion (USB-IRQ context) only enqueues
 // into a lock-free SPSC byte ring that read() drains from task context. AA_PLAN
 // rungs 2-3.
+//
+// Link faults are FATAL for a transport instance (review A1/A3/A7): the first failed
+// bulk-IN transfer, failed re-post, RX overflow or failed/timed-out bulk-OUT latches
+// the link dead (carsh::aa::AaBulkLink) — no more re-posts, read()/write() refuse —
+// and CircleAaDriver ends the session and, if the dongle doesn't re-cycle by itself,
+// forces a USB re-enumeration (aoaForceReenumerate below). Why not recover in place:
+// see the comment above aoaForceReenumerate in the .cpp.
 #ifndef _carsh_circle_aoa_transport_h
 #define _carsh_circle_aoa_transport_h
 
@@ -20,6 +27,9 @@
 #include <circle/usb/usbrequest.h>
 #include <circle/types.h>
 
+#include <atomic>
+
+#include "aa/AaBulkLink.h"
 #include "aa/IAaTransport.h"
 
 namespace carsh::device {
@@ -55,28 +65,25 @@ public:
     boolean Configure(void) override;
 
     bool isAccessory() const { return m_pBulkIn != nullptr && m_pBulkOut != nullptr; }
-    unsigned rxBytes() const { return m_rxBytes; }  // Rung-3 throughput counter
-    unsigned txBytes() const { return m_txBytes; }  // bulk-OUT bytes sent (TLS bring-up)
-    // Last bulk-IN TUSBError + a monotonically-rising counter, set from IRQ context on
-    // a transfer error and logged by the driver from task context (see inCompletion).
-    unsigned lastInUsbErr() const { return m_lastInUsbErr; }
-    unsigned inErrSeq() const { return m_inErrSeq; }
-    // Bulk-IN diagnostics (xHCI bulk-reset hunt): the result length reported on the
-    // last IN error (a length > kInTransfer points at a babble/over-run), and how many
-    // bulk-IN URBs are still posted. inFlight()==0 means the IN pipe is fully dead and
-    // the head unit is deaf — the driver re-posts (restartInPolling) and logs it.
-    unsigned lastInResultLen() const { return m_lastInResultLen; }
-    unsigned inFlight() const { return m_inFlight; }
-    unsigned ringUsed() const { return (m_ringTail - m_ringHead) & kRingMask; }
-    // Last bulk-OUT TUSBError + counter (write() runs in task context, so it captures
-    // the error directly from an owned URB — unlike the IRQ-context IN path).
-    unsigned lastOutUsbErr() const { return m_lastOutUsbErr; }
-    unsigned outErrSeq() const { return m_outErrSeq; }
 
-    // Re-post the bulk-IN URBs after the pipe stalled. ONLY safe to call from task
-    // context when inFlight()==0 (no completion routine is pending, so the buffers are
-    // free of any in-flight URB). Returns true if at least one URB was posted.
-    bool restartInPolling();
+    // Link health (any context). Once linkDead(), this instance never carries AA
+    // traffic again: read()/write() return -1 and no bulk-IN request is re-posted.
+    bool linkDead() const { return m_link.dead(); }
+    carsh::aa::AaLinkFault linkFault() const { return m_link.fault(); }
+
+    // Diagnostics for the driver's log. Circle's xHCI path records neither a USB
+    // error code nor a length for a failed transfer (the controller's completion code
+    // is only in Circle's own "xhciep: Transfer error N on endpoint M" log line), so
+    // there is deliberately no per-error TUSBError/length here any more.
+    unsigned rxBytes() const { return m_link.rxBytes(); }  // bulk-IN bytes accepted
+    unsigned txBytes() const { return m_link.txBytes(); }  // bulk-OUT bytes sent
+    unsigned ringUsed() const { return static_cast<unsigned>(m_link.ringUsed()); }
+    // Bulk-IN requests still posted. After an IN error on a halted xHCI endpoint this
+    // stays at 1 for good (the second request never completes) — expected, harmless.
+    unsigned inFlight() const { return m_inFlight.load(std::memory_order_relaxed); }
+    // How long the failing bulk-OUT write blocked: ~3000 ms = Circle's hard-coded
+    // xHCI Transfer() timeout (the dongle NAKed); less = a transfer error.
+    unsigned lastOutBlockedMs() const { return m_lastOutBlockedMs; }
 
     // IAaTransport.
     int read(uint8_t* buf, size_t len, uint32_t timeoutMs) override;
@@ -84,40 +91,45 @@ public:
 
 private:
     bool configureAccessory();
-    bool startInRequest(u8* buf);  // submit one async bulk-IN using the given buffer
+    bool submitIn(CUSBRequest* pURB);  // post one async bulk-IN request
     void inCompletion(CUSBRequest* pURB);
     static void inCompletionStub(CUSBRequest* pURB, void* pParam, void* pContext);
 
     static constexpr unsigned kRingSize = 256 * 1024;  // RX byte ring (power of two)
-    static constexpr unsigned kRingMask = kRingSize - 1;
     // Each bulk-IN URB buffer holds a WHOLE video keyframe (~64 KB seen on the bench).
     // Circle's xHCI endpoint allows only 2 outstanding URBs (m_pURB[0]/[1]); on the PC
     // harness we kept 8 small ones in flight and it never glitched. With only 2 slots,
     // 16 KB each was too little — a bursty keyframe outran the buffering, corrupting the
-    // stream (a misaligned plaintext frame appeared mid-run) and eventually faulting the
-    // controller (xHCI completion code 4 on the IN endpoint -> hard hang). Bigger buffers
-    // give the dongle far more headroom between our completion+re-arm cycles.
+    // stream (a misaligned plaintext frame appeared mid-run). Bigger buffers give the
+    // dongle far more headroom between our completion+re-arm cycles.
     static constexpr unsigned kInTransfer = 64 * 1024;
     // Keep multiple bulk-IN URBs posted so a posted buffer is always available during
     // the phone's channel-open/AV-setup burst (a single-buffer re-arm leaves gaps that
     // make the dongle reset). xHCI allows 2 outstanding URBs per endpoint.
     static constexpr unsigned kInBuffers = 2;
+    // Bulk-OUT bounce buffer: one AA frame (kUsbTransferSize) — larger writes go out
+    // in chunks of this size. A multiple of every bulk max-packet size (64/512), so a
+    // chunk boundary never ends a transfer with a short packet mid-frame.
+    static constexpr unsigned kOutChunk = 16 * 1024;
 
     CUSBEndpoint* m_pBulkIn;
     CUSBEndpoint* m_pBulkOut;
     u8* m_pInBuffer[kInBuffers];
+    // One reusable request per IN buffer, created in task context at configure time:
+    // the IRQ re-arm only resets + resubmits it, so it allocates nothing, and a request
+    // stranded on a halted endpoint is freed with the device (not leaked from Circle's
+    // fixed CUSBRequest pool on every dongle cycle).
+    CUSBRequest* m_pInURB[kInBuffers];
+    // Transport-owned OUT buffer: a timed-out bulk-OUT TRB stays live on the xHCI ring
+    // and may still DMA from its buffer later, so it must not be the caller's (soon
+    // freed) frame. This one lives until the device object dies, which Circle does
+    // only after the xHCI slot is disabled (~CXHCIUSBDevice runs before ~CUSBDevice
+    // deletes the functions).
+    u8* m_pOutBuffer;
     unsigned m_nDeviceNumber;  // "uaaN" registration; 0 = not registered
-    u8 m_ring[kRingSize];
-    volatile unsigned m_ringHead;
-    volatile unsigned m_ringTail;
-    volatile unsigned m_rxBytes;
-    volatile unsigned m_txBytes;
-    volatile unsigned m_lastInUsbErr;
-    volatile unsigned m_inErrSeq;
-    volatile unsigned m_lastInResultLen;  // result length at the last bulk-IN error
-    volatile unsigned m_inFlight;         // bulk-IN URBs currently posted
-    volatile unsigned m_lastOutUsbErr;    // TUSBError of the last bulk-OUT failure
-    volatile unsigned m_outErrSeq;        // bulk-OUT failure counter
+    carsh::aa::AaBulkLink<kRingSize> m_link;  // RX ring + sticky dead latch
+    std::atomic<unsigned> m_inFlight;         // bulk-IN requests currently posted
+    unsigned m_lastOutBlockedMs;
 };
 
 // Factory hook — called from the patched CUSBDeviceFactory (see
@@ -129,6 +141,16 @@ extern "C" CUSBFunction* carshCreateAndroidAutoDevice(CUSBFunction* pParent, con
 
 // AOA mode-switch on a pre-switch device (reqs 51/52/53 + AA identity strings).
 bool aoaStartAccessory(CUSBDevice* pDevice);
+
+// Recovery for a dead link: make the dongle drop off the bus and re-enumerate, by
+// removing its USB device (on a hub port: CLEAR_FEATURE(PORT_ENABLE) + delete) and
+// rescanning the bus (SET_FEATURE(PORT_RESET) on the still-connected port, then the
+// normal enumerate -> factory -> AOA path). TASK context only — the UI loop, the same
+// task that runs UpdatePlugAndPlay(). On success pDongle has been DELETED (its
+// removed-handlers ran) before this returns; the caller must drop every pointer to it
+// first. Blocks for the port reset + enumeration (a few hundred ms). Returns false if
+// Circle could not remove the device (it then still exists, link still dead).
+bool aoaForceReenumerate(CAndroidAutoDevice* pDongle);
 // Rung-1 first-light: log VID/PID/class + endpoints to the serial.
 void aoaDumpDeviceDescriptor(CUSBDevice* pDevice);
 
