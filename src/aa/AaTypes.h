@@ -120,6 +120,19 @@ enum class TouchAction : uint32_t {
     Drag = 2,
 };
 
+// Media transport keys sent over the input channel as ButtonEvents (Android
+// keycodes / scan codes). These exact codes are already declared as supported
+// buttons in the service-discovery input channel (AaConnection.cpp), so the phone
+// binds them — letting the head unit drive AA media playback from its own UI /
+// hard buttons, the same way AVRCP drives a Bluetooth phone.
+enum class MediaKey : uint32_t {
+    PlayPause = 0x55,  // KEYCODE_MEDIA_PLAY_PAUSE (85)
+    Next = 0x57,       // KEYCODE_MEDIA_NEXT (87)
+    Previous = 0x58,   // KEYCODE_MEDIA_PREVIOUS (88)
+    Play = 0x7E,       // KEYCODE_MEDIA_PLAY (126)
+    Pause = 0x7F,      // KEYCODE_MEDIA_PAUSE (127)
+};
+
 // Protocol version the head unit advertises (matches the DHU: 1.7).
 inline constexpr uint16_t kVersionMajor = 1;
 inline constexpr uint16_t kVersionMinor = 7;

@@ -12,6 +12,7 @@
 // and tapping a song plays the album from that song onward.
 #pragma once
 
+#include <cctype>
 #include <cstdint>
 #include <cstdio>
 #include <optional>
@@ -20,6 +21,7 @@
 #include <vector>
 
 #include "library/Database.h"
+#include "library/TextNorm.h"
 
 namespace carsh::library {
 
@@ -92,6 +94,22 @@ public:
         }
         if (shuffle) shuffleInPlace(ids);
         return PlayRequest{std::move(ids), 0};
+    }
+
+    // Index of the first row that sorts under `letter` (A–Z), or under "#" (any row
+    // whose normalized first character isn't a–z, e.g. digits/symbols). -1 if none.
+    // Used by the alphabetical-jump bar; most useful at the Artists level (which is
+    // alphabetical), but works on whatever rows are showing.
+    int firstRowForLetter(char letter) const {
+        const char target = static_cast<char>(std::tolower(static_cast<unsigned char>(letter)));
+        const bool wantOther = !(target >= 'a' && target <= 'z');
+        for (std::size_t i = 0; i < rows_.size(); ++i) {
+            const std::string n = normalize(rows_[i]);
+            const char c0 = n.empty() ? '\0' : n[0];
+            const bool isAlpha = (c0 >= 'a' && c0 <= 'z');
+            if (wantOther ? !isAlpha : (isAlpha && c0 == target)) return int(i);
+        }
+        return -1;
     }
 
     // Short scope tag for button captions: "ALL" / "ARTIST" / "ALBUM".

@@ -53,6 +53,14 @@ public:
     // Lists a directory (non-recursive). Returns false if not a directory.
     virtual bool readdir(const std::string& path,
                          std::vector<DirEntry>& out) = 0;
+
+    // Write `len` bytes to `path`, creating/overwriting it. Best-effort; the base
+    // returns false so read-only backends (and test fakes) need not implement it.
+    // Used for caches like the serialized library DB (PLAN.md R7 batched writes).
+    virtual bool writeFile(const std::string& /*path*/, const std::uint8_t* /*data*/,
+                           std::size_t /*len*/) {
+        return false;
+    }
 };
 
 enum class SourceType : std::uint8_t { Usb = 0, Sd = 1, Bt = 2 };

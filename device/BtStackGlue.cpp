@@ -176,13 +176,25 @@ void avrcpPacketHandler(uint8_t type, uint16_t, uint8_t* packet, uint16_t) {
     switch (hci_event_avrcp_meta_get_subevent_code(packet)) {
         case AVRCP_SUBEVENT_CONNECTION_ESTABLISHED:
             g_avrcpCid = avrcp_subevent_connection_established_get_avrcp_cid(packet);
-            // TODO(hw): enable track-changed / playback-status notifications and
-            // request the initial now-playing info (avrcp_controller_get_now_playing_info)
-            // here so the subevents below start arriving.
+            // Subscribe to playback-status + track-changed notifications and pull the
+            // current track's attributes, so the now-playing subevents below start
+            // arriving and refresh on every change. Without this the controller is
+            // connected but the phone never volunteers metadata. [hw] bench check.
+            avrcp_controller_enable_notification(
+                g_avrcpCid, AVRCP_NOTIFICATION_EVENT_PLAYBACK_STATUS_CHANGED);
+            avrcp_controller_enable_notification(
+                g_avrcpCid, AVRCP_NOTIFICATION_EVENT_TRACK_CHANGED);
+            avrcp_controller_get_now_playing_info(g_avrcpCid);
             break;
         case AVRCP_SUBEVENT_CONNECTION_RELEASED:
             g_avrcpCid = 0;
             g_nowPlaying.reset();
+            break;
+        case AVRCP_SUBEVENT_NOTIFICATION_TRACK_CHANGED:
+            // New track: drop the previous track's attributes and re-query this
+            // track's metadata (the fresh attributes arrive via the subevents below).
+            g_nowPlaying.reset();
+            if (g_avrcpCid) avrcp_controller_get_now_playing_info(g_avrcpCid);
             break;
         // Now-playing attributes arrive one subevent at a time; accumulate them
         // (the value bytes are length-delimited, not NUL-terminated). The
