@@ -166,6 +166,13 @@ public:
 
     void draw(Canvas& c, const Theme& th) override {
         c.fillRect(bounds.x, bounds.y, bounds.w, bounds.h, th.panel);
+        // Swipes scroll by arbitrary pixel offsets, so the top and bottom rows are
+        // usually partial: clip every row fill + text to the list's own bounds, or
+        // they paint over the header / button row, where taps don't reach the list.
+        ClipScope clip(c, bounds.x, bounds.y, bounds.w, bounds.h);
+        // Text wider than the row is cut with ".." (the clip alone would slice a
+        // glyph mid-cell at the right edge, next to the A-Z strip).
+        const int maxChars = (bounds.w - 8) / kCellW;
         int first = scroll_ / rowH_;
         for (int i = first; i < int(items_.size()); ++i) {
             int ry = bounds.y + i * rowH_ - scroll_;
@@ -177,7 +184,11 @@ public:
             if (i == current_)
                 c.fillRect(bounds.x, ry, 4, rowH_, th.accent);
             uint32_t fg = (i == selected_ || i == current_) ? th.accent : th.bright;
-            c.drawText(bounds.x + 8, ry + (rowH_ - kCellH) / 2, items_[i], fg);
+            const int ty = ry + (rowH_ - kCellH) / 2;
+            if (int(items_[i].size()) <= maxChars)
+                c.drawText(bounds.x + 8, ty, items_[i], fg);
+            else
+                c.drawText(bounds.x + 8, ty, ellipsize(items_[i], maxChars), fg);
         }
     }
     bool onTap(int px, int py) override {
@@ -196,6 +207,12 @@ public:
     }
 
 private:
+    // `s` (longer than maxChars glyphs) cut to maxChars, ending in "..".
+    static std::string ellipsize(const std::string& s, int maxChars) {
+        if (maxChars <= 0) return std::string();
+        if (maxChars <= 2) return s.substr(0, std::size_t(maxChars));
+        return s.substr(0, std::size_t(maxChars - 2)) + "..";
+    }
     void clampScroll() {
         int contentH = int(items_.size()) * rowH_;
         int maxScroll = std::max(0, contentH - bounds.h);
