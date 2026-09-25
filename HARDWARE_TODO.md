@@ -114,6 +114,24 @@ this is the prioritized list for the first hardware session. Format:
 - **Stub now:** OTA package parse/verify + A/B state-machine decision logic are
   host-tested; the actual slot write + reboot are stubbed behind an interface.
 
+### H7b — Serial OTA push + A/B chainloader (the no-card-swap dev loop)
+- **Module:** `device/chainloader/`, `device/OtaPush.h`, `CircleUsbLog` RX feed,
+  `scripts/carsh_ota.py`. All decision/verify/framing logic is host-tested; this
+  session validates the device plumbing.
+- **One-time:** migrate the card (chainloader as boot kernel, app as `kernel8-A.img`
+  — see `device/chainloader/README.md`); `carsh_ota.py keygen` + rebuild to provision
+  the push key.
+- **Validate:**
+  1. Chainloader boots slot A on the migrated card (UART log: "chainboot slot A").
+  2. `carsh_ota.py flash` end-to-end: push → `ota-push: apply=ok` → reboot →
+     "trial CONFIRMED healthy" → new image runs. Note the transfer rate.
+  3. Forced rollback: push an image built to hang before the UI loop; power-cycle
+     3×; expect "ROLLED BACK to slot A" and the old image running.
+  4. Push while AA is streaming (CDC RX load vs the xHCI dongle path — they share
+     no controller, but confirm no audio/video hiccups).
+  5. `boot_slot.bin` power-loss: yank power mid-apply; expect a clean rescan/boot
+     (record written after the slot image; worst case the push is just re-sent).
+
 ### H8 — Android Auto stability + video throughput  [partly done — TOP open AA bug]
 - **Module:** `CircleAoaTransport`, Circle xHCI, `CircleAaDecodeCore`.
 - **Done (2026-06-29):** AA video + media audio play end-to-end; choppy audio fixed
