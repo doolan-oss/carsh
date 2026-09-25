@@ -1,5 +1,5 @@
-// MediaSession — arbitration between the local file player and a Bluetooth phone
-// for the Now Playing view + transport routing.
+// MediaSession — arbitration between the local file player, a Bluetooth phone and
+// the Android Auto projection for the Now Playing view + transport routing.
 #include "player/MediaSession.h"
 
 #include <string>
@@ -9,6 +9,7 @@
 
 using carsh::player::MediaSession;
 using carsh::player::Source;
+using carsh::player::StreamActivity;
 
 namespace {
 MediaSession::LocalState localTrack(const char* title, bool playing) {
@@ -70,6 +71,7 @@ TEST(MediaSession, LocalKeptWhenBluetoothConnectedButIdle) {
     s.setBluetooth(true, false, btMeta("Phone Song", false));  // connected, not streaming
     CHECK(s.source() == Source::Local);
     CHECK_EQ(s.view().title, std::string("Song A"));
+    CHECK(!s.shouldPauseLocal());
 }
 
 TEST(MediaSession, BluetoothShownWhenConnectedAndNoLocalTrack) {
@@ -90,13 +92,13 @@ TEST(MediaSession, AndroidAutoOutranksEverything) {
     MediaSession s;
     s.setLocal(localTrack("Song A", true));
     s.setBluetooth(true, true, btMeta("Phone Song", true));  // BT streaming too
-    s.setAndroidAuto(true);                                   // ...but AA is active
+    s.setAndroidAuto(true, true);                             // ...but AA is playing
     CHECK(s.source() == Source::AndroidAuto);
     auto v = s.view();
     CHECK_EQ(v.title, std::string("Android Auto"));
     CHECK(v.playing);
-    // When AA stops, it falls back to the next-highest active source (BT here).
-    s.setAndroidAuto(false);
+    // AA pauses while BT keeps streaming: BT is what's audible now, so it takes over.
+    s.setAndroidAuto(true, false);
     CHECK(s.source() == Source::Bluetooth);
 }
 
@@ -113,4 +115,197 @@ TEST(MediaSession, TransportTargetAndPlayPauseCommand) {
     // BT paused -> toggle should PLAY.
     s.setBluetooth(true, true, btMeta("Phone Song", false));
     CHECK(s.playPauseCommand() == carsh::bt::AvrcpCommand::Play);
+}
+
+// --- Latched ownership (review A2 / P4) --------------------------------------
+
+// Pausing AA from the head unit stops its PCM; the session must still be AA (so '>'
+// resumes the phone) and show it paused, not fall back to the local track.
+TEST(MediaSession, AndroidAutoKeepsTransportWhilePaused) {
+    MediaSession s;
+    s.setLocal(localTrack("Song A", false));  // a local track is queued
+    s.setAndroidAuto(true, true);             // AA media playing
+    CHECK(s.transportTarget() == Source::AndroidAuto);
+    CHECK(s.view().playing);
+
+    s.setAndroidAuto(true, false);            // paused: audio stops, still connected
+    CHECK(s.source() == Source::AndroidAuto);
+    CHECK(s.transportTarget() == Source::AndroidAuto);
+    auto v = s.view();
+    CHECK_EQ(v.title, std::string("Android Auto"));
+    CHECK(!v.playing);                         // the view shows '>' (paused)
+
+    s.setAndroidAuto(true, true);             // '>' resumed it
+    CHECK(s.source() == Source::AndroidAuto);
+    CHECK(s.view().playing);
+}
+
+// Same for BT: a paused phone (no PCM, AVRCP PAUSED) keeps the session even though a
+// local track is queued.
+TEST(MediaSession, BluetoothKeepsTransportWhilePaused) {
+    MediaSession s;
+    s.setLocal(localTrack("Song A", false));
+    s.setBluetooth(true, true, btMeta("Phone Song", true));
+    CHECK(s.source() == Source::Bluetooth);
+    s.setBluetooth(true, false, btMeta("Phone Song", false));  // phone paused
+    CHECK(s.source() == Source::Bluetooth);
+    CHECK(s.transportTarget() == Source::Bluetooth);
+    CHECK(!s.view().playing);
+    CHECK(s.playPauseCommand() == carsh::bt::AvrcpCommand::Play);
+}
+
+// The latch is released when the owning phone goes away.
+TEST(MediaSession, LatchDropsOnDisconnect) {
+    MediaSession s;
+    s.setLocal(localTrack("Song A", false));
+    s.setAndroidAuto(true, true);
+    s.setAndroidAuto(true, false);
+    CHECK(s.source() == Source::AndroidAuto);
+    s.setAndroidAuto(false, false);           // dongle unplugged / session ended
+    CHECK(s.source() == Source::Local);
+    CHECK_EQ(s.view().title, std::string("Song A"));
+
+    s.setBluetooth(true, true, btMeta("Phone Song", true));
+    s.setBluetooth(true, false, btMeta("Phone Song", false));
+    CHECK(s.source() == Source::Bluetooth);
+    s.setBluetooth(false, false, btMeta("", false));
+    CHECK(s.source() == Source::Local);
+}
+
+// Streaming reported while disconnected is ignored (stale ring tail after unplug).
+TEST(MediaSession, StreamingIgnoredWhenNotConnected) {
+    MediaSession s;
+    s.setLocal(localTrack("Song A", true));
+    s.setAndroidAuto(false, true);
+    s.setBluetooth(false, true, btMeta("Phone Song", true));
+    CHECK(s.source() == Source::Local);
+    CHECK(!s.shouldPauseLocal());
+}
+
+// P4: a remote that starts playing takes over; the local player must be paused
+// (and stays paused: nothing here asks to resume it).
+TEST(MediaSession, RemoteTakeoverPausesLocal) {
+    MediaSession s;
+    s.setLocal(localTrack("Song A", true));   // USB track playing
+    CHECK(!s.shouldPauseLocal());
+    s.setBluetooth(true, true, btMeta("Phone Song", true));  // Spotify starts
+    CHECK(s.source() == Source::Bluetooth);
+    CHECK(s.shouldPauseLocal());
+    s.setLocal(localTrack("Song A", false));  // the app paused it
+    CHECK(!s.shouldPauseLocal());
+    // The phone pauses: the session stays on BT and local stays paused.
+    s.setBluetooth(true, false, btMeta("Phone Song", false));
+    CHECK(s.source() == Source::Bluetooth);
+    CHECK(!s.view().playing);
+
+    MediaSession a;
+    a.setLocal(localTrack("Song A", true));
+    a.setAndroidAuto(true, true);
+    CHECK(a.shouldPauseLocal());
+}
+
+// Explicitly starting local playback takes the session back and asks the app to
+// pause whichever remote is still streaming; that stream's tail can't re-grab it.
+TEST(MediaSession, SelectLocalTakesSessionAndPausesRemote) {
+    MediaSession s;
+    s.setLocal(localTrack("Song A", false));
+    s.setBluetooth(true, true, btMeta("Phone Song", true));
+    CHECK(s.source() == Source::Bluetooth);
+
+    MediaSession::PauseRequest r = s.selectLocal();  // user picked a library track
+    CHECK(r.bluetooth);
+    CHECK(!r.androidAuto);
+    s.setLocal(localTrack("Song B", true));
+    CHECK(s.source() == Source::Local);
+    CHECK(!s.shouldPauseLocal());
+
+    // The phone's stream is still draining for a few frames: no takeover.
+    s.setBluetooth(true, true, btMeta("Phone Song", true));
+    CHECK(s.source() == Source::Local);
+    CHECK_EQ(s.view().title, std::string("Song B"));
+
+    // It stops (paused), then the user presses play on the phone: BT takes over.
+    s.setBluetooth(true, false, btMeta("Phone Song", false));
+    CHECK(s.source() == Source::Local);
+    s.setBluetooth(true, true, btMeta("Phone Song", true));
+    CHECK(s.source() == Source::Bluetooth);
+    CHECK(s.shouldPauseLocal());
+}
+
+TEST(MediaSession, SelectLocalFromPausedRemoteRequestsNoPause) {
+    MediaSession s;
+    s.setLocal(localTrack("Song A", false));
+    s.setAndroidAuto(true, true);
+    s.setAndroidAuto(true, false);            // AA paused, still the owner
+    MediaSession::PauseRequest r = s.selectLocal();
+    CHECK(!r.androidAuto);
+    CHECK(!r.bluetooth);
+    CHECK(s.source() == Source::Local);
+    // AA starts playing again later (phone-side play): it takes the session back.
+    s.setAndroidAuto(true, true);
+    CHECK(s.source() == Source::AndroidAuto);
+}
+
+TEST(MediaSession, SelectLocalSuppressesStreamingAndroidAuto) {
+    MediaSession s;
+    s.setLocal(localTrack("Song A", false));
+    s.setAndroidAuto(true, true);
+    MediaSession::PauseRequest r = s.selectLocal();
+    CHECK(r.androidAuto);
+    s.setLocal(localTrack("Song A", true));
+    s.setAndroidAuto(true, true);             // jitter tail still engaged
+    CHECK(s.source() == Source::Local);
+    s.setAndroidAuto(true, false);
+    s.setAndroidAuto(true, true);             // a genuinely new AA stream
+    CHECK(s.source() == Source::AndroidAuto);
+}
+
+// Nothing latched and no local track: a connected AA session owns Now Playing (so
+// '>' can start AA media), ahead of a connected BT phone.
+TEST(MediaSession, ConnectedAndroidAutoShownWithNoLocalTrack) {
+    MediaSession s;
+    s.setAndroidAuto(true, false);
+    CHECK(s.source() == Source::AndroidAuto);
+    CHECK(!s.view().playing);
+    s.setBluetooth(true, false, btMeta("Phone Song", false));
+    CHECK(s.source() == Source::AndroidAuto);
+    s.setLocal(localTrack("Song A", false));  // a local track appears: local shows
+    CHECK(s.source() == Source::Local);
+}
+
+// The last source to START playing wins, whichever it is.
+TEST(MediaSession, LastRemoteToStartWins) {
+    MediaSession s;
+    s.setAndroidAuto(true, true);
+    s.setAndroidAuto(true, false);            // AA paused (latched)
+    s.setBluetooth(true, true, btMeta("Phone Song", true));
+    CHECK(s.source() == Source::Bluetooth);
+    s.setBluetooth(true, false, btMeta("Phone Song", false));
+    CHECK(s.source() == Source::Bluetooth);   // BT paused, still latched
+    s.setAndroidAuto(true, true);
+    CHECK(s.source() == Source::AndroidAuto);
+}
+
+// --- StreamActivity ------------------------------------------------------------
+
+TEST(StreamActivity, FirstSampleIsBaselineOnly) {
+    StreamActivity a(500);
+    CHECK(!a.update(42, 0));          // data from before we watched isn't "now"
+    CHECK(!a.update(42, 100000));
+    CHECK(a.update(43, 200000));      // a new chunk arrived
+}
+
+TEST(StreamActivity, HoldsThroughBurstGapsThenReleases) {
+    StreamActivity a(500);            // 500 ms hold
+    uint32_t n = 0;
+    a.update(n, 0);
+    CHECK(a.update(++n, 10000));
+    // A 400 ms delivery gap (bursty WiFi) keeps it streaming.
+    CHECK(a.update(n, 410000));
+    CHECK(a.update(++n, 420000));
+    // Then it stops for good: released once the hold expires.
+    CHECK(a.update(n, 900000));
+    CHECK(!a.update(n, 920001));
+    CHECK(!a.streaming());
+    CHECK(a.update(++n, 5000000));    // resumes
 }
