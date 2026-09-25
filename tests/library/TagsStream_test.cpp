@@ -380,6 +380,83 @@ TEST(TagsStream, Id3v24BigEndianConventionBreaksTies) {
     CHECK_EQ(r.meta.artist, std::string("Right"));
 }
 
+// A syncsafe v2.4 frame of 128 bytes or more followed by an invalid-id frame:
+// the syncsafe reading lands on that frame, which the walker skips by size, so
+// it counts as a boundary and a big-endian reading that only reaches the
+// padding further on does not win. TALB 200 is 00 00 01 48 (big-endian 328),
+// APIC 1000 is 00 00 07 68 (big-endian 1896); both big-endian readings land in
+// the padding. The album stays clean and the frames after the invalid id parse.
+TEST(TagsStream, Id3v24InvalidIdAfterLargeFrameKeepsSyncsafe) {
+    const std::string album(199, 'A');  // 200-byte payload
+    Bytes body = frame(4, "TALB", latin1(album));
+    append(body, frame(4, "Tit2", latin1("lower")));
+    append(body, frame(4, "TIT2", latin1("Title")));
+    append(body, frame(4, "TPE1", latin1("Artist")));
+    append(body, Bytes(1024, 0));  // padding
+    Parsed r = runId3(tag(4, 0, body));
+    REQUIRE(r.ok);
+    CHECK_EQ(r.meta.album, album);
+    CHECK_EQ(r.meta.title, std::string("Title"));
+    CHECK_EQ(r.meta.artist, std::string("Artist"));
+
+    Bytes art = frame(4, "APIC", artPayload(1000));
+    append(art, frame(4, "tit2", latin1("lower")));
+    append(art, frame(4, "TIT2", latin1("Title")));
+    append(art, frame(4, "TPE1", latin1("Artist")));
+    append(art, Bytes(2048, 0));  // padding
+    Parsed ra = runId3(tag(4, 0, art));
+    REQUIRE(ra.ok);
+    CHECK(ra.meta.hasEmbeddedArt);
+    CHECK_EQ(ra.meta.title, std::string("Title"));
+    CHECK_EQ(ra.meta.artist, std::string("Artist"));
+}
+
+// The big-endian counterpart: an invalid-id frame right after a big-endian
+// frame is where the big-endian reading lands, and the syncsafe one lands mid-
+// art, so big-endian wins. First in a tag already proved big-endian (TIT2 200 =
+// 00 00 00 C8), then with the APIC (256 = 00 00 01 00, syncsafe 128) as the
+// tag's first frame.
+TEST(TagsStream, Id3v24BigEndianTagInvalidIdAfterLargeFrame) {
+    const bool be = true;
+    const std::string title = "Title" + std::string(194, '.');  // 200-byte payload
+    Bytes body = frame(4, "TIT2", latin1(title), 0, be);
+    append(body, frame(4, "APIC", artPayload(512), 0, be));  // syncsafe 256
+    append(body, frame(4, "tpe1", latin1("lower"), 0, be));
+    append(body, frame(4, "TPE1", latin1("Right"), 0, be));
+    append(body, frame(4, "TALB", latin1("Alb"), 0, be));
+    Parsed r = runId3(tag(4, 0, body));
+    REQUIRE(r.ok);
+    CHECK_EQ(r.meta.title, title);
+    CHECK(r.meta.hasEmbeddedArt);
+    CHECK_EQ(r.meta.artist, std::string("Right"));
+    CHECK_EQ(r.meta.album, std::string("Alb"));
+
+    Bytes first = frame(4, "APIC", artPayload(256), 0, be);
+    append(first, frame(4, "tpe1", latin1("lower"), 0, be));
+    append(first, frame(4, "TPE1", latin1("Right"), 0, be));
+    append(first, Bytes(64, 0));  // padding
+    Parsed rf = runId3(tag(4, 0, first));
+    REQUIRE(rf.ok);
+    CHECK(rf.meta.hasEmbeddedArt);
+    CHECK_EQ(rf.meta.artist, std::string("Right"));
+    CHECK(rf.meta.title.empty());
+}
+
+// When neither reading lands anywhere (here: the last frame, followed by junk
+// padding that is not zeros), a tag already proved big-endian stays
+// big-endian. TPE1 300 is 00 00 01 2C (syncsafe 172, mid-text); read as
+// syncsafe it would come back cut at 171 characters.
+TEST(TagsStream, Id3v24BigEndianConventionBreaksNowhereTie) {
+    const bool be = true;
+    const std::string artist = "R" + std::string(298, 'r');  // 300-byte payload
+    Bytes body = frame(4, "TIT2", latin1("Title" + std::string(194, '.')), 0, be);  // 200
+    append(body, frame(4, "TPE1", latin1(artist), 0, be));
+    append(body, Bytes(64, 0x55));  // junk padding
+    Parsed r = runId3(tag(4, 0, body));
+    REQUIRE(r.ok);
+    CHECK_EQ(r.meta.artist, artist);
+}
+
 // v2.4 frame-level unsync covers the grouping byte too: a 0xFF group id gains a
 // stuffed 0x00 that must be removed before the prefix is stripped.
 TEST(TagsStream, Id3v24UnsyncCoversGroupingByte) {

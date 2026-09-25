@@ -15,12 +15,12 @@
 // frame-level unsynchronisation, v2.4 data-length indicators and grouping bytes.
 // Compressed or encrypted frames are skipped.
 //
-// Real-world quirks, following mutagen/TagLib: a frame with an invalid id
-// (lowercase, punctuation) is skipped by its size like any unknown frame, so the
-// frames after it still parse — the walk only stops at padding or at a size that
-// runs past the tag. v2.2 names in a v2.3/v2.4 tag ("TT2\0") are mapped. v2.4
-// frame sizes written as plain big-endian (old iTunes) are detected by checking
-// where each reading of the size lands; see id3::v24FrameSize().
+// Real-world quirks, following mutagen: a frame with an invalid id (lowercase,
+// punctuation) is skipped by its size like any unknown frame, so the frames
+// after it still parse — the walk only stops at padding or at a size that runs
+// past the tag. v2.2 names in a v2.3/v2.4 tag ("TT2\0") are mapped. v2.4 frame
+// sizes written as plain big-endian (old iTunes) are detected by checking where
+// each reading of the size lands; see id3::v24FrameSize().
 #pragma once
 
 #include <cstdint>
@@ -220,10 +220,14 @@ inline std::size_t frameIdLen(const std::uint8_t* id, std::size_t idLen) {
 }
 
 // How plausible it is that a v2.4 frame body of `size` bytes, starting at the
-// cursor, ends on a frame boundary: 0 = no (runs past the tag, or lands on bytes
-// that are neither padding nor a frame header), 1 = lands on the end of the tag
-// or on padding (zeros for the next 10 bytes or up to the end), 2 = lands on a
-// well-formed frame header whose own size fits in the rest of the tag.
+// cursor, ends on a frame boundary — i.e. where the walker would go next:
+//   0 = no: runs past the tag, or lands on bytes that are neither padding nor a
+//       frame header whose own size fits in the rest of the tag;
+//   1 = weak: lands on the end of the tag, on padding (zeros for the next 10
+//       bytes or up to the end), or on a header whose size fits but whose id is
+//       invalid (the walker skips such a frame by its size, so it is a real
+//       boundary in the tags that have them — just easier to hit by chance);
+//   2 = strong: lands on a header with a valid id whose own size fits.
 inline int boundaryScore(TagCursor& c, std::uint64_t size) {
     const std::uint64_t left = c.left();
     if (size > left) return 0;
@@ -235,25 +239,30 @@ inline int boundaryScore(TagCursor& c, std::uint64_t size) {
     bool zeros = true;
     for (std::size_t i = 0; i < n; ++i) zeros = zeros && h[i] == 0;
     if (zeros) return 1;
-    if (n < sizeof h || frameIdLen(h, 4) == 0) return 0;
+    if (n < sizeof h) return 0;
     // The next frame's smallest reading must fit (syncsafe <= big-endian when
     // no size byte has its high bit set).
     const std::uint32_t next =
         ((h[4] | h[5] | h[6] | h[7]) & 0x80) ? be32(h + 4) : syncsafe(h + 4);
-    return next <= rest - sizeof h ? 2 : 0;
+    if (next > rest - sizeof h) return 0;
+    return frameIdLen(h, 4) ? 2 : 1;
 }
 
 // Size of a v2.4 frame whose 4 size bytes are `sz`; the cursor is at the frame
 // body. The spec says syncsafe, but old iTunes (and a few others) wrote plain
 // big-endian sizes. The two readings agree below 128, and a size byte with its
 // high bit set can only be big-endian. Otherwise each reading is checked for
-// where it lands (boundaryScore) and the better one wins; on a tie the tag's
-// established convention does (`preferBe32`, set once a frame proved to be
-// big-endian), else the spec's syncsafe. A spec-conforming tag therefore never
-// switches: its syncsafe reading always lands on a header, padding or the end,
-// and a big-endian reading can only beat that by landing on a well-formed
-// header when syncsafe landed on padding — impossible, as padding runs to the
-// end of the tag.
+// where it lands (boundaryScore) and the higher score wins. On a tie — both
+// weak, both strong, or both nowhere — the tag's established convention does
+// (`preferBe32`, set once a frame proved to be big-endian), else the spec's
+// syncsafe. A spec-conforming tag therefore never switches: its syncsafe
+// reading always lands on a valid header (2), padding or the end (1), and a
+// big-endian reading can only beat that by scoring 2 when syncsafe landed on
+// padding — impossible, as padding runs to the end of the tag, so from there
+// big-endian lands on more padding, the end, or past it (at most 1). A tag
+// with invalid ids is not conforming, but its syncsafe reading that lands on
+// such a frame still scores 1, so it ties with (rather than loses to) a
+// big-endian reading that only reaches padding further on.
 inline std::uint32_t v24FrameSize(TagCursor& c, const std::uint8_t* sz,
                                   bool& preferBe32) {
     const std::uint32_t bigEndian = be32(sz);
@@ -269,7 +278,7 @@ inline std::uint32_t v24FrameSize(TagCursor& c, const std::uint8_t* sz,
         preferBe32 = true;
         return bigEndian;
     }
-    if (safeScore > beScore || safeScore == 0) return safe;
+    if (safeScore > beScore) return safe;
     return preferBe32 ? bigEndian : safe;
 }
 
