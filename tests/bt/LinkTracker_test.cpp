@@ -9,6 +9,8 @@
 #include <vector>
 
 #include "Test.h"
+#include "bt/NowPlaying.h"
+#include "player/MediaSession.h"
 #include "profile/ProfileManager.h"
 
 using namespace carsh;
@@ -25,7 +27,8 @@ constexpr uint8_t kRemoteTerminated = 0x13;
 // Records every callback in order, like the kernel's handlers would see them.
 struct Recorder {
     struct Ev {
-        char kind;  // 'C' connected, 'D' disconnected, 'F' connect failed
+        char kind;  // 'C' connected, 'D' disconnected, 'F' connect failed,
+                    // 'E' the connected phone's AVRCP session ended
         BdAddr addr;
         int reason;
     };
@@ -36,6 +39,7 @@ struct Recorder {
         cb.onConnected = [this](const BdAddr& a) { evs.push_back({'C', a, 0}); };
         cb.onDisconnected = [this](const BdAddr& a) { evs.push_back({'D', a, 0}); };
         cb.onConnectFailed = [this](const BdAddr& a, int r) { evs.push_back({'F', a, r}); };
+        cb.onAvrcpSessionEnded = [this](const BdAddr& a) { evs.push_back({'E', a, 0}); };
         t.setCallbacks(cb);
     }
     int count(char kind) const {
@@ -327,4 +331,123 @@ TEST(LinkTracker, AvrcpOfASecondaryPhoneIsNotUsedForCommands) {
     t.aclConnectionComplete(0, 0x000C, kOther);
     t.avrcpEstablished(0, 0x09, kOther);
     CHECK_EQ(t.avrcpCid(), uint16_t(0));  // only the connected phone's AVRCP counts
+}
+
+// ---- End of the connected phone's AVRCP session ---------------------------
+// The glue resets and republishes the now-playing metadata and the absolute
+// volume on onAvrcpSessionEnded. Otherwise the kernel keeps the old title with
+// playing=true after the phone leaves.
+
+namespace {
+// A phone connected by the phone itself (no user connect), with A2DP and AVRCP up.
+void phoneUpWithAvrcp(LinkTracker& t, const BdAddr& a, uint16_t handle, uint16_t avrcpCid) {
+    t.aclConnectionComplete(0, handle, a);
+    t.a2dpSignalingEstablished(0, 0x41, a);
+    t.a2dpStreamEstablished(0, a);
+    t.avrcpEstablished(0, avrcpCid, a);
+}
+}  // namespace
+
+TEST(LinkTracker, AvrcpReleaseOfTheConnectedPhoneEndsItsSessionOnce) {
+    LinkTracker t;
+    Recorder r;
+    r.attach(t);
+    phoneUpWithAvrcp(t, kPhone, 0x000B, 0x07);
+    t.avrcpReleased(0x07);
+    CHECK_EQ(r.count('E'), 1);
+    CHECK_EQ(r.evs.back().kind, 'E');
+    CHECK(r.evs.back().addr == kPhone);
+    CHECK(t.connected());  // AVRCP only: the phone (and A2DP) stay connected
+    t.avrcpReleased(0x07);  // duplicate release: nothing more
+    // The link drops later: disconnected, but the session already ended.
+    t.aclDisconnectionComplete(0, 0x000B, kRemoteTerminated);
+    CHECK_EQ(r.count('E'), 1);
+    CHECK_EQ(r.count('D'), 1);
+}
+
+TEST(LinkTracker, LinkDropWithAvrcpUpEndsTheSessionBeforeDisconnected) {
+    // HCI reports the drop before L2CAP closes the AVRCP channel.
+    LinkTracker t;
+    Recorder r;
+    r.attach(t);
+    phoneUpWithAvrcp(t, kPhone, 0x000B, 0x07);
+    t.aclDisconnectionComplete(0, 0x000B, kConnectionTimeout);
+    REQUIRE(r.evs.size() == std::size_t(3));  // C, E, D
+    CHECK_EQ(r.evs[1].kind, 'E');
+    CHECK(r.evs[1].addr == kPhone);
+    CHECK_EQ(r.evs[2].kind, 'D');
+    t.avrcpReleased(0x07);  // the late AVRCP release: already ended
+    CHECK_EQ(r.count('E'), 1);
+}
+
+TEST(LinkTracker, AvrcpReleasedBeforeTheLinkDropEndsTheSessionOnce) {
+    // BTstack's usual order: L2CAP sees the drop first, so AVRCP is released
+    // while the link is still tracked, then Disconnection Complete follows.
+    LinkTracker t;
+    Recorder r;
+    r.attach(t);
+    phoneUpWithAvrcp(t, kPhone, 0x000B, 0x07);
+    t.avrcpReleased(0x07);
+    t.aclDisconnectionComplete(0, 0x000B, kConnectionTimeout);
+    REQUIRE(r.evs.size() == std::size_t(3));  // C, E, D
+    CHECK_EQ(r.evs[1].kind, 'E');
+    CHECK_EQ(r.evs[2].kind, 'D');
+}
+
+TEST(LinkTracker, NoSessionEndWithoutAvrcpOrForASecondaryPhone) {
+    LinkTracker t;
+    Recorder r;
+    r.attach(t);
+    t.aclConnectionComplete(0, 0x000B, kPhone);
+    t.aclConnectionComplete(0, 0x000C, kOther);
+    t.avrcpEstablished(0, 0x09, kOther);  // the second phone's AVRCP
+    t.avrcpReleased(0x09);
+    CHECK_EQ(r.count('E'), 0);  // not the connected phone's session
+    t.avrcpConnectStarted(kPhone);
+    t.avrcpEstablished(0x04, 0x07, kPhone);  // AVRCP to the phone failed
+    t.aclDisconnectionComplete(0, 0x000B, kRemoteTerminated);
+    CHECK_EQ(r.count('E'), 0);  // no AVRCP was up: no metadata to clear
+    CHECK_EQ(r.count('D'), 1);
+}
+
+TEST(LinkTracker, StaleNowPlayingDoesNotSurviveTheLinkDrop) {
+    // The glue's wiring (BtStackGlue.cpp endAvrcpSession): session end -> resetAll()
+    // -> publish. The kernel then feeds MediaSession with the published metadata,
+    // and a playing flag counts as "BT streaming".
+    LinkTracker t;
+    bt::NowPlayingAssembler np;
+    bt::AvrcpMetadata published;  // the kernel's g_btMeta
+    LinkTracker::Callbacks cb;
+    cb.onAvrcpSessionEnded = [&](const BdAddr&) {
+        np.resetAll();
+        published = np.metadata();
+    };
+    t.setCallbacks(cb);
+
+    phoneUpWithAvrcp(t, kPhone, 0x000B, 0x07);
+    const char title[] = "Old Song";
+    np.setAttribute(uint8_t(bt::AvrcpAttr::Title), title, sizeof(title) - 1);
+    np.setPlaybackStatus(uint8_t(bt::AvrcpPlayStatus::Playing));
+    published = np.metadata();
+
+    // The phone goes out of range while playing.
+    t.aclDisconnectionComplete(0, 0x000B, kConnectionTimeout);
+    CHECK(!published.playing);
+    CHECK(published.title.empty());
+
+    // The user plays a local track, then the phone's link comes back (ACL only,
+    // AVRCP not up yet). A stale playing=true would count as BT streaming, take
+    // the session from the local track and pause it.
+    player::MediaSession session;
+    player::MediaSession::LocalState local;
+    local.hasTrack = true;
+    local.playing = true;
+    local.title = "Local";
+    session.setLocal(local);
+    session.selectLocal();
+    t.aclConnectionComplete(0, 0x000D, kPhone);
+    session.setBluetooth(t.connected(), published.playing, published);
+    CHECK(session.source() == player::Source::Local);
+    CHECK(!session.shouldPauseLocal());
+    CHECK_EQ(session.view().title, std::string("Local"));
 }
