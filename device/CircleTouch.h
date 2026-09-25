@@ -21,6 +21,12 @@
 // Also, CTouchScreenDevice requires Setup(CDisplay*) before any event can be
 // reported (ReportHandler dereferences the display for coordinate mapping), so
 // initialize() takes the framebuffer and wires it in.
+//
+// Lifetime: Circle can't unregister a periodic timer handler, so the handler
+// outlives this object; ~CircleTouch turns it into a no-op. The timer IRQ reads
+// the display through the driver until then, so the display passed to initialize()
+// must outlive this object (in kernel.cpp: a local declared after the framebuffer,
+// so it is destroyed first).
 #ifndef _carsh_circle_touch_h
 #define _carsh_circle_touch_h
 
@@ -44,13 +50,16 @@ public:
     CircleTouch& operator=(const CircleTouch&) = delete;
 
     // Circle has no way to unregister a periodic handler, so it outlives this
-    // object: clearing the self-pointer turns the handler into a no-op. (The IRQ
-    // and this destructor run on the same core, so no handler is mid-flight here.)
+    // object: clearing the self-pointer turns the handler into a no-op. This runs
+    // before the members (the driver, the ring) are destroyed, and before the
+    // display if the owner declared it first. (The IRQ and this destructor run on
+    // the same core, so no handler is mid-flight here.)
     ~CircleTouch() { s_self.store(nullptr, std::memory_order_release); }
 
     // display: the framebuffer the UI renders to (CBcmFrameBuffer is a CDisplay).
     // CTouchScreenDevice::Setup() needs it for coordinate mapping; without it,
-    // the first reported event null-derefs the display in ReportHandler.
+    // the first reported event null-derefs the display in ReportHandler. It must
+    // outlive this object (the timer IRQ reads it until ~CircleTouch).
     // timer: the kernel's CTimer, whose 100 Hz tick pumps the driver.
     bool initialize(CDisplay* display, CTimer* timer) {
         if (!mTouch.Initialize()) return false;
@@ -80,6 +89,14 @@ public:
 
     // Events the ring refused under backlog (diagnostics).
     uint32_t dropped() const { return ring_.dropped(); }
+
+    // Down/Up events the ring lost because it was completely full (diagnostics).
+    uint32_t droppedTransitions() const { return ring_.droppedTransitions(); }
+
+    // UI task, after draining: true if the ring lost a Down/Up since the last call
+    // (it was completely full). The UI must then reset its contact tracking — the
+    // lost event may be the Up that its primary-contact latch is waiting for.
+    bool lostTransitionSinceLastCheck() { return ring_.lostTransitionSinceLastCheck(); }
 
 private:
     // Timer IRQ, 100 Hz, core 0.

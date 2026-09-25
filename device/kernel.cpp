@@ -484,10 +484,15 @@ CStdlibApp::TShutdownMode CKernel::Run(void) {
     // (Now Playing transport buttons are wired after Bluetooth is set up below, so
     // they can route play/pause/next/prev to AVRCP when the phone is the source.)
 
-    // Touch (real hardware only; QEMU has no digitizer).
-    // static: the 100 Hz timer IRQ pumps it and Circle can't unregister that handler.
-    static carsh::device::CircleTouch touch;
-    // fb supplies touch coord mapping; mTimer's periodic tick pumps the driver.
+    // Touch (real hardware only; QEMU has no digitizer). fb supplies the coordinate
+    // mapping; mTimer's 100 Hz periodic tick pumps the driver from the timer IRQ,
+    // and that IRQ reads fb through the driver's display pointer. Circle can't
+    // unregister the handler, so ~CircleTouch turns it into a no-op. Keep `touch` a
+    // LOCAL declared AFTER fb: locals are destroyed in reverse order, so if Run()
+    // ever unwinds, the handler is neutralised before fb (and the driver itself)
+    // go away. (A static would never run that destructor and leave the IRQ reading
+    // a dead fb.)
+    carsh::device::CircleTouch touch;
     bool haveTouch = touch.initialize(&fb, &mTimer);
     mLogger.Write(FROM, LogNotice, "touch: %s", haveTouch ? "ready" : "absent");
 
@@ -825,6 +830,18 @@ CStdlibApp::TShutdownMode CKernel::Run(void) {
             mgr.onTouch(ev);
             touchStampUs = 0;
         }
+        // The ring was completely full and lost a Down/Up (the UI stalled > 1 s).
+        // A lost Up would leave ScreenManager's primary-contact latch waiting for
+        // it forever, ignoring every later touch: reset the touch routing (cancels
+        // the contact in progress like a tab switch — an AA press gets its Release —
+        // and drops the latch) so the next Down starts cleanly. Checked after the
+        // drain, so every event queued before the loss was delivered first.
+        if (touch.lostTransitionSinceLastCheck()) {
+            mgr.resetTouch();
+            mLogger.Write(FROM, LogWarning,
+                          "touch: ring lost a Down/Up (%u total); input reset",
+                          unsigned(touch.droppedTransitions()));
+        }
     };
 
     for (;;) {
@@ -895,9 +912,18 @@ CStdlibApp::TShutdownMode CKernel::Run(void) {
             wantRate = r ? r : 44100;
             wantOpen = true;
         } else if (ps.queueIndex >= 0 && ps.queueIndex < int(g_queueIds.size())) {
-            const carsh::library::Track* t =
-                g_db.get(g_queueIds[std::size_t(ps.queueIndex)]);
-            wantRate = (t && t->sampleRate) ? t->sampleRate : kRate;
+            // The rate the player is actually producing (PlayerState::sampleRate:
+            // the heard decoder's native rate, which changes on a non-gapless
+            // restart at a new rate), so the jack reclocks from the true rate even
+            // if the library row says 0 or is stale. The row's rate is only a
+            // fallback, then 48 kHz.
+            uint32_t r = ps.sampleRate;
+            if (r == 0) {
+                const carsh::library::Track* t =
+                    g_db.get(g_queueIds[std::size_t(ps.queueIndex)]);
+                if (t) r = t->sampleRate;
+            }
+            wantRate = r ? r : kRate;
             wantOpen = true;
         }
         if (wantOpen && (wantRate != curRate || !sound.isOpen())) {

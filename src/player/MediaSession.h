@@ -23,10 +23,12 @@
 //     a stream the app just paused can't grab the session straight back. The
 //     returned PauseRequest names the remotes the app should pause.
 //   * With nothing latched: Android Auto if it's connected and there's no local
-//     track, else Bluetooth under the same rule, else the local player.
+//     track, else Bluetooth under the same rule, else the local player. This
+//     fallback only picks what Now Playing shows; it never pauses the local player.
 // Transport (play/pause/next/prev) routes to the owner: AA media keys over the input
-// channel, AVRCP to the BT phone, or the local player. While a remote owns the
-// session the local player must not play underneath it (shouldPauseLocal()).
+// channel, AVRCP to the BT phone, or the local player. While a remote has TAKEN the
+// session (latched) the local player must not play underneath it
+// (shouldPauseLocal()).
 #pragma once
 
 #include <cstdint>
@@ -155,7 +157,7 @@ public:
             v.album = btMeta_.album;
             v.durationMs = btMeta_.durationMs;
             v.positionMs = 0;  // AVRCP play position not tracked yet (no BT scrub)
-            v.playing = btMeta_.playing;
+            v.playing = btPlaying();
         } else if (local_.hasTrack) {
             v.title = local_.title;
             v.artist = local_.artist;
@@ -173,16 +175,22 @@ public:
     // Where a transport intent should go right now.
     Source transportTarget() const { return source(); }
 
-    // A remote source owns the session but the local player is still playing
-    // underneath it (the remote just took over): the app must pause the local
-    // player. It is only ever resumed by an explicit local action.
-    bool shouldPauseLocal() const { return source() != Source::Local && local_.playing; }
+    // A remote source has TAKEN the session (it started playing and is latched)
+    // but the local player is still playing underneath it: the app must pause the
+    // local player. It is only ever resumed by an explicit local action. The
+    // unlatched fallback (no local track + a phone connected) never pauses local:
+    // nothing was started there, and a local player that is Playing without a
+    // track row must not be paused again every frame.
+    bool shouldPauseLocal() const {
+        return latched_ != Source::Local && source() == latched_ && local_.playing;
+    }
 
     // Convenience for a play/pause toggle: the AVRCP command to send when BT is the
-    // target (Play when currently paused/stopped, Pause when playing).
+    // target (Play when currently paused/stopped, Pause when playing). Matches the
+    // view's '>' / '||' for the BT source.
     carsh::bt::AvrcpCommand playPauseCommand() const {
-        return btMeta_.playing ? carsh::bt::AvrcpCommand::Pause
-                               : carsh::bt::AvrcpCommand::Play;
+        return btPlaying() ? carsh::bt::AvrcpCommand::Pause
+                           : carsh::bt::AvrcpCommand::Play;
     }
 
 private:
@@ -204,6 +212,10 @@ private:
             return streaming;
         }
     };
+
+    // The BT phone is playing: AVRCP says so, or its A2DP stream is live (a phone
+    // without AVRCP, or before the first status arrives, must still be pausable).
+    bool btPlaying() const { return btMeta_.playing || bt_.streaming; }
 
     void resolve() {
         // A remote that is playing takes (or keeps) the session; AA outranks BT.

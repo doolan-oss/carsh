@@ -112,9 +112,31 @@ TEST(MediaSession, TransportTargetAndPlayPauseCommand) {
     CHECK(s.transportTarget() == Source::Bluetooth);
     CHECK(s.playPauseCommand() == carsh::bt::AvrcpCommand::Pause);
 
-    // BT paused -> toggle should PLAY.
-    s.setBluetooth(true, true, btMeta("Phone Song", false));
+    // BT paused (AVRCP PAUSED, no PCM arriving) -> toggle should PLAY.
+    s.setBluetooth(true, false, btMeta("Phone Song", false));
+    CHECK(s.transportTarget() == Source::Bluetooth);  // still latched while paused
     CHECK(s.playPauseCommand() == carsh::bt::AvrcpCommand::Play);
+}
+
+// A phone streaming A2DP without AVRCP status (no AVRCP link yet, or before the
+// first PLAYING notification): the stream itself means "playing", so Now Playing
+// shows '||' and the toggle sends PAUSE — the head unit can pause it.
+TEST(MediaSession, BluetoothStreamWithoutAvrcpStatusIsPausable) {
+    MediaSession s;
+    s.setLocal(localTrack("Song A", false));
+    s.setBluetooth(true, true, btMeta("Phone Song", false));  // PCM, AVRCP not PLAYING
+    CHECK(s.transportTarget() == Source::Bluetooth);
+    CHECK(s.view().playing);
+    CHECK(s.playPauseCommand() == carsh::bt::AvrcpCommand::Pause);
+    // The stream stops (paused from here): '>' and PLAY.
+    s.setBluetooth(true, false, btMeta("Phone Song", false));
+    CHECK(s.transportTarget() == Source::Bluetooth);
+    CHECK(!s.view().playing);
+    CHECK(s.playPauseCommand() == carsh::bt::AvrcpCommand::Play);
+    // AVRCP alone (PLAYING before the first PCM chunk) also counts.
+    s.setBluetooth(true, false, btMeta("Phone Song", true));
+    CHECK(s.view().playing);
+    CHECK(s.playPauseCommand() == carsh::bt::AvrcpCommand::Pause);
 }
 
 // --- Latched ownership (review A2 / P4) --------------------------------------
@@ -273,8 +295,10 @@ TEST(MediaSession, ConnectedAndroidAutoShownWithNoLocalTrack) {
     CHECK(s.source() == Source::Local);
 }
 
-// The last source to START playing wins, whichever it is.
-TEST(MediaSession, LastRemoteToStartWins) {
+// A remote that STARTS playing takes the session from a paused (latched) owner,
+// whichever it is. But while both actually stream, AA outranks BT regardless of
+// which started last (it outranks A2DP in the audio mix too).
+TEST(MediaSession, StartingRemoteTakesPausedSessionButAaOutranksStreamingBt) {
     MediaSession s;
     s.setAndroidAuto(true, true);
     s.setAndroidAuto(true, false);            // AA paused (latched)
@@ -284,6 +308,45 @@ TEST(MediaSession, LastRemoteToStartWins) {
     CHECK(s.source() == Source::Bluetooth);   // BT paused, still latched
     s.setAndroidAuto(true, true);
     CHECK(s.source() == Source::AndroidAuto);
+
+    // BT starts while AA is still streaming: BT started last, AA keeps it.
+    s.setBluetooth(true, true, btMeta("Phone Song", true));
+    CHECK(s.source() == Source::AndroidAuto);
+    CHECK(s.transportTarget() == Source::AndroidAuto);
+    s.setAndroidAuto(true, true);             // next frame: both still streaming
+    CHECK(s.source() == Source::AndroidAuto);
+    // AA pauses; BT is still streaming, so it is what's audible: BT takes over.
+    s.setAndroidAuto(true, false);
+    CHECK(s.source() == Source::Bluetooth);
+}
+
+// shouldPauseLocal() is about a remote TAKING the session, not the unlatched
+// fallback: with no local track row and a phone merely connected, Now Playing
+// shows the phone, but a local player that is Playing (its queue entry missing
+// from the library) must not be paused every frame.
+TEST(MediaSession, UnlatchedFallbackNeverPausesLocal) {
+    MediaSession::LocalState playingNoRow;  // hasTrack = false
+    playingNoRow.playing = true;
+
+    MediaSession a;
+    a.setLocal(playingNoRow);
+    a.setAndroidAuto(true, false);            // connected, idle
+    CHECK(a.source() == Source::AndroidAuto);  // shown via the fallback
+    CHECK(!a.shouldPauseLocal());
+    a.setAndroidAuto(true, true);             // AA media starts: it takes over
+    CHECK(a.shouldPauseLocal());
+
+    MediaSession b;
+    b.setLocal(playingNoRow);
+    b.setBluetooth(true, false, btMeta("Phone Song", false));
+    CHECK(b.source() == Source::Bluetooth);
+    CHECK(!b.shouldPauseLocal());
+    b.setBluetooth(true, true, btMeta("Phone Song", true));
+    CHECK(b.shouldPauseLocal());
+    // The owner disconnects: the latch drops and local is left alone again.
+    b.setBluetooth(false, false, btMeta("", false));
+    CHECK(b.source() == Source::Local);
+    CHECK(!b.shouldPauseLocal());
 }
 
 // --- StreamActivity ------------------------------------------------------------

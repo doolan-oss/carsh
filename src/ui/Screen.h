@@ -8,7 +8,8 @@
 // or the gesture recognizer (taps + swipes for the tab bar and widgets). Events
 // from other contact ids are ignored until the latched contact's Up, so a second
 // finger or a palm can't hijack the rail or steal a tap. Switching tabs cancels
-// the contact in progress; its remaining events are swallowed.
+// the contact in progress; its remaining events are swallowed. resetTouch() is
+// the recovery path when the driver lost an event (see its comment).
 #pragma once
 
 #include <memory>
@@ -194,6 +195,17 @@ public:
     // True while a contact is being tracked (by any owner, incl. a cancelled
     // contact whose remaining events are being swallowed).
     bool touchActive() const { return capture_ != Capture::None; }
+
+    // Recovery after the input path lost a Down/Up (the device's touch ring was
+    // full). Cancels the contact in progress exactly as a tab switch does, then
+    // also drops the latch: the lost event may be the latched contact's Up, and
+    // swallowing until that Up would block every later touch. Events of a contact
+    // still down are ignored until the next Down, which starts cleanly.
+    void resetTouch() {
+        cancelTouch();
+        capture_ = Capture::None;
+        captureId_ = -1;
+    }
 
     TabBar& tabBar() { return tabs_; }
 
