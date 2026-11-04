@@ -69,3 +69,11 @@ Still hardware-gated (bench): I2S DAC (have a working PWM jack), real-time/under
 behavior under load, USB across a drive/hub matrix, Bluetooth AVRCP (A2DP audio
 already plays on the board with `CARSH_HAVE_BTSTACK=1`), WiFi, and the OTA push +
 chainloader. See **[STATUS.md](STATUS.md)** and **[HARDWARE_TODO.md](HARDWARE_TODO.md)**.
+
+## Licence
+
+carsh is free software under the **GNU General Public License v3.0 or later**
+([`LICENSE`](LICENSE)). Third-party components, build-time downloads (including
+the Android Auto head-unit certificate fetched from aasdk) and the BTstack caveat
+are listed in **[NOTICE.md](NOTICE.md)**. Android Auto is a trademark of Google
+LLC; carsh is not affiliated with Google.

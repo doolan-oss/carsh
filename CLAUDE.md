@@ -57,6 +57,10 @@ track the `CARSH_*` flags.
 builds `libmbed{crypto,x509,tls}.a` + `libcircle-mbedtls.a` (bare-metal config +
 entropy via Circle's hardware RNG).
 
+**AA head-unit cert:** `scripts/fetch_aa_cert.sh` (one-time) fetches the
+Google-registered cert + key from aasdk into the git-ignored `device/AaHuCert.gen.h`.
+They are not committed — never paste them into a tracked file.
+
 ## circle-stdlib patches (important)
 
 `third_party/circle-stdlib/` is git-ignored, so local edits to it are tracked as
@@ -121,7 +125,7 @@ parse) is host-tested and merged. Bring-up status (full log in `AA_PLAN.md`):
 
 - **Working end-to-end on hardware:** dongle enumerates (`ven2717-ff40` PTP) → AOA
   switch → accessory mode (`ven18d1-2d00`) → bulk endpoints bound as `uaa1` →
-  version → **live TLS** (real aasdk cert in `AaHuCert.h`) → service discovery →
+  version → **live TLS** (real aasdk cert, fetched by `scripts/fetch_aa_cert.sh`) → service discovery →
   channels → **H.264 video + media audio both play.** AA media is also wired into the
   player UI (Now Playing source badge + transport keys; see `player::MediaSession`).
 - **AA input (2026-09-25, `claude/review-fixes`, host-done, bench pending):** touch and

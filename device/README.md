@@ -63,6 +63,9 @@ export PATH=/opt/arm-toolchain/bin:$PATH
 # One-time: build the bundled mbedTLS for the Android Auto TLS channel (the default
 # image now links AaCryptoMbedTls). See AA_PLAN rung 4b.
 ( cd ../third_party/circle-stdlib && make mbedtls )
+# One-time: fetch the Android Auto head-unit cert + key from aasdk into the
+# git-ignored AaHuCert.gen.h (carsh doesn't redistribute them; see AaHuCert.h).
+../scripts/fetch_aa_cert.sh
 make                # -> kernel8-rpi4.img
 ```
 
