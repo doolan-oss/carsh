@@ -634,7 +634,7 @@ Legend: **BMF** = bare-metal-friendly (no OS deps, malloc-only, no threads requi
   Alternative: BearSSL (smaller, but mbed TLS integrates more easily with Circle's net).
 
 ### Framework
-- **Circle** (rsta2/circle) — its own permissive-ish license (see repo; generally usable);
+- **Circle** (rsta2/circle) — GPLv3 (the device image links it, so distributed builds are GPLv3);
   provides USB, DSI FB, I2S, I2C, FAT, scheduler, net, BT transport. The backbone.
 
 ### Font atlas tooling (offline)

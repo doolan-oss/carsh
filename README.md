@@ -70,3 +70,11 @@ behavior under load, USB across a drive/hub matrix, BTstack on a real radio
 (A2DP/AVRCP — `CARSH_HAVE_BTSTACK=1` compiles+links today; USB ACL path + firmware
 blob remain), WiFi, and the OTA flash write + chainloader. See **[STATUS.md](STATUS.md)**
 and **[HARDWARE_TODO.md](HARDWARE_TODO.md)**.
+
+## Licence
+
+carsh is free software under the **GNU General Public License v3.0 or later**
+([`LICENSE`](LICENSE)). Third-party components, build-time downloads (including
+the Android Auto head-unit certificate fetched from aasdk) and the BTstack caveat
+are listed in **[NOTICE.md](NOTICE.md)**. Android Auto is a trademark of Google
+LLC; carsh is not affiliated with Google.
