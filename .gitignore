@@ -20,6 +20,12 @@ __pycache__/
 /ota_dev_key.pem
 *.carup
 
+# Android Auto head-unit cert + key, fetched from aasdk (scripts/fetch_aa_cert.sh)
+device/AaHuCert.gen.h
+
+# tools/aa_linux build output
+tools/aa_linux/aa_linux
+
 third_party/circle/
 third_party/circle-stdlib/
 third_party/circle-stdlib/
