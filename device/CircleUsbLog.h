@@ -8,6 +8,14 @@
 // runs this task repeatedly during the UI loop's MsSleep(). The USB-C port is the
 // dwc2 OTG controller, independent of the xHCI host that drives the USB-A music
 // stick (CUSBHCIDevice) — the two coexist on the Pi 4.
+//
+// Host->device bytes carry the serial OTA push (src/ota/PushProtocol.h). The
+// gadget queues them in an 8 KiB ring from its IRQ with no back-pressure, and
+// only this task drains it, so the push is flow-controlled: after each drain
+// pass this task logs the receiver's cumulative "ota-push: ack <seq>", which the
+// host waits for before sending more. A negative Read() means the gadget's ring
+// overran and dropped bytes: it is logged and fails an in-progress push with
+// rx-overrun (review finding O2) rather than being mistaken for "no data".
 #ifndef _carsh_circle_usb_log_h
 #define _carsh_circle_usb_log_h
 
@@ -46,15 +54,20 @@ public:
             }
             // Drain host->device bytes so the CDC RX path never backs up. With a
             // push receiver attached they carry the serial OTA transfer; loop-
-            // drain (bounded per pass) so a multi-MB push moves at USB speed,
-            // not one small buffer per scheduler round.
-            if (mSerial) {
-                uint8_t buf[512];
-                for (unsigned pass = 0; pass < 32; ++pass) {
-                    const int n = mSerial->Read(buf, sizeof buf);
-                    if (n <= 0) break;
-                    if (mPush) mPush->feed(buf, static_cast<std::size_t>(n));
-                }
+            // drain (bounded per pass), then ack what was consumed so the host
+            // sends the next window (PushProtocol.h flow control).
+            if (CUSBSerialDevice* serial = mSerial) {
+                const carsh::ota::PushDrainResult r = carsh::ota::drainPushSource(
+                    mPush, [serial](uint8_t* buf, std::size_t cap) {
+                        return serial->Read(buf, cap);
+                    });
+                if (r.overrun)
+                    mLogger->Write("usblog", LogWarning,
+                                   "CDC RX overrun: host->device bytes dropped%s",
+                                   r.abortedTransfer ? " (OTA push aborted)" : "");
+                if (r.ackReady)
+                    mLogger->Write("ota", LogNotice, carsh::ota::push::kAckLogFormat,
+                                   unsigned(r.ackSeq));
             }
             CScheduler::Get()->Yield();
         }

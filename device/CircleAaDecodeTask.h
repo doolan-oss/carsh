@@ -16,10 +16,10 @@
 
 #include <circle/sched/scheduler.h>
 #include <circle/sched/task.h>
-#include <circle/timer.h>
 
 #include <atomic>
 
+#include "CircleClock.h"  // clockUs32(): decode timing
 #include "aa/AsyncH264Decoder.h"
 
 namespace carsh::device {
@@ -56,10 +56,10 @@ public:
 
     void Run(void) override {
         for (;;) {
-            const unsigned t0 = CTimer::GetClockTicks();  // 1 MHz free-running (us)
+            const uint32_t t0 = clockUs32();  // us; t1 - t0 is wrap-safe
             const unsigned n = dec_->pump(1);             // one AU per pass, then yield
             if (n > 0 && stats_ != nullptr)
-                stats_->record(CTimer::GetClockTicks() - t0);
+                stats_->record(clockUs32() - t0);
             CScheduler::Get()->Yield();
         }
     }

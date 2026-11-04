@@ -30,6 +30,7 @@
 #include <circle/types.h>
 
 #include "CircleAaDecodeTask.h"      // AaDecodeStats
+#include "CircleClock.h"             // clockUs32(): decode timing
 #include "aa/AsyncH264Decoder.h"
 
 namespace carsh::device {
@@ -51,10 +52,10 @@ public:
     void Run(unsigned nCore) override {
         if (nCore != kDecodeCore) return;  // park cores 1,2 (and any core != decode)
         for (;;) {
-            const unsigned t0 = CTimer::GetClockTicks();  // 1 MHz free-running (us)
+            const uint32_t t0 = clockUs32();  // us; t1 - t0 is wrap-safe
             const unsigned n = dec_->pump(1);
             if (n > 0 && stats_ != nullptr)
-                stats_->record(CTimer::GetClockTicks() - t0);
+                stats_->record(clockUs32() - t0);
             // No Yield() — this core is ours. A tiny pause keeps an empty queue from
             // hammering the bus; the AuQueue's acquire load still sees fresh AUs.
             if (n == 0) CTimer::SimpleusDelay(200);

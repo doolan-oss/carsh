@@ -2,7 +2,9 @@
 // CBcmFrameBuffer (PLAN.md §2.2). The UI toolkit draws into an in-RAM backbuffer
 // (so the toolkit sees a tightly-packed width*height ARGB surface regardless of
 // the framebuffer's hardware pitch); present() blits it row-by-row into the real
-// framebuffer, which also gives tear-free double buffering.
+// framebuffer. That framebuffer is the one being scanned out, and there is no
+// vsync wait or page flip, so a frame can tear mid-copy (review K13, open): the
+// back buffer only keeps half-drawn UI off the screen, it is not double buffering.
 //
 // Color order: the Pi's 32bpp framebuffer is commonly BGRA in memory. If colors
 // come out with red/blue swapped on hardware, build with -DCARSH_FB_SWAP_RB.

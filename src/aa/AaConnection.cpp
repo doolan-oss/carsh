@@ -95,12 +95,16 @@ std::vector<uint8_t> buildServiceDiscoveryResponse() {
         });
     });
 
-    // Video channel: 720p @ 60fps. Replicated byte-for-byte from the Google Desktop
-    // Head Unit's service-discovery video MediaSinkService (captured 2026-06-28). The
-    // previous minimal config (resolution+fps+dpi only, plus a bogus available_type=3
-    // and available_while_in_call at field 5) was mis-parsed by the phone: it requested
-    // a bogus config_index and set up the channel but never started the stream. The DHU
-    // omits available_type for video and sends the full VideoConfig field set.
+    // Video channel: 480p (800x480) @ 30fps — the resolution the 800x480 touch surface
+    // above is sized for (they MUST match; the phone won't start the stream on a
+    // mismatch). The field layout is the Google Desktop Head Unit's service-discovery
+    // video MediaSinkService (captured 2026-06-28); only the resolution differs from
+    // that capture (the DHU asked for 720p; carsh dropped to 480p for real-time
+    // software decode). The previous minimal config (resolution+fps+dpi only, plus a
+    // bogus available_type=3 and available_while_in_call at field 5) was mis-parsed by
+    // the phone: it requested a bogus config_index and set up the channel but never
+    // started the stream. The DHU omits available_type for video and sends the full
+    // VideoConfig field set.
     w.submessage(1, [](pb::Writer& ch) {
         ch.uint32(1, static_cast<uint32_t>(ChannelId::Video));
         ch.submessage(3, [](pb::Writer& av) {       // av_channel (AVChannelData)
@@ -139,8 +143,11 @@ AaConnection::AaConnection(AaMessenger& msger, IAaCrypto& crypto, AaConnectionCa
     : msger_(msger), crypto_(crypto), cbs_(std::move(cbs)) {
     // Decrypt ENCRYPTED frames per-frame inside the messenger (aasdk model) — required
     // for multi-frame (large keyframe) messages; see AaMessenger::setDecryptor.
+    // The messenger calls this for EVERY encrypted frame in order (even ones it then
+    // drops) so the TLS record sequence stays aligned; a failure is picked up by poll()
+    // through crypto_.failed().
     msger_.setDecryptor([this](const uint8_t* p, size_t n) -> std::vector<uint8_t> {
-        if (!crypto_.handshakeDone()) return {};
+        if (!crypto_.handshakeDone() || crypto_.failed()) return {};
         return crypto_.decrypt(p, n);
     });
 }
@@ -169,9 +176,9 @@ bool AaConnection::sendEncrypted(ChannelId ch, uint16_t msgId, const uint8_t* p,
     plain.reserve(2 + n);
     plain.push_back(static_cast<uint8_t>((msgId >> 8) & 0xFF));
     plain.push_back(static_cast<uint8_t>(msgId & 0xFF));
-    plain.insert(plain.end(), p, p + n);
+    if (n > 0) plain.insert(plain.end(), p, p + n);
     std::vector<uint8_t> cipher = crypto_.encrypt(plain.data(), plain.size());
-    if (cipher.empty()) return false;
+    if (cipher.empty()) return false;  // a fatal encrypt error surfaces via failed()
     return msger_.sendRaw(ch, EncryptionType::Encrypted, MessageType::Specific,
                           cipher.data(), cipher.size());
 }
@@ -187,7 +194,7 @@ bool AaConnection::sendEncryptedChannelControl(ChannelId ch, uint16_t msgId,
     plain.reserve(2 + n);
     plain.push_back(static_cast<uint8_t>((msgId >> 8) & 0xFF));
     plain.push_back(static_cast<uint8_t>(msgId & 0xFF));
-    plain.insert(plain.end(), p, p + n);
+    if (n > 0) plain.insert(plain.end(), p, p + n);
     std::vector<uint8_t> cipher = crypto_.encrypt(plain.data(), plain.size());
     if (cipher.empty()) return false;
     return msger_.sendRaw(ch, EncryptionType::Encrypted, MessageType::Control,
@@ -207,7 +214,7 @@ void AaConnection::handleVersionResponse(const uint8_t* p, size_t n) {
     if (n < 4) return;
     const uint16_t status = (n >= 6) ? static_cast<uint16_t>((p[4] << 8) | p[5]) : 0;
     if (status != 0) {  // version rejected by the phone
-        state_ = AaState::Shutdown;
+        enterShutdown(AaShutdownReason::VersionRejected);
         return;
     }
     state_ = AaState::SslHandshake;
@@ -272,27 +279,29 @@ void AaConnection::handleChannelOpenRequest(ChannelId frameCh, const uint8_t* /*
     // stream is live). Prompting here was a workaround for the previously-wrong config.
 }
 
+// PingRequest{ int64 timestamp = 1 } -> PingResponse{ int64 timestamp = 1 } echoing
+// the phone's timestamp unchanged (aasdk Ping{Request,Response}Message.proto, headunit
+// hu.proto; later schemas add request bug_report = 2 / data = 3, which the response
+// does not carry). The value is kept as the raw 64-bit varint, so a µs/ns clock above
+// 2^31 round-trips intact — it used to be truncated to int32 and paired with a bogus
+// field 2. Still sent PLAIN: aasdk sends its own pings plain after TLS, phones accept
+// plain control frames, and this is the path the bench has been running.
 void AaConnection::handlePingRequest(const uint8_t* p, size_t n) {
     pb::Reader r(p, n);
     uint32_t field;
     uint8_t wire;
-    int32_t id = 0;
     uint64_t timestamp = 0;
     while (!r.eof()) {
         if (!r.tag(field, wire)) break;
         if (field == 1 && wire == 0) {
-            uint64_t v;
-            if (r.varint(v)) id = static_cast<int32_t>(v);
-        } else if (field == 2 && wire == 0) {
-            r.varint(timestamp);
+            if (!r.varint(timestamp)) break;
         } else if (!r.skip(wire)) {
             break;
         }
     }
     std::vector<uint8_t> body;
     pb::Writer w(body);
-    w.int32(1, id);
-    w.tag(0, 2);
+    w.tag(0, 1);  // timestamp (int64 varint: two's complement bits echoed verbatim)
     w.varint(timestamp);
     sendPlainSpecific(static_cast<uint16_t>(ControlMsgId::PingResponse), body.data(), body.size());
 }
@@ -340,6 +349,35 @@ void AaConnection::handleNavFocusRequest(const uint8_t* /*p*/, size_t /*n*/) {
                   body.size());
 }
 
+// ShutdownRequest{ reason = 1 (QUIT) }: acknowledge with an (empty) SHUTDOWN_RESPONSE
+// BEFORE going down, encrypted/SPECIFIC on the control channel like openauto's
+// AndroidAutoEntity::onShutdownRequest (aasdk ControlServiceChannel::sendShutdown
+// Response). Without it the phone sits out its bye-bye timeout before tearing down.
+void AaConnection::handleShutdownRequest(const uint8_t* /*p*/, size_t /*n*/) {
+    const uint16_t id = static_cast<uint16_t>(ControlMsgId::ShutdownResponse);
+    if (crypto_.handshakeDone() && !crypto_.failed()) {
+        sendEncryptedControl(id, nullptr, 0);
+    } else {
+        sendPlainSpecific(id, nullptr, 0);  // pre-TLS shutdown: nothing to encrypt with
+    }
+    enterShutdown(AaShutdownReason::PhoneRequest);
+}
+
+void AaConnection::enterShutdown(AaShutdownReason reason) {
+    if (state_ == AaState::Shutdown) return;  // terminal; fire onShutdown only once
+    state_ = AaState::Shutdown;
+    shutdownReason_ = reason;
+    channelOpen_.fill(false);
+    sensorStarted_.fill(false);
+    if (cbs_.onShutdown) cbs_.onShutdown();
+}
+
+bool AaConnection::checkCryptoFailed() {
+    if (!crypto_.failed()) return false;
+    enterShutdown(AaShutdownReason::CryptoFailure);
+    return true;
+}
+
 void AaConnection::handleControl(uint16_t msgId, const uint8_t* p, size_t n) {
     switch (static_cast<ControlMsgId>(msgId)) {
         case ControlMsgId::VersionResponse:
@@ -363,8 +401,7 @@ void AaConnection::handleControl(uint16_t msgId, const uint8_t* p, size_t n) {
             handleNavFocusRequest(p, n);
             break;
         case ControlMsgId::ShutdownRequest:
-            state_ = AaState::Shutdown;
-            if (cbs_.onShutdown) cbs_.onShutdown();
+            handleShutdownRequest(p, n);
             break;
         default:
             break;
@@ -381,6 +418,8 @@ void AaConnection::handleChannelMessage(ChannelId ch, uint16_t msgId, const uint
         handleInputChannel(msgId, p, n);
     } else if (ch == ChannelId::Sensor) {
         handleSensorChannel(msgId, p, n);
+    } else if (ch == ChannelId::AvInput) {
+        handleAvInputChannel(msgId, p, n);
     } else if (cbs_.onChannelMessage) {
         // Nav / media-status / bluetooth: not decoded here yet.
         cbs_.onChannelMessage(ch, msgId, p, n);
@@ -526,6 +565,69 @@ void AaConnection::handleSensorChannel(uint16_t msgId, const uint8_t* p, size_t 
     }
 }
 
+// The AV-input (microphone) channel carsh advertises in service discovery. The phone
+// drives it like aasdk's AVInputServiceChannel / openauto's AudioInputService expect:
+// SETUP_REQUEST, then AV_INPUT_OPEN_REQUEST when a voice session wants the HU mic.
+// Both used to go unanswered, so the phone's voice session hung waiting. carsh has no
+// mic uplink yet, so after the OK the phone receives no mic audio and the voice
+// session times out on silence instead of hanging on the open.
+void AaConnection::handleAvInputChannel(uint16_t msgId, const uint8_t* p, size_t n) {
+    switch (static_cast<AvMsgId>(msgId)) {
+        case AvMsgId::SetupRequest: {
+            // AVChannelSetupRequest{ config_index = 1 } -> the same AVChannelSetupResponse
+            // as the sink channels: {OK, max_unacked = 1, configs = [0]} (one advertised
+            // config: 16 kHz mono) — exactly openauto's onAVChannelSetupRequest.
+            uint32_t configIndex = 0;
+            pb::Reader r(p, n);
+            uint32_t field;
+            uint8_t wire;
+            while (!r.eof()) {
+                if (!r.tag(field, wire)) break;
+                if (field == 1 && wire == 0) {
+                    r.u32(configIndex);
+                } else if (!r.skip(wire)) {
+                    break;
+                }
+            }
+            sendAvSetupResponse(ChannelId::AvInput, static_cast<uint8_t>(configIndex));
+            if (cbs_.onAvSetup) cbs_.onAvSetup(ChannelId::AvInput, static_cast<uint8_t>(configIndex));
+            break;
+        }
+        case AvMsgId::AvInputOpenRequest: {
+            // AVInputOpenRequest{ open = 1 (bool), anc = 2, ec = 3, max_unacked = 4 }.
+            bool open = false;
+            pb::Reader r(p, n);
+            uint32_t field;
+            uint8_t wire;
+            while (!r.eof()) {
+                if (!r.tag(field, wire)) break;
+                if (field == 1 && wire == 0) {
+                    uint64_t v = 0;
+                    if (r.varint(v)) open = (v != 0);
+                } else if (!r.skip(wire)) {
+                    break;
+                }
+            }
+            // AVInputOpenResponse{ session = 1 (int32), value = 2 (uint32, 0 = OK) },
+            // both required (proto2). openauto answers {session_ = 0, value = 0} for an
+            // open (once its mic started) and for a close; every schema agrees on zeros.
+            std::vector<uint8_t> body;
+            pb::Writer w(body);
+            w.int32(1, 0);   // session
+            w.uint32(2, 0);  // value = OK
+            sendEncrypted(ChannelId::AvInput,
+                          static_cast<uint16_t>(AvMsgId::AvInputOpenResponse), body.data(),
+                          body.size());
+            if (cbs_.onMicRequest) cbs_.onMicRequest(open);
+            break;
+        }
+        default:
+            // AV_MEDIA_ACK_INDICATION would ack mic data we never send.
+            if (cbs_.onChannelMessage) cbs_.onChannelMessage(ChannelId::AvInput, msgId, p, n);
+            break;
+    }
+}
+
 // SensorEventIndication carries one repeated sub-message per sensor, and aasdk's
 // field number for each equals the SensorType id (driving_status = 13, night = 10,
 // matching buildServiceDiscoveryResponse above), so encode generically by type.
@@ -589,7 +691,7 @@ void AaConnection::sendMediaAck(ChannelId ch) {
 }
 
 bool AaConnection::sendVideoFocus(VideoFocusMode mode, bool unrequested) {
-    if (!channelOpen(ChannelId::Video)) return false;
+    if (state_ != AaState::Running || !channelOpen(ChannelId::Video)) return false;
     // VideoFocusIndication{ focus_mode = 1, unrequested = 2 (bool) }. The phone DRIVES
     // video focus: it sends VideoFocusRequest and the HU replies with this Indication,
     // echoing the requested mode (unrequested=false). Matches the functional NexusDrive
@@ -604,45 +706,59 @@ bool AaConnection::sendVideoFocus(VideoFocusMode mode, bool unrequested) {
 }
 
 bool AaConnection::sendTouch(TouchAction action, uint32_t x, uint32_t y,
-                             uint64_t timestamp) {
-    if (!channelOpen(ChannelId::Input)) return false;
-    // InputEventIndication{ timestamp = 1 (int64), touch_event = 2 {
-    //   touch_location[1] { x[1], y[2], pointer_id[3] }, touch_action[2], action_index[3] } }.
+                             uint64_t timestampUs) {
+    if (state_ != AaState::Running || !channelOpen(ChannelId::Input)) return false;
+    // InputEventIndication (aasdk InputEventIndicationMessage.proto; headunit's
+    // InputEvent and Google's InputReport use the same numbers):
+    //   timestamp    = 1  uint64 (µs)
+    //   disp_channel = 2  int32   — omitted: the primary display
+    //   touch_event  = 3  TouchEvent {
+    //     touch_location = 1  repeated TouchLocation { x = 1, y = 2, pointer_id = 3 }
+    //     action_index   = 2  uint32 — index of the pointer the action is for (0)
+    //     touch_action   = 3  enum TouchAction { PRESS = 0, RELEASE = 1, DRAG = 2 } }
+    //   button_event = 4  ButtonEvents (see sendButtonEvent)
+    // Zero-valued fields are still written: the phone parses a proto2 schema in which
+    // pointer_id and touch_action are REQUIRED (headunit hu.proto), so omitting a zero
+    // PRESS / pointer 0 would make the whole event fail to parse. (carsh used to put
+    // touch_event in field 2 — disp_channel, an int32, so the phone skipped it — with
+    // action/action_index swapped; no AA tap ever reached the phone.)
     std::vector<uint8_t> body;
     pb::Writer w(body);
     w.tag(0, 1);
-    w.varint(timestamp);
-    w.submessage(2, [&](pb::Writer& te) {
-        te.submessage(1, [&](pb::Writer& loc) {
+    w.varint(timestampUs);
+    w.submessage(3, [&](pb::Writer& te) {   // touch_event
+        te.submessage(1, [&](pb::Writer& loc) {  // touch_location[0]
             loc.uint32(1, x);
             loc.uint32(2, y);
-            loc.uint32(3, 0);  // pointer_id
+            loc.uint32(3, 0);  // pointer_id (single touch)
         });
-        te.uint32(2, static_cast<uint32_t>(action));
-        te.uint32(3, 0);  // action_index
+        te.uint32(2, 0);                             // action_index
+        te.uint32(3, static_cast<uint32_t>(action));  // touch_action
     });
     return sendEncrypted(ChannelId::Input,
                          static_cast<uint16_t>(InputMsgId::InputEventIndication),
                          body.data(), body.size());
 }
 
-bool AaConnection::sendButtonEvent(MediaKey key, bool pressed, uint64_t timestamp) {
-    if (!channelOpen(ChannelId::Input)) return false;
-    // InputEventIndication{ timestamp = 1 (int64), button_event = 3 {  // ButtonEvents
-    //   button_events[1] { scan_code[1], is_pressed[2] } } }.
-    // NOTE: button_event is field 3 (not 4) because carsh follows the older aasdk
-    // layout WITHOUT disp_channel — the same layout its hardware-validated sendTouch
-    // uses (touch_event = field 2). On aasdk master (with disp_channel = 2) these
-    // shift to touch_event = 3 / button_event = 4; keep these in lockstep with
-    // sendTouch above. [hw] confirm the phone binds + acts on the key on the bench.
+bool AaConnection::sendButtonEvent(MediaKey key, bool pressed, uint64_t timestampUs) {
+    if (state_ != AaState::Running || !channelOpen(ChannelId::Input)) return false;
+    // InputEventIndication{ timestamp = 1, button_event = 4 (ButtonEvents) {
+    //   button_events = 1 (repeated ButtonEvent) {
+    //     scan_code = 1, is_pressed = 2, meta = 3, long_press = 4 } } }
+    // (aasdk ButtonEvent{s}Data.proto). meta/long_press are written as 0/false, like
+    // openauto's InputService::onButtonEvent: headunit's proto2 ButtonInfo makes all
+    // four REQUIRED, so leaving them out could get the key rejected. (carsh used to
+    // send button_event as field 3 — touch_event — so keys never reached the phone.)
     std::vector<uint8_t> body;
     pb::Writer w(body);
     w.tag(0, 1);  // timestamp (varint, field 1)
-    w.varint(timestamp);
-    w.submessage(3, [&](pb::Writer& be) {            // button_event (ButtonEvents)
+    w.varint(timestampUs);
+    w.submessage(4, [&](pb::Writer& be) {            // button_event (ButtonEvents)
         be.submessage(1, [&](pb::Writer& b) {        // button_events[0] (ButtonEvent)
             b.uint32(1, static_cast<uint32_t>(key));  // scan_code
             b.boolean(2, pressed);                    // is_pressed
+            b.uint32(3, 0);                           // meta (no modifier state)
+            b.boolean(4, false);                      // long_press
         });
     });
     return sendEncrypted(ChannelId::Input,
@@ -650,10 +766,10 @@ bool AaConnection::sendButtonEvent(MediaKey key, bool pressed, uint64_t timestam
                          body.data(), body.size());
 }
 
-bool AaConnection::sendMediaKey(MediaKey key, uint64_t timestamp) {
-    // A key press is a down followed by an up (mirrors sendTouch's press/release).
-    const bool down = sendButtonEvent(key, true, timestamp);
-    const bool up = sendButtonEvent(key, false, timestamp);
+bool AaConnection::sendMediaKey(MediaKey key, uint64_t timestampUs) {
+    // A key press is a down followed by an up (mirrors a touch's press/release).
+    const bool down = sendButtonEvent(key, true, timestampUs);
+    const bool up = sendButtonEvent(key, false, timestampUs);
     return down && up;
 }
 
@@ -661,7 +777,15 @@ bool AaConnection::poll(uint32_t timeoutMs) {
     if (state_ == AaState::Shutdown) return false;
 
     AaMessage msg;
-    if (!msger_.receive(msg, timeoutMs)) return false;
+    const bool got = msger_.receive(msg, timeoutMs);
+    // A fatal TLS error ends the session. A lost or corrupted record fails its MAC and,
+    // because records are sequence-numbered, so does every record after it: the link
+    // can never produce plaintext again. This used to be invisible — decrypt returned
+    // empty, the message went out as msgId 0 and the connection stayed "Running"
+    // forever with frozen video. Checked even when no message completed (the bad
+    // frame may have been a MIDDLE, or dropped), and before dispatching anything.
+    if (checkCryptoFailed()) return false;
+    if (!got) return false;
 
     // Decrypt-then-dispatch. PLAIN messages already carry the message id (the
     // SSL_HANDSHAKE payload is raw TLS, handled as-is). ENCRYPTED messages hold a
@@ -681,6 +805,7 @@ bool AaConnection::poll(uint32_t timeoutMs) {
             return true;
         }
         decrypted = crypto_.decrypt(msg.payload.data(), msg.payload.size());
+        if (checkCryptoFailed()) return false;
         if (decrypted.size() < 2) {
             if (cbs_.onRxFrame) cbs_.onRxFrame(msg.channel, 0xFFF1, true, decrypted.size());
             return true;
@@ -705,6 +830,8 @@ bool AaConnection::poll(uint32_t timeoutMs) {
     } else {
         handleChannelMessage(msg.channel, msgId, payload, payloadLen);
     }
+    // A handshake step or an encrypted reply above may have hit a fatal TLS error.
+    checkCryptoFailed();
     return true;
 }
 

@@ -46,6 +46,12 @@ struct BluetoothCallbacks {
     std::function<void(const BdAddr&)> onConnected;
     std::function<void(const BdAddr&)> onDisconnected;
     std::function<void(const AvrcpMetadata&)> onMetadata;
+    // The connected phone's AVRCP session ended (AVRCP released, or the link
+    // dropped with it up): its last metadata no longer applies, and until AVRCP
+    // reports again the phone has no play-status channel. A2DP may well still be
+    // streaming, so this is not a disconnect. On a link drop it comes before
+    // onDisconnected.
+    std::function<void()> onAvrcpEnded;
     // Decoded A2DP PCM (SBC/AAC) destined for the engine's BT decode ring.
     std::function<void(const float* interleaved, std::size_t frames,
                        uint8_t channels)> onA2dpPcm;

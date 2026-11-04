@@ -4,6 +4,28 @@
 modifications to it live here as tracked patches and must be re-applied after a
 fresh `scripts/fetch_circle.sh`.
 
+On a fresh checkout, apply all seven before the first circle-stdlib build (they apply
+cleanly in this order to the pinned Circle Step51), then the gadget VID edit below:
+```sh
+for p in usbbluetooth-acl usbdevicefactory-aoa usbstandardhub-reconfigure \
+         sysconfig-multicore sysconfig-heap-buckets chainboot-multicore \
+         usbcdcgadget-rx-overrun; do
+  patch -p1 -d third_party/circle-stdlib/libs/circle < scripts/patches/$p.patch
+done
+```
+On an already-built circle-stdlib, rebuild per patch as noted in each section. The
+two `sysconfig-*` patches change `sysconfig.h`, which is compiled into most of
+Circle, so they need a **full libcircle rebuild** (`./makeall clean && ./makeall`),
+not one directory.
+
+**Not a patch — the USB gadget vendor ID.** Circle's default
+`USB_GADGET_VENDOR_ID` is 0x0000, which its gadget driver rejects, so without this
+edit there is no USB-C serial console (`/dev/ttyACM0`), no bench log and no serial OTA
+push. It is a one-line manual edit of `libs/circle/include/circle/sysconfig.h`
+(`#define USB_GADGET_VENDOR_ID 0x1209`, the pid.codes development VID), described in
+`device/README.md` step 3; rebuild `lib/usb/gadget` afterwards (or apply it before the
+first build).
+
 ## usbbluetooth-acl.patch
 Adds the HCI **ACL data path** to Circle's `CUSBBluetoothDevice`, which upstream
 configures the bulk IN/OUT endpoints for but never exposes. Adds:
@@ -44,8 +66,8 @@ that re-enumerates on the same port is enumerated but never `Configure()`d (the 
 skips it). This is exactly the Android Auto flow: our pre-switch driver triggers the
 AOA mode-switch and returns FALSE (so the hub frees the slot fast); the dongle then
 re-enumerates in accessory mode on the **same port**, and must be `Configure()`d to
-bind its bulk endpoints. Bench-confirmed root cause; the fix itself is pending bench
-re-test (see `device/CircleAoaTransport.cpp`).
+bind its bulk endpoints. Bench-confirmed root cause and fix (AA_PLAN rung 3: the
+accessory device binds its bulk endpoints as `uaa1`).
 
 Apply + rebuild:
 ```sh
@@ -70,3 +92,54 @@ patch -p1 -d third_party/circle-stdlib/libs/circle < scripts/patches/sysconfig-m
 ```
 The device image gets the dedicated core by default with `make CARSH_HAVE_OPENH264=1`;
 build `CARSH_NO_DECODE_CORE=1` to fall back to the single-core cooperative decode task.
+
+## sysconfig-heap-buckets.patch
+Adds large heap buckets to Circle's `HEAP_BLOCK_BUCKET_SIZES` in `sysconfig.h`:
+0xC0000 up to 0x8000000 (768 KiB to 128 MiB), 20 buckets in total, which is Circle's
+`HEAP_BLOCK_MAX_BUCKETS` limit. `CHeapAllocator` only puts a freed block back on a free
+list when its size equals a bucket. With the stock list, whose largest bucket is
+0x80000, every freed malloc/new block over 512 KiB was lost for good; cover-art
+decodes, tag buffers, vector regrowth and per-session buffers slowly used up HEAP_LOW
+this way (review L1). The app refuses to build without it: `device/kernel.cpp`
+`static_assert`s that the largest `HEAP_BLOCK_BUCKET_SIZES` entry is at least
+0x8000000 (the check reads the header, so a patched header over a stale
+`libcircle.a` still needs the rebuild below). The hunk is independent of
+`sysconfig-multicore.patch` and applies before or after it. Like that patch, it
+needs a full libcircle rebuild:
+```sh
+patch -p1 -d third_party/circle-stdlib/libs/circle < scripts/patches/sysconfig-heap-buckets.patch
+( cd third_party/circle-stdlib/libs/circle && ./makeall clean && ./makeall -j$(nproc) )
+```
+
+## chainboot-multicore.patch
+Lets Circle's `EnableChainBoot()` work in an `ARM_ALLOW_MULTI_CORE` build. Upstream
+`assert (0)`s in every multi-core build, so the A/B chainloader (`device/chainloader/`,
+linked against the same libcircle) halted on every boot (review O1). The patch refuses
+only once a `CMultiCoreSupport` exists, i.e. once secondary cores may be running the
+image that is about to be overwritten. The chainloader never starts them: they stay
+parked in the armstub spin table, and the chained app releases them as on a cold boot.
+It adds `IsChainBootAllowed()`, `CMultiCoreSupport::IsActive()` and the
+`CHAINBOOT_MULTICORE_SAFE` marker. Without the patch the chainloader `#error`s, and a
+patched header over a stale `libcircle.a` fails to link.
+
+Apply + rebuild (after `sysconfig-multicore.patch`; it touches `multicore.h`, so
+rebuild `lib/` — a full `./makeall clean && ./makeall` for the sysconfig patches
+covers it too):
+```sh
+patch -p1 -d third_party/circle-stdlib/libs/circle < scripts/patches/chainboot-multicore.patch
+( cd third_party/circle-stdlib/libs/circle/lib && make -j$(nproc) )
+```
+
+## usbcdcgadget-rx-overrun.patch
+Stock Circle asserts inside the USB IRQ when the CDC gadget's 8 KiB RX ring is exactly
+full, or when a zero-length packet arrives: `Enqueue()` of 0 bytes trips
+`assert (nCount > 0)`. That halts the whole board instead of reporting the overrun
+(-1) to `Read()`. With this patch, `CircleUsbLog` logs the overrun and fails an
+in-progress OTA push with `rx-overrun`, and the host restarts it. The serial push is
+flow-controlled, so the ring should never fill; this is defence in depth (review O2).
+
+Apply + rebuild:
+```sh
+patch -p1 -d third_party/circle-stdlib/libs/circle < scripts/patches/usbcdcgadget-rx-overrun.patch
+( cd third_party/circle-stdlib/libs/circle/lib/usb/gadget && make )
+```

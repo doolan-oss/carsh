@@ -1,10 +1,26 @@
-// ID3v2 (.2.3/.2.4) parser for MP3 tags (PLAN.md §2.10).
+// ID3v2 (v2.2/v2.3/v2.4) parser for MP3 tags (PLAN.md §2.10).
 //
-// Reads the tag at the start of the stream into a buffer and walks text frames
-// (TIT2/TPE1/TPE2/TALB/TCON/TRCK/TPOS/TYER/TDRC) plus APIC (embedded art flag).
+// Walks the tag frame by frame straight from the stream: only the text frames we
+// map (TIT2/TPE1/TPE2/TALB/TCON/TRCK/TPOS/TYER/TDRC, v2.2 TT2/TP1/...) are read,
+// each into one small reused buffer (<= kMaxId3TextFrame); every other frame —
+// APIC/PIC cover art above all — is seeked past, and APIC only sets the
+// hasEmbeddedArt flag. The header's tag size is clamped to the stream size, so a
+// corrupt header claiming 256 MiB costs nothing. Nothing is allocated in
+// proportion to the tag: on Circle's stock heap a freed block > 512 KiB is lost
+// for good, and buffering whole tags (embedded art included) per file could
+// exhaust memory while indexing a big library (review L1).
+//
 // Handles the four text encodings (ISO-8859-1, UTF-16 BOM/BE, UTF-8) for the
-// Basic Multilingual Plane. Unsynchronization + extended headers are uncommon in
-// practice and treated as best-effort (documented limitation).
+// Basic Multilingual Plane, extended headers, v2.2/v2.3 tag-level and v2.4
+// frame-level unsynchronisation, v2.4 data-length indicators and grouping bytes.
+// Compressed or encrypted frames are skipped.
+//
+// Real-world quirks, following mutagen: a frame with an invalid id (lowercase,
+// punctuation) is skipped by its size like any unknown frame, so the frames
+// after it still parse — the walk only stops at padding or at a size that runs
+// past the tag. v2.2 names in a v2.3/v2.4 tag ("TT2\0") are mapped. v2.4 frame
+// sizes written as plain big-endian (old iTunes) are detected by checking where
+// each reading of the size lands; see id3::v24FrameSize().
 #pragma once
 
 #include <cstdint>
@@ -89,41 +105,309 @@ inline std::string decodeId3Text(const uint8_t* d, std::size_t len) {
     return out;
 }
 
+// Largest text frame parseId3v2() will read; bigger ones are skipped (no real
+// title/artist is anywhere near this). Keeps the buffer in a small heap bucket.
+constexpr std::size_t kMaxId3TextFrame = 64 * 1024;
+
+namespace id3 {
+
+// Bounded, forward-only view of the tag bytes [pos, end) of the stream. With
+// `unsync` set (the v2.2/v2.3 tag-level flag) reads undo the unsynchronisation
+// scheme (0xFF 0x00 -> 0xFF) across the whole tag, which is how v2.3 defines
+// frame sizes; skips then have to read through (via a small fixed buffer)
+// instead of seeking, since the raw byte count is not known up front.
+class TagCursor {
+public:
+    TagCursor(carsh::hal::IStream* s, std::uint64_t pos, std::uint64_t end,
+              bool unsync)
+        : s_(s), pos_(pos), end_(end), unsync_(unsync) {
+        s_->seek(pos_);
+    }
+
+    // Raw tag bytes left — an upper bound on the logical bytes when unsync is on.
+    std::uint64_t left() const { return (end_ - pos_) + (len_ - off_); }
+
+    bool read(std::uint8_t* dst, std::size_t n) {
+        if (!unsync_) {
+            if (n > end_ - pos_) return false;
+            const std::size_t got = n ? s_->read(dst, n) : 0;
+            pos_ += got;
+            return got == n;
+        }
+        for (std::size_t i = 0; i < n; ++i)
+            if (!next(dst[i])) return false;
+        return true;
+    }
+
+    bool skip(std::uint64_t n) {
+        if (!unsync_) {
+            if (n > end_ - pos_) return false;
+            pos_ += n;
+            return s_->seek(pos_);
+        }
+        std::uint8_t b;
+        for (std::uint64_t i = 0; i < n; ++i)
+            if (!next(b)) return false;
+        return true;
+    }
+
+    // Copies up to n tag bytes starting `ahead` bytes past the read position
+    // into dst without consuming them (seek, read, seek back); returns how many
+    // were available. Raw mode only — v2.4, the one caller, never takes the
+    // tag-level unsync path — and 0 with unsync on.
+    std::size_t peek(std::uint64_t ahead, std::uint8_t* dst, std::size_t n) {
+        if (unsync_ || ahead >= end_ - pos_) return 0;
+        const std::uint64_t avail = end_ - pos_ - ahead;
+        if (n > avail) n = std::size_t(avail);
+        const std::size_t got = s_->seek(pos_ + ahead) ? s_->read(dst, n) : 0;
+        s_->seek(pos_);
+        return got;
+    }
+
+private:
+    bool rawByte(std::uint8_t& b) {
+        if (off_ == len_) {
+            std::uint64_t want = end_ - pos_;
+            if (want > sizeof buf_) want = sizeof buf_;
+            len_ = want ? s_->read(buf_, std::size_t(want)) : 0;
+            off_ = 0;
+            pos_ += len_;
+            if (len_ == 0) return false;
+        }
+        b = buf_[off_++];
+        return true;
+    }
+    bool next(std::uint8_t& b) {
+        if (!rawByte(b)) return false;
+        if (prevFF_ && b == 0x00 && !rawByte(b)) return false;  // drop the stuffed 0
+        prevFF_ = (b == 0xFF);
+        return true;
+    }
+
+    carsh::hal::IStream* s_;
+    std::uint64_t pos_, end_;  // stream position of the next unbuffered byte
+    bool unsync_;
+    bool prevFF_ = false;
+    std::uint8_t buf_[512];
+    std::size_t off_ = 0, len_ = 0;
+};
+
+// Undo unsynchronisation in place (v2.4 per-frame); returns the new length.
+inline std::size_t undoUnsync(std::uint8_t* d, std::size_t n) {
+    std::size_t w = 0;
+    for (std::size_t r = 0; r < n; ++r) {
+        d[w++] = d[r];
+        if (d[r] == 0xFF && r + 1 < n && d[r + 1] == 0x00) ++r;
+    }
+    return w;
+}
+
+inline bool validFrameId(const std::uint8_t* id, std::size_t n) {
+    for (std::size_t i = 0; i < n; ++i) {
+        const std::uint8_t c = id[i];
+        if (!((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9'))) return false;
+    }
+    return true;
+}
+
+// Length of the frame id at `id` for a tag whose ids are idLen (3 or 4) chars
+// long: idLen for a valid id, 3 for a v2.2 name NUL-padded into a v2.3/v2.4
+// header ("TT2\0" — some writers do this; mutagen maps them too), 0 otherwise.
+inline std::size_t frameIdLen(const std::uint8_t* id, std::size_t idLen) {
+    if (validFrameId(id, idLen)) return idLen;
+    if (idLen == 4 && id[3] == 0 && validFrameId(id, 3)) return 3;
+    return 0;
+}
+
+// How plausible it is that a v2.4 frame body of `size` bytes, starting at the
+// cursor, ends on a frame boundary — i.e. where the walker would go next:
+//   0 = no: runs past the tag, or lands on bytes that are neither padding nor a
+//       frame header whose own size fits in the rest of the tag;
+//   1 = weak: lands on the end of the tag, on padding (zeros for the next 10
+//       bytes or up to the end), or on a header whose size fits but whose id is
+//       invalid (the walker skips such a frame by its size, so it is a real
+//       boundary in the tags that have them — just easier to hit by chance);
+//   2 = strong: lands on a header with a valid id whose own size fits.
+inline int boundaryScore(TagCursor& c, std::uint64_t size) {
+    const std::uint64_t left = c.left();
+    if (size > left) return 0;
+    const std::uint64_t rest = left - size;
+    if (rest == 0) return 1;
+    std::uint8_t h[10];
+    const std::size_t n = c.peek(size, h, sizeof h);
+    if (n == 0) return 0;
+    bool zeros = true;
+    for (std::size_t i = 0; i < n; ++i) zeros = zeros && h[i] == 0;
+    if (zeros) return 1;
+    if (n < sizeof h) return 0;
+    // The next frame's smallest reading must fit (syncsafe <= big-endian when
+    // no size byte has its high bit set).
+    const std::uint32_t next =
+        ((h[4] | h[5] | h[6] | h[7]) & 0x80) ? be32(h + 4) : syncsafe(h + 4);
+    if (next > rest - sizeof h) return 0;
+    return frameIdLen(h, 4) ? 2 : 1;
+}
+
+// Size of a v2.4 frame whose 4 size bytes are `sz`; the cursor is at the frame
+// body. The spec says syncsafe, but old iTunes (and a few others) wrote plain
+// big-endian sizes. The two readings agree below 128, and a size byte with its
+// high bit set can only be big-endian. Otherwise each reading is checked for
+// where it lands (boundaryScore) and the higher score wins. On a tie — both
+// weak, both strong, or both nowhere — the tag's established convention does
+// (`preferBe32`, set once a frame proved to be big-endian), else the spec's
+// syncsafe. A spec-conforming tag therefore never switches: its syncsafe
+// reading always lands on a valid header (2), padding or the end (1), and a
+// big-endian reading can only beat that by scoring 2 when syncsafe landed on
+// padding — impossible, as padding runs to the end of the tag, so from there
+// big-endian lands on more padding, the end, or past it (at most 1). A tag
+// with invalid ids is not conforming, but its syncsafe reading that lands on
+// such a frame still scores 1, so it ties with (rather than loses to) a
+// big-endian reading that only reaches padding further on.
+inline std::uint32_t v24FrameSize(TagCursor& c, const std::uint8_t* sz,
+                                  bool& preferBe32) {
+    const std::uint32_t bigEndian = be32(sz);
+    if ((sz[0] | sz[1] | sz[2] | sz[3]) & 0x80) {
+        preferBe32 = true;
+        return bigEndian;
+    }
+    const std::uint32_t safe = syncsafe(sz);
+    if (safe == bigEndian) return safe;
+    const int safeScore = boundaryScore(c, safe);
+    const int beScore = boundaryScore(c, bigEndian);
+    if (beScore > safeScore) {
+        preferBe32 = true;
+        return bigEndian;
+    }
+    if (safeScore > beScore) return safe;
+    return preferBe32 ? bigEndian : safe;
+}
+
+enum class Field : std::uint8_t {
+    None, Art, Title, Artist, AlbumArtist, Album, Genre, Track, Disc, Year
+};
+
+// Frame id -> field (4-char v2.3/v2.4 ids, 3-char v2.2 ids).
+inline Field fieldFor(const std::string& id) {
+    struct Map { const char* v3; const char* v2; Field f; };
+    static const Map kMap[] = {
+        {"APIC", "PIC", Field::Art},    {"TIT2", "TT2", Field::Title},
+        {"TPE1", "TP1", Field::Artist}, {"TPE2", "TP2", Field::AlbumArtist},
+        {"TALB", "TAL", Field::Album},  {"TCON", "TCO", Field::Genre},
+        {"TRCK", "TRK", Field::Track},  {"TPOS", "TPA", Field::Disc},
+        {"TYER", "TYE", Field::Year},   {"TDRC", nullptr, Field::Year},
+    };
+    for (const Map& m : kMap)
+        if (id == m.v3 || (m.v2 && id == m.v2)) return m.f;
+    return Field::None;
+}
+
+inline void applyText(Field f, const std::string& txt, TrackMeta& meta) {
+    switch (f) {
+        case Field::Title: meta.title = txt; break;
+        case Field::Artist: meta.artist = txt; break;
+        case Field::AlbumArtist: meta.albumArtist = txt; break;
+        case Field::Album: meta.album = txt; break;
+        case Field::Genre: meta.genre = txt; break;
+        case Field::Track: meta.trackNo = parseLeadingInt(txt); break;
+        case Field::Disc: meta.discNo = parseLeadingInt(txt); break;
+        case Field::Year: meta.year = parseYear(txt); break;
+        default: break;
+    }
+}
+
+}  // namespace id3
+
+// Returns false when the stream has no valid ID3v2 header; true otherwise, with
+// whatever frames could be read (a truncated or partly corrupt tag still yields
+// the frames before the damage).
 inline bool parseId3v2(carsh::hal::IStream* s, TrackMeta& meta) {
     if (!s) return false;
     s->seek(0);
     uint8_t h[10];
     if (s->read(h, 10) != 10) return false;
     if (h[0] != 'I' || h[1] != 'D' || h[2] != '3') return false;
-    uint8_t major = h[3];
-    uint32_t size = syncsafe(h + 6);
-    std::vector<uint8_t> buf(size);
-    if (size && s->read(buf.data(), size) != size) return false;
+    const uint8_t major = h[3];
+    if (major < 2 || major > 4 || h[4] == 0xFF) return false;
+    if ((h[6] | h[7] | h[8] | h[9]) & 0x80) return false;  // size not syncsafe
+    const uint8_t flags = h[5];
+    // v2.2's "compression" bit never got a defined scheme: ignore the tag.
+    if (major == 2 && (flags & 0x40)) return true;
 
-    std::size_t p = 0;
-    while (p + 10 <= buf.size()) {
-        const uint8_t* f = buf.data() + p;
-        if (f[0] == 0) break;  // padding
-        std::string id(reinterpret_cast<const char*>(f), 4);
-        uint32_t fsize = (major >= 4) ? syncsafe(f + 4) : be32(f + 4);
-        p += 10;
-        if (fsize == 0 || p + fsize > buf.size()) break;
-        const uint8_t* data = buf.data() + p;
+    // Clamp the claimed size to what the stream actually holds.
+    const std::uint64_t streamSize = s->size();
+    std::uint64_t end = 10 + std::uint64_t(syncsafe(h + 6));
+    if (end > streamSize) end = streamSize;
+    const bool tagUnsync = (flags & 0x80) != 0;
+    // v2.2/v2.3 unsynchronise the whole tag (frame sizes are pre-unsync);
+    // v2.4 does it per frame (sizes are the stored bytes).
+    id3::TagCursor c(s, 10, end, tagUnsync && major < 4);
 
-        if (id == "APIC") {
-            meta.hasEmbeddedArt = true;
-        } else if (id[0] == 'T') {
-            std::string txt = decodeId3Text(data, fsize);
-            if (id == "TIT2") meta.title = txt;
-            else if (id == "TPE1") meta.artist = txt;
-            else if (id == "TPE2") meta.albumArtist = txt;
-            else if (id == "TALB") meta.album = txt;
-            else if (id == "TCON") meta.genre = txt;
-            else if (id == "TRCK") meta.trackNo = parseLeadingInt(txt);
-            else if (id == "TPOS") meta.discNo = parseLeadingInt(txt);
-            else if (id == "TYER" || id == "TDRC") meta.year = parseYear(txt);
+    if (major >= 3 && (flags & 0x40)) {  // extended header: skip it
+        uint8_t e[4];
+        if (!c.read(e, 4)) return true;
+        if (major == 3) {  // size excludes its own 4 bytes
+            if (!c.skip(be32(e))) return true;
+        } else {  // v2.4: syncsafe, includes its own 4 bytes
+            const uint32_t n = syncsafe(e);
+            if (n < 6 || !c.skip(n - 4)) return true;
         }
-        p += fsize;
+    }
+
+    const std::size_t idLen = major == 2 ? 3 : 4;
+    const std::size_t hdrLen = major == 2 ? 6 : 10;
+    bool preferBe32 = false;    // v2.4: this tag's frame sizes proved big-endian
+    std::vector<uint8_t> body;  // reused text-frame buffer, <= kMaxId3TextFrame
+    while (c.left() >= hdrLen) {
+        uint8_t f[10];
+        if (!c.read(f, hdrLen)) break;
+        if (f[0] == 0) break;  // padding
+        uint32_t fsize;
+        uint8_t fmt = 0;  // v2.3/v2.4 format-flags byte
+        if (major == 2) {
+            fsize = (uint32_t(f[3]) << 16) | (uint32_t(f[4]) << 8) | f[5];
+        } else if (major == 3) {
+            fsize = be32(f + 4);
+            fmt = f[9];
+        } else {
+            fsize = id3::v24FrameSize(c, f + 4, preferBe32);
+            fmt = f[9];
+        }
+        if (fsize > c.left()) break;  // runs past the (clamped) tag end
+
+        // An invalid id (lowercase, punctuation, ...) is skipped by its size
+        // like any unmapped frame: the frames after it are still read.
+        const std::size_t idN = id3::frameIdLen(f, idLen);
+        const id3::Field field =
+            idN ? id3::fieldFor(std::string(reinterpret_cast<const char*>(f), idN))
+                : id3::Field::None;
+        if (field == id3::Field::Art) meta.hasEmbeddedArt = true;
+
+        bool readIt = field != id3::Field::None && field != id3::Field::Art &&
+                      fsize <= kMaxId3TextFrame;
+        std::size_t prefix = 0;      // flag-added bytes before the text
+        bool frameUnsync = false;
+        if (major == 3) {
+            if (fmt & 0xC0) readIt = false;           // compressed / encrypted
+            if (fmt & 0x20) prefix += 1;              // grouping id
+        } else if (major == 4) {
+            if (fmt & 0x0C) readIt = false;           // compressed / encrypted
+            if (fmt & 0x40) prefix += 1;              // grouping id
+            if (fmt & 0x01) prefix += 4;              // data length indicator
+            frameUnsync = tagUnsync || (fmt & 0x02);
+        }
+        if (!readIt) {
+            if (!c.skip(fsize)) break;
+            continue;
+        }
+        body.resize(fsize);
+        if (!c.read(body.data(), fsize)) break;
+        // v2.4 unsynchronises everything after the frame header, the grouping
+        // and data-length bytes included (a 0xFF group id gains a stuffed 0x00),
+        // so undo it before stripping them.
+        std::size_t n = body.size();
+        if (frameUnsync) n = id3::undoUnsync(body.data(), n);
+        if (prefix >= n) continue;
+        id3::applyText(field, decodeId3Text(body.data() + prefix, n - prefix), meta);
     }
     return true;
 }

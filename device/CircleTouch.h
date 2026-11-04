@@ -7,77 +7,133 @@
 // Driving the driver: Circle does NOT self-pump this. CTouchScreenDevice::Update()
 // is what reads the firmware touch buffer and fires events, and its header says
 // "Call this about 60 times per second!" — nothing in CRPiTouchScreen registers a
-// timer to do that. So poll() pumps Update() itself. Also, CTouchScreenDevice
-// requires Setup(CDisplay*) before any event can be reported (ReportHandler
-// dereferences the display for coordinate mapping), so initialize() takes the
-// framebuffer and wires it in.
+// timer to do that. The firmware keeps ONE snapshot and Update() only diffs the
+// latest one against the last it saw, so a tap or the middle of a flick that falls
+// between two Update() calls is lost. Pumping it from the UI loop (one call per
+// rendered frame, 45-100 ms apart) lost short taps and turned flicks into taps, so
+// Update() now runs from Circle's periodic timer handler: HZ = 100 times a second,
+// in the timer IRQ on core 0, independent of rendering. That path is IRQ-safe:
+// Update() is plain reads of the coherent touch page + the CDisplay size/offset
+// getters + our handler, which only stamps the event and pushes it into a
+// fixed-size lock-free SPSC ring (hal::TouchRing — no allocation, no locks, no
+// logging). poll(), on the UI task, only drains the ring.
+//
+// Also, CTouchScreenDevice requires Setup(CDisplay*) before any event can be
+// reported (ReportHandler dereferences the display for coordinate mapping), so
+// initialize() takes the framebuffer and wires it in.
+//
+// Lifetime: Circle can't unregister a periodic timer handler, so the handler
+// outlives this object; ~CircleTouch turns it into a no-op. The timer IRQ reads
+// the display through the driver until then, so the display passed to initialize()
+// must outlive this object (in kernel.cpp: a local declared after the framebuffer,
+// so it is destroyed first).
 #ifndef _carsh_circle_touch_h
 #define _carsh_circle_touch_h
 
 #include <circle/devicenameservice.h>
 #include <circle/input/rpitouchscreen.h>
 #include <circle/input/touchscreen.h>
+#include <circle/timer.h>
 
-#include <deque>
+#include <atomic>
+#include <cstdint>
 
+#include "CircleClock.h"
 #include "hal/Touch.h"
+#include "hal/TouchRing.h"
 
 namespace carsh::device {
 
 class CircleTouch : public carsh::hal::ITouch {
 public:
+    CircleTouch() = default;
+    CircleTouch(const CircleTouch&) = delete;
+    CircleTouch& operator=(const CircleTouch&) = delete;
+
+    // Circle has no way to unregister a periodic handler, so it outlives this
+    // object: clearing the self-pointer turns the handler into a no-op. This runs
+    // before the members (the driver, the ring) are destroyed, and before the
+    // display if the owner declared it first. (The IRQ and this destructor run on
+    // the same core, so no handler is mid-flight here.)
+    ~CircleTouch() { s_self.store(nullptr, std::memory_order_release); }
+
     // display: the framebuffer the UI renders to (CBcmFrameBuffer is a CDisplay).
     // CTouchScreenDevice::Setup() needs it for coordinate mapping; without it,
-    // the first reported event null-derefs the display in ReportHandler.
-    bool initialize(CDisplay* display) {
+    // the first reported event null-derefs the display in ReportHandler. It must
+    // outlive this object (the timer IRQ reads it until ~CircleTouch).
+    // timer: the kernel's CTimer, whose 100 Hz tick pumps the driver.
+    bool initialize(CDisplay* display, CTimer* timer) {
         if (!mTouch.Initialize()) return false;
         mDevice = static_cast<CTouchScreenDevice*>(
             CDeviceNameService::Get()->GetDevice("touch1", FALSE));
         if (!mDevice) return false;
         mDevice->Setup(display);  // REQUIRED before Update()/event reporting
-        s_self = this;
         mDevice->RegisterEventHandler(&CircleTouch::handler);
+        // Publish self last: from here on the timer IRQ may pump Update().
+        s_self.store(this, std::memory_order_release);
+        timer->RegisterPeriodicHandler(&CircleTouch::periodic);
         return true;
     }
 
-    // Pump the driver, then drain. CTouchScreenDevice::Update() polls the firmware
-    // touch buffer and synchronously fires our handler (which enqueues), so one
-    // Update() when the queue is empty refills it for this frame. The UI loop
-    // calls poll() until it returns false, so Update() runs ~once per frame.
+    // Drain one event (UI task). Never touches the driver — the timer IRQ pumps it.
     bool poll(carsh::hal::TouchEvent& out) override {
-        if (queue_.empty()) mDevice->Update();
-        if (queue_.empty()) return false;
-        out = queue_.front();
-        queue_.pop_front();
+        carsh::hal::StampedTouch s;
+        if (!ring_.pop(s)) return false;
+        out = s.ev;
+        lastUs_ = s.us;
         return true;
     }
+
+    // Capture time (µs, device::clockUs(): monotonic, no ~95 h overflow) of the
+    // event the last successful poll() returned — the AA input channel's event
+    // timestamp.
+    uint64_t lastEventUs() const { return lastUs_; }
+
+    // Events the ring refused under backlog (diagnostics).
+    uint32_t dropped() const { return ring_.dropped(); }
+
+    // Down/Up events the ring lost because it was completely full (diagnostics).
+    uint32_t droppedTransitions() const { return ring_.droppedTransitions(); }
+
+    // UI task, after draining: true if the ring lost a Down/Up since the last call
+    // (it was completely full). The UI must then reset its contact tracking — the
+    // lost event may be the Up that its primary-contact latch is waiting for.
+    bool lostTransitionSinceLastCheck() { return ring_.lostTransitionSinceLastCheck(); }
 
 private:
+    // Timer IRQ, 100 Hz, core 0.
+    static void periodic(void) {
+        CircleTouch* self = s_self.load(std::memory_order_acquire);
+        if (self != nullptr && self->mDevice != nullptr) self->mDevice->Update();
+    }
+
+    // Called synchronously from Update(), i.e. in the timer IRQ.
     static void handler(TTouchScreenEvent Event, unsigned nID, unsigned nPosX,
                         unsigned nPosY) {
-        if (!s_self) return;
-        carsh::hal::TouchEvent e;
-        e.id = int(nID);
-        e.x = int(nPosX);
-        e.y = int(nPosY);
+        CircleTouch* self = s_self.load(std::memory_order_acquire);
+        if (self == nullptr) return;
+        carsh::hal::StampedTouch s;
+        s.us = clockUs();
+        s.ev.id = int(nID);
+        s.ev.x = int(nPosX);
+        s.ev.y = int(nPosY);
+        s.ev.tMs = static_cast<uint32_t>(s.us / 1000u);
         switch (Event) {
-            case TouchScreenEventFingerDown: e.phase = carsh::hal::TouchPhase::Down; break;
-            case TouchScreenEventFingerUp:   e.phase = carsh::hal::TouchPhase::Up;   break;
-            case TouchScreenEventFingerMove: e.phase = carsh::hal::TouchPhase::Move; break;
+            case TouchScreenEventFingerDown: s.ev.phase = carsh::hal::TouchPhase::Down; break;
+            case TouchScreenEventFingerUp:   s.ev.phase = carsh::hal::TouchPhase::Up;   break;
+            case TouchScreenEventFingerMove: s.ev.phase = carsh::hal::TouchPhase::Move; break;
             default: return;
         }
-        s_self->queue_.push_back(e);
+        self->ring_.pushEvent(s);
     }
 
     CRPiTouchScreen mTouch;
     CTouchScreenDevice* mDevice = nullptr;
-    std::deque<carsh::hal::TouchEvent> queue_;
-    static CircleTouch* s_self;
+    carsh::hal::TouchRing ring_;  // producer: timer IRQ; consumer: poll() (UI task)
+    uint64_t lastUs_ = 0;         // UI task only
+    // The handlers are plain function pointers (no user param); read in the IRQ.
+    static inline std::atomic<CircleTouch*> s_self{nullptr};
 };
-
-// Defined in kernel.cpp (single TU) to keep the static linkage simple.
-// inline avoids a separate definition requirement.
-inline CircleTouch* CircleTouch::s_self = nullptr;
 
 }  // namespace carsh::device
 

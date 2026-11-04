@@ -27,6 +27,7 @@
 using carsh::aa::AaConnection;
 using carsh::aa::AaConnectionCallbacks;
 using carsh::aa::AaMessenger;
+using carsh::aa::AaShutdownReason;
 using carsh::aa::AaState;
 using carsh::aa::ChannelId;
 using carsh::device::AaCryptoMbedTls;
@@ -50,6 +51,16 @@ const char* stateName(AaState s) {
         case AaState::ServiceDiscovery: return "ServiceDiscovery";
         case AaState::Running: return "Running";
         case AaState::Shutdown: return "Shutdown";
+    }
+    return "?";
+}
+
+const char* shutdownReasonName(AaShutdownReason r) {
+    switch (r) {
+        case AaShutdownReason::None: return "none";
+        case AaShutdownReason::PhoneRequest: return "phone exit (SHUTDOWN_REQUEST)";
+        case AaShutdownReason::VersionRejected: return "version rejected";
+        case AaShutdownReason::CryptoFailure: return "TLS failure";
     }
     return "?";
 }
@@ -86,7 +97,12 @@ SessionResult runSession(carsh::aalinux::LibUsbAaTransport* transport) {
             printf(">> MEDIA ch=%u frame#%lu len=%zu (total %lu KB)\n", (unsigned)ch,
                    mediaFrames, len, mediaBytes / 1024);
     };
-    cbs.onShutdown = [] { printf("** phone requested shutdown\n"); };
+    // onShutdown fires from inside conn.poll(), so `live` is set by then.
+    const AaConnection* live = nullptr;
+    cbs.onShutdown = [&live] {
+        printf("** connection shut down: %s\n",
+               live != nullptr ? shutdownReasonName(live->shutdownReason()) : "?");
+    };
     bool videoStarted = false;
     cbs.onAvStart = [&](ChannelId ch, bool started) {
         printf("** AV %s on ch=%u  <<<< %s\n", started ? "START" : "STOP", (unsigned)ch,
@@ -98,6 +114,7 @@ SessionResult runSession(carsh::aalinux::LibUsbAaTransport* transport) {
     };
 
     AaConnection conn(msger, crypto, cbs);
+    live = &conn;
     printf("== starting AA connection (VERSION_REQUEST) ==\n");
     conn.start();
 

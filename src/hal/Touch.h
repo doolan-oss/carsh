@@ -5,8 +5,10 @@
 // Host backend: SyntheticTouch, which replays scripted event sequences so UI
 // hit-testing and gestures are testable without a digitizer.
 //
-// The driver layer emits raw down/move/up points at >60 Hz; the gesture layer
-// (GestureRecognizer) turns them into taps and vertical swipes for list flinging.
+// The driver layer emits raw down/move/up points, each stamped with its capture
+// time (on the device, CircleTouch pumps the firmware touch buffer at 100 Hz from
+// the timer IRQ into a hal::TouchRing); the gesture layer (GestureRecognizer)
+// turns them into taps and vertical swipes for list flinging.
 #pragma once
 
 #include <cstdint>

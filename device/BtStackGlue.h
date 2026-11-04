@@ -13,10 +13,11 @@ namespace carsh::device {
 
 class CircleBluetooth;  // forward decl; glue calls back into it to deliver events
 
-// Initialize BTstack: set up the HCI UART transport to the onboard controller,
-// the BCM/CYW chipset (firmware .hcd download), the run loop, and the A2DP sink +
-// AVRCP CT/TG profiles. Returns true once HCI is up. No-op stub returns false
-// when BTstack is not compiled in.
+// Initialize BTstack: the run loop, HCI over the Circle USB transport to the
+// Realtek dongle (rtlbt firmware download from SD), the A2DP sink + AVRCP CT/TG
+// profiles with all their packet handlers, and their SDP records; then power on
+// (HCI reaches WORKING asynchronously). No-op stub returns false when BTstack is
+// not compiled in.
 bool btGlueInit(CircleBluetooth* owner);
 
 // Drive one pass of the BTstack run loop + transport RX. Called from the BT
@@ -33,7 +34,10 @@ void btGlueStartScan();
 void btGlueStopScan();
 
 // Connect/disconnect the A2DP source (the phone). addr6 is a 6-byte Classic
-// address, MSB-first. Failure is delivered via deliverConnectFailed. No-op stubs.
+// address, MSB-first. Success arrives as deliverConnected (ACL link up); any
+// failure on the way (page, A2DP signaling/stream, link loss) as exactly one
+// deliverConnectFailed. Disconnect drops the connected phone's link (A2DP and
+// AVRCP with it). No-op stubs.
 void btGlueConnect(const unsigned char* addr6);
 void btGlueDisconnect();
 

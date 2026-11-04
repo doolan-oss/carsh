@@ -12,20 +12,32 @@ device backends here.
 #    (carsh is built/tested with 14.2.Rel1 aarch64-none-elf)
 export PATH=/opt/arm-toolchain/bin:$PATH
 
-# 2. Fetch + build circle-stdlib (Circle + newlib + libstdc++, STDLIB_SUPPORT=4).
-#    Needs `texinfo` installed (newlib's libgloss builds docs).
+# 2. Fetch circle-stdlib (Circle + newlib + libstdc++).
 ../scripts/fetch_circle.sh
 cd ../third_party/circle-stdlib
+
+# 3. Before the first build: apply carsh's seven tracked Circle patches (see
+#    ../scripts/patches/README.md — without them no image builds (kernel.cpp
+#    checks for the heap-bucket patch), the AA image doesn't compile, the dongle
+#    never binds and the chainloader doesn't build), then set a
+#    non-zero USB Vendor ID for the USB-C serial-log gadget (the default 0x0000 is
+#    rejected by Circle's gadget driver; this one is a manual edit, not a patch).
+#    carsh uses the pid.codes open-source VID 0x1209 for development — replace
+#    before shipping a product. Edit libs/circle/include/circle/sysconfig.h:
+#        #define USB_GADGET_VENDOR_ID  0x1209
+for p in usbbluetooth-acl usbdevicefactory-aoa usbstandardhub-reconfigure \
+         sysconfig-multicore sysconfig-heap-buckets chainboot-multicore \
+         usbcdcgadget-rx-overrun; do
+  patch -p1 -d libs/circle < ../../scripts/patches/$p.patch
+done
+
+# 4. Build circle-stdlib. `./configure -r 4` targets the Pi 4 with STDLIB_SUPPORT=3
+#    (newlib + the toolchain's libstdc++). Needs `texinfo` installed (newlib's
+#    libgloss builds docs). On an already-built tree, a patch or VID change needs
+#    the rebuild noted in scripts/patches/README.md (all of libcircle for the two
+#    sysconfig patches; just lib/usb/gadget for the VID).
 ./configure -r 4 --prefix aarch64-none-elf-
 make -j$(nproc)
-
-# 3. USB-C serial-log gadget: set a non-zero USB Vendor ID (the default 0x0000 is
-#    rejected by Circle's gadget driver). carsh uses the pid.codes open-source VID
-#    0x1209 for development — replace before shipping a product. Edit
-#    libs/circle/include/circle/sysconfig.h:
-#        #define USB_GADGET_VENDOR_ID  0x1209
-#    then rebuild just the gadget lib:
-cd libs/circle/lib/usb/gadget && make
 ```
 
 ### USB-C serial console (no extra cable)
@@ -40,8 +52,8 @@ USB-A media stick and the onboard Bluetooth.
 
 > Why circle-stdlib and not plain Circle? carsh's core uses the C++ STL
 > (`std::vector`/`string`/`map`/`function`, `<cmath>`, `<atomic>`, `<complex>`).
-> Plain Circle is `-nostdinc`; full STL needs `STDLIB_SUPPORT=4`, which
-> circle-stdlib provides (newlib + the toolchain's libstdc++).
+> Plain Circle is `-nostdinc`; full STL needs circle-stdlib's `STDLIB_SUPPORT=3`
+> (newlib + the toolchain's libstdc++; `4` would switch to LLVM libc++).
 
 ## Build the image
 
@@ -61,7 +73,9 @@ The default image links the **AA TLS crypto** (mbedTLS, rung 4b). To also link t
 **H.264 decoder** for live video projection, vendor + cross-build openh264
 (`scripts/fetch_openh264.sh`) and build with `make CARSH_HAVE_OPENH264=1` (rung 5);
 without it the AA tab shows its placeholder but TLS / channels / audio / touch still
-run.
+run. The bench image is `make CARSH_HAVE_OPENH264=1 CARSH_HAVE_BTSTACK=1`. Run
+`make clean` whenever you switch between `CARSH_*` variants: the Makefile doesn't
+track the flags, so objects built for another variant are silently reused.
 
 Copy `kernel8-rpi4.img` (keep this name — `config.txt`'s `[pi4]` section loads
 `kernel=kernel8-rpi4.img`) + the Pi firmware + `config.txt` to a **FAT32** SD card
@@ -85,7 +99,7 @@ variant (different Pi model + semihosting):
 cd ../third_party/circle-stdlib
 ./configure -r 3 --qemu --prefix aarch64-none-elf- && make -j$(nproc)
 cd ../../device && make clean && make
-qemu-system-aarch64 -M raspi3b -kernel kernel8-rpi3.img -serial stdio -display none
+qemu-system-aarch64 -M raspi3b -kernel kernel8.img -serial stdio -display none
 # then reconfigure back to -r 4 and rebuild for the product image
 ```
 
@@ -95,8 +109,9 @@ The app binds to `bt::IBluetooth`; `device/CircleBluetooth` implements it. All
 BTstack-specific code is in `device/BtStackGlue.cpp`, **gated behind
 `CARSH_HAVE_BTSTACK`** — the default build links a stub (no BT), so the rest of
 the image is unaffected. The kernel already wires the seam: connect → driver
-profile switch, AVRCP metadata → BT now-playing, decoded A2DP PCM → `g_btRing`,
-and a `CircleBtRunLoopTask` that pumps the BTstack run loop.
+profile switch, AVRCP metadata → BT now-playing (and `onAvrcpEnded` → back to A2DP
+activity when the phone's AVRCP session ends), decoded A2DP PCM → `g_btRing`, and a
+`CircleBtRunLoopTask` that pumps the BTstack run loop.
 
 ### Building it
 
@@ -112,8 +127,8 @@ three carsh files:
 
 - `btstack_config.h` — Classic-only A2DP-sink + AVRCP, embedded run loop, no
   BLE/mesh (small footprint).
-- `HalCircle.cpp` — the embedded HAL (`hal_time_ms` via `CTimer`, `hal_cpu_*`
-  via Circle critical sections).
+- `HalCircle.cpp` — the embedded HAL (`hal_time_ms` from carsh's counter clock,
+  `device/CircleClock.h`, `hal_cpu_*` via Circle critical sections).
 - `CircleHciTransport.cpp` — a `hci_transport_t` backed by Circle's
   `CUSBBluetoothDevice` (the stage-1 USB-dongle path).
 - `BtStackClassicShims.c` — the `hci_le_rand` command descriptor (BLE-gated
@@ -122,7 +137,14 @@ three carsh files:
 `BtStackGlue.cpp` holds the real A2DP-sink + AVRCP + GAP glue (modelled on
 `example/a2dp_sink_demo.c`), and `src/bt/NowPlaying.h` assembles the per-attribute
 AVRCP now-playing subevents into one `bt::AvrcpMetadata` (host-tested in
-`tests/bt/BtParse_test`).
+`tests/bt/BtParse_test`). It registers all three AVRCP packet handlers (avrcp /
+avrcp_controller / avrcp_target) and the A2DP sink, AVRCP CT, AVRCP TG and Device ID
+SDP records (four records = `MAX_NR_SERVICE_RECORD_ITEMS` in `btstack_config.h`), and
+feeds HCI/A2DP/AVRCP connection events into `src/bt/LinkTracker.h` (host-tested in
+`tests/bt/LinkTracker_test`), which decides connected, disconnected and
+connect-failed. The AVRCP TG implements absolute volume: the phone's
+SetAbsoluteVolume is applied as a gain on the A2DP PCM (`src/bt/AbsoluteVolume.h`),
+ahead of the HU master rail.
 
 ### Two-stage hardware path
 
@@ -131,25 +153,13 @@ Mirrors the audio bring-up: get A2DP working first over a **USB BT dongle**
 `hci_transport` (simpler, no onboard firmware), then port to the onboard
 CYW43455. The build above targets stage 1.
 
-### What still needs the bench (TODO(hw), see HARDWARE_TODO H6)
+### What still needs the bench
 
-The build links, but it is **not** validated against a radio:
-
-1. **USB ACL data path — the one real transport gap.** Circle's
-   `CUSBBluetoothDevice` configures the bulk IN/OUT endpoints but exposes no ACL
-   transfer API (only the control EP for commands + the interrupt EP for events).
-   `CircleHciTransport.cpp` therefore wires HCI **command/event** (so HCI
-   bring-up, inquiry and connection can work) but **drops ACL** — no A2DP audio
-   flows until `CUSBBluetoothDevice` is extended with bulk ACL in/out. Note
-   `third_party/circle-stdlib/` is git-ignored, so that extension must ship as a
-   tracked patch under `scripts/`, not an in-place edit.
-2. **Realtek firmware blobs.** `BtStackGlue` points the chipset at
-   `SD:/firmware/rtlbt`; the matching `rtlbt_fw` / `rtlbt_config` for the dongle's
-   USB product id must be placed there (R3).
-3. **IRQ-context delivery.** Circle delivers HCI events from USB-completion
-   context; for correctness they should be trampolined onto the BTstack run loop
-   rather than handed to the stack synchronously.
-4. **SSP / pairing** and the **clock-drift adaptive SRC** (R12) on the A2DP PCM.
+A2DP audio works on the board (UB500 dongle, `scripts/patches/usbbluetooth-acl.patch`
+for the ACL path, Realtek firmware from `SD:/firmware/rtlbt`). AVRCP metadata /
+transport / absolute volume and the connect/disconnect state are fixed in code but
+not yet benched — see HARDWARE_TODO H6 and H9 §F. Still open: bonding (no link-key
+DB), SSP pairing UX and the clock-drift adaptive SRC (R12) on the A2DP PCM.
 
 ## Current milestone — booting on real hardware
 
@@ -159,23 +169,32 @@ library, onboard PWM audio out the 3.5 mm jack, the vertical volume rail, and th
 USB-C serial console. The decode + scheduler tasks run live feeding playback.
 
 Remaining hardware work (see ../HARDWARE_TODO.md): I2S DAC HAT (PWM jack works
-today), BTstack on a real radio (USB ACL path + Realtek firmware blob — H6),
-WiFi, and the OTA flash write + chainloader. Backends that build but await their
-peripheral: `CircleSoundDevice` (I2S), `CircleFlashTarget` (OTA slot write).
+today), Bluetooth AVRCP (A2DP audio already plays — H6), WiFi, and the serial OTA
+push + A/B chainloader (H7b). Everything fixed on 2026-09-25 is bench-pending (H9).
+Backends that build but await their peripheral: `CircleSoundDevice` (I2S),
+`CircleFlashTarget` (OTA slot write).
 
 ## Serial OTA dev loop (no card swap)
 
-Once per card: install the A/B chainloader (`device/chainloader/README.md`).
-Once per bench: `scripts/carsh_ota.py keygen` (writes `device/OtaPushKey.h`),
-then rebuild the image so it trusts your key. After that the loop is:
+Once per card: install the A/B chainloader (`device/chainloader/README.md`) with an
+app image from 2026-09-25 or later — older kernels don't ack the flow-controlled
+push, so this migration is the last card swap. Once per bench:
+`scripts/carsh_ota.py keygen` (writes `device/OtaPushKey.h`), then rebuild the image
+so it trusts your key. After that the loop is:
 
 ```sh
-cd device && make                    # build the app image
-../scripts/carsh_ota.py flash        # sign + push over /dev/ttyACM0, reboot, watch
+cd device && make                                # build the app image
+../scripts/carsh_ota.py flash --log ../bench.log # sign + push over /dev/ttyACM0, reboot, watch
 ```
 
 The push travels the same USB-C console the log rides on (PushProtocol framing,
-CRC-32 per packet + whole-blob, Ed25519-signed .carup). The kernel stages it to
+CRC-32 per packet + whole-blob, Ed25519-signed .carup). The transfer is
+flow-controlled: the kernel acks each packet it has drained from the gadget's 8 KiB
+receive ring (`ota-push: ack <seq>`) and the host keeps at most 6 KiB un-acked,
+because Circle's CDC gadget drops bytes that don't fit instead of pushing back. Stop
+`scripts/bench_capture.py` during a push (the script refuses otherwise); a failed
+receive restarts from BEGIN (`--retries`). The chainloader needs
+`scripts/patches/chainboot-multicore.patch`. The kernel stages the image to
 the inactive slot (`kernel8-A/B.img`), arms a 3-boot trial in `boot_slot.bin`,
 and reboots; the chainloader rolls back automatically if the new image never
-reaches the UI loop. Bench validation checklist: HARDWARE_TODO.md H7b.
+reaches the UI loop. Bench validation checklist: HARDWARE_TODO.md H7b + H9 §G.

@@ -53,6 +53,29 @@ TEST(Bt, AvrcpMetadataReachesNowPlaying) {
     CHECK(latest.playing);
 }
 
+// The kernel's wiring: metadata makes AVRCP the phone's play-status source; the
+// session-end signal (AVRCP released while A2DP may still stream) drops it again.
+// An empty metadata is NOT that signal: it is a report (e.g. a status-only PAUSED).
+TEST(Bt, AvrcpEndedIsItsOwnSignalNotAnEmptyMetadata) {
+    host::FakeBluetooth bt;
+    bt::AvrcpMetadata meta;   // g_btMeta
+    bool reported = false;    // g_btAvrcpReported
+    bt::BluetoothCallbacks cb;
+    cb.onMetadata = [&](const bt::AvrcpMetadata& m) { meta = m; reported = true; };
+    cb.onAvrcpEnded = [&] { meta = {}; reported = false; };
+    bt.setCallbacks(cb);
+
+    bt.simulateConnect({{0x11, 0x22, 0x33, 0x44, 0x55, 0x66}});
+    bt.simulateMetadata({"Teardrop", "Massive Attack", "Mezzanine", 330000, true});
+    CHECK(reported);
+    bt.simulateMetadata(bt::AvrcpMetadata{});  // an AVRCP report with nothing in it
+    CHECK(reported);
+    bt.simulateAvrcpEnded();
+    CHECK(!reported);
+    CHECK(meta.title.empty());
+    CHECK(bt.connected());  // A2DP / the link are unaffected
+}
+
 TEST(Bt, AvrcpControllerCommandsRecorded) {
     host::FakeBluetooth bt;
     bt.sendAvrcpCommand(bt::AvrcpCommand::Play);
